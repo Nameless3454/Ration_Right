@@ -1,0 +1,318 @@
+    1: """RationRight — column detection and schema mapping (Phase 3).
+       
+       External government/Excel datasets rarely use RationAI's internal field names
+       (``fps_code`` vs ``FPS_ID``, ``district`` vs ``District Name``, ``quantity``
+       vs ``Qty Distributed``). This module maps external column names onto the
+       normalized internal schema from Phase 2 WITHOUT creating a table per dataset.
+       
+       Matching is case/whitespace/punctuation-insensitive: headers are normalized
+       (e.g. ``District Name`` -> ``districtname``) and compared against a curated,
+       extendable alias table (``FIELD_ALIASES``). Unknown columns map to
+       ``ignore``. Automatic mapping is a suggestion — the user can override any
+       column in the mapping UI, and required fields are clearly marked.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import re
+       
+    1: from ingestion.parsers import ParseError
+       
+       # Dataset kinds the importer understands.
+    1: DATASET_TYPES = ("beneficiaries", "fps_centers", "ration_transactions", "inventory", "combined")
+       
+    1: DATASET_TYPE_LABELS = {
+    1:     "beneficiaries": "Beneficiaries",
+    1:     "fps_centers": "FPS Centers",
+    1:     "ration_transactions": "Ration Transactions",
+    1:     "inventory": "Inventory",
+    1:     "combined": "Combined Dataset",
+       }
+       
+       # Human-readable labels for the internal fields (used by the mapping UI).
+    1: FIELD_LABELS = {
+    1:     "external_reference": "Beneficiary ID",
+    1:     "fps_code": "FPS Code",
+    1:     "name": "Center Name",
+    1:     "external_transaction_id": "Transaction ID",
+    1:     "beneficiary_id": "Beneficiary ID (ref)",
+    1:     "fps_center_id": "FPS Code (ref)",
+    1:     "transaction_date": "Transaction Date",
+    1:     "commodity": "Commodity",
+    1:     "quantity": "Quantity",
+    1:     "unit": "Unit",
+    1:     "latitude": "Latitude",
+    1:     "longitude": "Longitude",
+    1:     "state": "State",
+    1:     "district": "District",
+    1:     "block": "Block",
+    1:     "location": "Location",
+    1:     "capacity": "Capacity",
+    1:     "ration_category": "Ration Category",
+    1:     "family_size": "Family Size",
+    1:     "current_stock": "Current Stock",
+    1:     "monthly_consumption": "Monthly Consumption",
+    1:     "reorder_threshold": "Reorder Threshold",
+    1:     "last_updated": "Last Updated",
+    1:     "status": "Status",
+       }
+       
+       # Which internal fields are mappable per dataset type.
+    1: FIELDS_BY_TYPE = {
+    1:     "beneficiaries": (
+               "external_reference", "state", "district", "block",
+               "ration_category", "family_size", "status",
+           ),
+    1:     "fps_centers": (
+               "fps_code", "name", "state", "district", "block", "location",
+               "latitude", "longitude", "capacity", "status",
+           ),
+    1:     "ration_transactions": (
+               "external_transaction_id", "beneficiary_id", "fps_center_id",
+               "transaction_date", "commodity", "quantity", "unit",
+               "latitude", "longitude", "status",
+               # Beneficiary/center detail columns are accepted on transaction files:
+               "state", "district", "block", "ration_category", "family_size",
+               "name", "location",
+           ),
+    1:     "inventory": (
+               "fps_center_id", "commodity", "current_stock",
+               "monthly_consumption", "reorder_threshold", "last_updated",
+           ),
+    1:     "combined": (
+               "external_transaction_id", "beneficiary_id", "fps_center_id",
+               "transaction_date", "commodity", "quantity", "unit",
+               "latitude", "longitude", "status",
+               "external_reference", "state", "district", "block",
+               "ration_category", "family_size",
+               "name", "location", "capacity",
+           ),
+       }
+       
+       # Required internal fields per dataset type (documented Phase 4 rules).
+       # Transaction IDs stay OPTIONAL — a deterministic composite key is used when
+       # no ID column exists (see ingestion.importer._dedup_key).
+    1: REQUIRED_FIELDS = {
+    1:     "beneficiaries": ("external_reference", "district", "family_size", "ration_category"),
+    1:     "fps_centers": ("fps_code", "district"),
+    1:     "ration_transactions": ("fps_center_id", "transaction_date", "commodity", "quantity"),
+    1:     "inventory": ("fps_center_id", "commodity", "current_stock"),
+    1:     "combined": ("fps_center_id", "transaction_date", "commodity", "quantity"),
+       }
+       
+       # Extendable alias table: internal field -> accepted external names
+       # (normalized form: lowercase, alphanumerics only). The internal name is
+       # always accepted automatically.
+    1: FIELD_ALIASES = {
+    1:     "external_reference": {
+               "beneficiaryid", "beneficiary", "beneficiaryref", "beneficiaryreference",
+               "bid", "cardno", "rationcardno", "rationcardid", "bplcardno",
+               "beneficiarycode", "uniqueid", "hhid", "householdid", "uid",
+           },
+    1:     "fps_code": {
+               "fpscode", "fpsid", "fps", "fairpriceshop", "fairpriceshopcode",
+               "fairpriceshopid", "shopcode", "shopid", "centerid", "center",
+               "fpscenter", "fpscenterid", "distributioncenterid", "dccode", "outletcode",
+           },
+    1:     "name": {"name", "shopname", "fpsname", "centername", "outletname", "shop"},
+    1:     "external_transaction_id": {
+               "transactionid", "txid", "receiptno", "receiptnumber", "transactionno",
+               "tokenno", "slipno", "distributionid", "invoiceid", "billno", "id",
+               "serialno", "serialnumber", "vouchernumber",
+           },
+    1:     "beneficiary_id": {
+               "beneficiaryid", "beneficiary", "beneficiaryref", "bid", "cardno",
+               "rationcardno", "beneficiarycode", "hhid",
+           },
+    1:     "fps_center_id": {
+               "fpsid", "fps", "fairpriceshopcode", "shopcode", "centerid", "center",
+               "fpscenter", "fpscode", "outletcode",
+           },
+    1:     "transaction_date": {
+               "transactiondate", "date", "datedistributed", "distributiondate",
+               "timestamp", "txdate", "dateofdistribution", "transactiontime",
+               "distributedon", "saledate", "issuedate",
+           },
+    1:     "commodity": {
+               "commodity", "rationtype", "item", "itemname", "commodityname",
+               "grain", "product", "material", "ration", "commoditytype", "itemtype",
+               "goodstype", "commoditycode",
+           },
+    1:     "quantity": {
+               "quantity", "qty", "qtydistributed", "quantitydistributed", "amount",
+               "quantitykg", "distributedqty", "kg", "quantityissued", "issueqty",
+               "units", "quantityinkg", "weight", "qtyissued",
+           },
+    1:     "unit": {"unit", "units", "uom", "unitofmeasure"},
+    1:     "latitude": {"latitude", "lat", "latitudevalue"},
+    1:     "longitude": {"longitude", "lon", "lng", "long", "longitudevalue"},
+    1:     "state": {"state", "statename", "st"},
+    1:     "district": {"district", "districtname", "dist", "districtcode", "districtid"},
+    1:     "block": {"block", "blockname", "tehsil", "taluk", "mandal"},
+    1:     "location": {"location", "address", "locality", "villagename", "village", "area", "sector"},
+    1:     "capacity": {"capacity", "storagecapacity", "maxcapacity", "capacitykg", "storagelimit"},
+    1:     "ration_category": {
+               "rationcategory", "category", "cardcategory", "rationcardcategory",
+               "aaycategory", "householdcategory", "prioritycategory",
+           },
+    1:     "family_size": {
+               "familysize", "householdsize", "noofmembers", "members", "familymembers",
+               "totalmembers",
+           },
+    1:     "current_stock": {
+               "currentstock", "stock", "closingstock", "stockonhand", "available",
+               "balance", "inventory", "openingstock", "closingbalance", "stockqty",
+           },
+    1:     "monthly_consumption": {
+               "monthlyconsumption", "consumption", "avgmonthlyconsumption",
+               "monthlyusage", "monthlyconsumptionqty", "consumptionrate",
+           },
+    1:     "reorder_threshold": {
+               "reorderthreshold", "threshold", "reorderlevel", "minstock",
+               "safetystock", "minimumstock", "reorderpoint",
+           },
+    1:     "last_updated": {
+               "lastupdated", "updated", "asof", "reportdate", "stockdate", "updatedate",
+           },
+    1:     "status": {"status", "recordstatus", "stateflag"},
+       }
+       
+       # Fields whose values are constrained to an enumeration (validated at import).
+    1: STATUS_ALLOWED = {
+    1:     "beneficiaries": ("ACTIVE", "INACTIVE"),
+    1:     "fps_centers": ("ACTIVE", "INACTIVE"),
+    1:     "ration_transactions": ("COMPLETED", "PENDING", "FAILED", "CANCELLED"),
+    1:     "inventory": (),
+    1:     "combined": ("COMPLETED", "PENDING", "FAILED", "CANCELLED"),
+       }
+       
+       
+    2: class MappingError(ParseError):
+    1:     """Raised when a mapping is missing required fields or is malformed."""
+       
+       
+    1: def normalize_header(name) -> str:
+           """Lowercase and keep alphanumerics: 'District Name' -> 'districtname'."""
+  945:     return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+       
+       
+    1: def field_label(field: str) -> str:
+  227:     return FIELD_LABELS.get(field, field)
+       
+       
+    1: def mappable_fields(dataset_type: str) -> tuple:
+  590:     return FIELDS_BY_TYPE.get(dataset_type, FIELDS_BY_TYPE["ration_transactions"])
+       
+       
+    1: def required_fields(dataset_type: str) -> tuple:
+90787:     return REQUIRED_FIELDS.get(dataset_type, REQUIRED_FIELDS["ration_transactions"])
+       
+       
+    1: def _alias_set(field: str) -> set:
+ 1128:     return {field} | FIELD_ALIASES.get(field, set())
+       
+       
+    1: def detect_mapping(headers: list, dataset_type: str) -> dict:
+           """Auto-map external headers to internal fields.
+       
+           Returns ``{"mapping": [{"external": ..., "internal": ...|None}, ...],
+           "warnings": [...], "missing_required": [...]}``. The first column that
+           matches a field wins; unknown columns map to ``None`` (ignore)."""
+   68:     if dataset_type not in DATASET_TYPES:
+               raise MappingError(
+                   "Unknown dataset type %r. Supported: %s"
+                   % (dataset_type, ", ".join(DATASET_TYPES))
+               )
+   68:     fields = mappable_fields(dataset_type)
+ 1264:     aliases = {field: _alias_set(field) for field in fields}
+   68:     used = set()
+   68:     mapping = []
+   68:     warnings = []
+  435:     for header in headers:
+  367:         normalized = normalize_header(header)
+  367:         internal = None
+  367:         if normalized:
+ 1625:             for field, accepted in aliases.items():
+ 1624:                 if field not in used and normalized in accepted:
+  366:                     internal = field
+  366:                     used.add(field)
+  366:                     break
+  367:             if normalized in ("ignore", "ignored", "unused"):
+                       warnings.append("Column %r marked as ignored." % header)
+  367:         mapping.append({"external": header, "internal": internal})
+       
+  473:     missing_required = [
+  389:         field for field in required_fields(dataset_type)
+ 1991:         if field not in {m["internal"] for m in mapping}
+           ]
+   68:     return {"mapping": mapping, "warnings": warnings, "missing_required": missing_required}
+       
+       
+    1: def infer_dataset_type(headers: list) -> str:
+           """Guess the dataset kind from the columns present.
+       
+           Order of checks: inventory (stock columns, no quantity), transactions
+           (commodity + quantity/date), FPS centers (fps code, no commodity),
+           beneficiaries (beneficiary ref, no quantity), default transactions."""
+  382:     normalized = {normalize_header(h) for h in headers if normalize_header(h)}
+  329:     has = lambda field, aliases: bool(normalized & (set(aliases) | {field}))
+       
+   47:     has_stock = has("current_stock", FIELD_ALIASES["current_stock"])
+   47:     has_quantity = has("quantity", FIELD_ALIASES["quantity"])
+   47:     has_commodity = has("commodity", FIELD_ALIASES["commodity"])
+   47:     has_date = has("transaction_date", FIELD_ALIASES["transaction_date"])
+   47:     has_fps = has("fps_code", FIELD_ALIASES["fps_code"])
+   47:     has_beneficiary = has("external_reference", FIELD_ALIASES["external_reference"])
+       
+   47:     if has_stock and not has_quantity and has_commodity:
+    2:         return "inventory"
+   45:     if has_commodity and (has_quantity or has_date):
+   41:         return "ration_transactions"
+    4:     if has_fps and not has_commodity:
+    2:         return "fps_centers"
+    2:     if has_beneficiary and not has_quantity:
+    2:         return "beneficiaries"
+           return "ration_transactions"
+       
+       
+    1: def validate_mapping(mapping: list, dataset_type: str) -> list:
+           """Return errors (list of strings) if the mapping is unusable.
+       
+           ``mapping`` is a list of ``{"external": ..., "internal": ...}`` dicts."""
+   83:     if not isinstance(mapping, list):
+               raise MappingError("Mapping must be a list of column assignments.")
+   83:     mapped = []
+  594:     for entry in mapping:
+  514:         if not isinstance(entry, dict) or "external" not in entry:
+                   raise MappingError("Malformed mapping entry: %r" % (entry,))
+  514:         internal = entry.get("internal")
+  514:         if internal is None or internal in ("", "ignore"):
+                   continue
+  514:         fields = mappable_fields(dataset_type)
+  514:         if internal not in fields:
+    4:             raise MappingError(
+    4:                 "Column %r maps to unknown field %r (allowed for %s: %s)"
+    2:                 % (entry["external"], internal, dataset_type, ", ".join(fields))
+                   )
+  512:         if internal in mapped:
+    2:             raise MappingError(
+    2:                 "Multiple columns map to the same field %r; each internal field "
+    1:                 "may be used once." % internal
+                   )
+  511:         mapped.append(internal)
+       
+  474:     missing = [f for f in required_fields(dataset_type) if f not in mapped]
+   80:     if missing:
+    4:         labels = ", ".join(field_label(f) for f in missing)
+    1:         return ["Required field(s) are not mapped: %s." % labels]
+   79:     return []
+       
+       
+    1: def mapping_to_dict(mapping: list) -> dict:
+           """Convert the mapping list into ``{external: internal}`` for the importer."""
+   86:     result = {}
+  657:     for entry in mapping:
+  571:         internal = entry.get("internal")
+  571:         if internal and internal != "ignore":
+  571:             result[entry["external"]] = internal
+   86:     return result

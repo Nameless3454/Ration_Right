@@ -1,0 +1,110 @@
+    1: """RationRight — Phase 1: synthetic dataset tests.
+       
+       Run from the project root::
+       
+           python -m unittest discover -s tests -t . -v
+       """
+       
+    1: import unittest
+    1: from datetime import datetime
+       
+    1: from scripts.validate_dataset import (
+           DEFAULT_DATASET_PATH,
+           LARGE_DISTANCE_KM,
+           PLANTED_ANOMALY_IDS,
+           SHORT_INTERVAL_MINUTES,
+           find_suspicious_pairs,
+           load_dataset,
+           validate_transactions,
+           verify_planted_anomaly,
+       )
+       
+       
+    2: class TestSyntheticDataset(unittest.TestCase):
+    1:     """All tests against the checked-in synthetic dataset."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.dataset = load_dataset(DEFAULT_DATASET_PATH)
+    1:         cls.transactions = cls.dataset["transactions"]
+       
+    1:     def test_01_dataset_loads_successfully(self):
+               """TEST 1: dataset loads and is clearly labeled synthetic."""
+    1:         self.assertIsInstance(self.dataset, dict)
+    1:         self.assertIsInstance(self.transactions, list)
+    1:         self.assertGreater(len(self.transactions), 0)
+    1:         metadata = self.dataset.get("metadata", {})
+    1:         self.assertIn("Synthetic Demo Data", metadata.get("label", ""))
+       
+    1:     def test_02_transaction_ids_are_unique(self):
+               """TEST 2: every transaction_id appears exactly once."""
+   27:         ids = [tx["transaction_id"] for tx in self.transactions]
+    1:         self.assertEqual(len(ids), len(set(ids)))
+       
+    1:     def test_03_all_required_fields_exist(self):
+               """TEST 3: every record has all seven documented contract fields."""
+    1:         required = {
+                   "transaction_id",
+                   "beneficiary_id",
+                   "timestamp",
+                   "latitude",
+                   "longitude",
+                   "ration_type",
+                   "quantity",
+               }
+   26:         for tx in self.transactions:
+   25:             with self.subTest(transaction_id=tx.get("transaction_id")):
+   25:                 self.assertTrue(required.issubset(tx.keys()), tx)
+       
+    1:     def test_04_timestamps_are_valid(self):
+               """TEST 4: every timestamp parses as ISO-8601."""
+   26:         for tx in self.transactions:
+   25:             with self.subTest(transaction_id=tx["transaction_id"]):
+   25:                 datetime.fromisoformat(tx["timestamp"])
+       
+    1:     def test_05_coordinates_are_valid(self):
+               """TEST 5: latitudes in [-90, 90] and longitudes in [-180, 180]."""
+   26:         for tx in self.transactions:
+   25:             with self.subTest(transaction_id=tx["transaction_id"]):
+   25:                 self.assertTrue(-90 <= tx["latitude"] <= 90, tx)
+   25:                 self.assertTrue(-180 <= tx["longitude"] <= 180, tx)
+       
+    1:     def test_06_quantities_are_valid(self):
+               """TEST 6: every quantity is positive."""
+   26:         for tx in self.transactions:
+   25:             with self.subTest(transaction_id=tx["transaction_id"]):
+   25:                 self.assertGreater(tx["quantity"], 0)
+       
+    1:     def test_07_planted_anomaly_transactions_exist(self):
+               """TEST 7: the planted anomaly transaction IDs are present."""
+   27:         ids = {tx["transaction_id"] for tx in self.transactions}
+    3:         for tx_id in PLANTED_ANOMALY_IDS:
+    2:             with self.subTest(transaction_id=tx_id):
+    2:                 self.assertIn(tx_id, ids)
+       
+    1:     def test_08_planted_anomaly_satisfies_pattern(self):
+               """TEST 8: the planted pair shares a beneficiary, is within the short
+               interval, and is geographically far apart."""
+    1:         report = verify_planted_anomaly(self.transactions)
+    1:         self.assertTrue(report["present"], report)
+    1:         self.assertTrue(report["pattern_satisfied"], report)
+    1:         self.assertTrue(report["conditions"]["same_beneficiary"], report)
+    1:         self.assertTrue(report["conditions"]["short_time_interval"], report)
+    1:         self.assertTrue(report["conditions"]["large_geographic_distance"], report)
+    1:         self.assertLessEqual(report["time_difference_minutes"], SHORT_INTERVAL_MINUTES)
+    1:         self.assertGreaterEqual(report["distance_km"], LARGE_DISTANCE_KM)
+       
+    1:     def test_09_normal_transactions_do_not_trip_threshold(self):
+               """TEST 9: the planted pair is the ONLY pair meeting the thresholds —
+               normal and control records must not accidentally match."""
+    1:         pairs = find_suspicious_pairs(self.transactions)
+    1:         self.assertEqual(len(pairs), 1)
+    1:         self.assertEqual(pairs[0]["transaction_ids"], sorted(PLANTED_ANOMALY_IDS))
+       
+    1:     def test_10_full_schema_validation_has_no_errors(self):
+               """Full contract validation passes with zero errors."""
+    1:         self.assertEqual(validate_transactions(self.transactions), [])
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

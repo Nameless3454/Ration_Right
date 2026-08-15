@@ -1,0 +1,344 @@
+    1: """RationRight — Agent 3: Evidence Case Builder (Phase 4).
+       
+       Transforms verified findings from Agent 2 into a structured investigation case
+       (an evidence organizer / case builder, NOT a fraud judge). The case follows the
+       documented Investigation Case schema in ``RationRight_complete_docs/
+       data_contract.md``:
+       
+           {"case_id", "severity", "status", "finding_ids", "summary",
+            "evidence", "confidence", "recommended_action"}
+       
+       Deterministic rules used by this agent (documented, not fabricated per-case):
+       - ``status == "requires_human_review"`` when every supplied finding is
+         verified, carries calculated evidence, and every referenced transaction is
+         present in the supplied source data.
+       - ``status == "not_ready"`` when any finding is unverified, any verified
+         finding is missing calculated evidence, or a referenced transaction is
+         missing from the supplied data. No verified case is ever presented from
+         unverified input.
+       - ``severity`` = the shared pattern severity (``high``) for a ready case;
+         ``low`` for a not-ready case (no verified evidence to escalate).
+       - ``confidence`` = 0.9 for a ready case (both anomaly conditions verified
+         against calculated evidence); 0.0 for not-ready.
+       - ``recommended_action`` = "Human verification" (the system never decides
+         guilt or punishment).
+       
+       Agent 2's calculated values are copied into the case unchanged — never
+       recalculated, altered, or guessed. The narrative is generated deterministically
+       from actual input facts only (transaction IDs, beneficiary when derivable from
+       the supplied records, and the verified evidence); interpretation such as
+       "the beneficiary travelled quickly" is never added.
+       
+       Input accepts either the documented ``{"findings": [...]}`` shape or a single
+       ``{"finding": {...}}``, each optionally accompanied by ``"transactions": [...]``
+       used for traceability validation.
+       
+       Run standalone::
+       
+           python3 scripts/run_agent_3.py
+       
+       Import::
+       
+           from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+       
+    1: from agents.llm import maybe_generate
+    1: from agents.pattern_config import RAPID_GEOGRAPHIC_SEVERITY
+       
+    1: logger = logging.getLogger("rationright.agent_3")
+       
+    1: CASE_FIELDS = (
+           "case_id",
+           "severity",
+           "status",
+           "finding_ids",
+           "summary",
+           "evidence",
+           "confidence",
+           "recommended_action",
+       )
+       
+       # Configured deterministic rules (see module docstring).
+    1: VERIFIED_CONFIDENCE = 0.9
+    1: NOT_READY_CONFIDENCE = 0.0
+    1: NOT_READY_SEVERITY = "low"
+    1: DEFAULT_SEVERITY = RAPID_GEOGRAPHIC_SEVERITY
+       
+       
+    2: class Agent3EvidenceCaseBuilder:
+    1:     """Evidence Case Builder: organizes verified findings into a case."""
+       
+    1:     def __init__(self, severity: str = DEFAULT_SEVERITY, narrative_generator=None):
+   49:         self.severity = severity
+   49:         self.narrative_generator = narrative_generator
+       
+    1:     def run(self, payload: dict) -> dict:
+               """Build one investigation case from verified findings.
+       
+               ``payload`` is ``{"findings": [...]}`` or ``{"finding": {...}}``,
+               optionally with ``"transactions": [...]`` for traceability checks.
+               """
+   47:         logger.info("Agent 3 started")
+   47:         findings, transactions = self._normalize_input(payload)
+       
+   87:         for finding in findings:
+   46:             self._validate_finding(finding)
+   82:         logger.info(
+   41:             "Finding(s) received and validated: %s",
+  125:             [f["finding_id"] for f in findings],
+               )
+       
+  980:         by_id = {
+  857:             tx.get("transaction_id"): tx
+  898:             for tx in transactions
+  857:             if isinstance(tx, dict) and isinstance(tx.get("transaction_id"), str)
+               }
+       
+  125:         unverified = [f for f in findings if f["status"] != "verified"]
+   41:         if unverified:
+    2:             logger.warning(
+    1:                 "Finding(s) are not verified: %s",
+    3:                 [f["finding_id"] for f in unverified],
+                   )
+    2:             return self._not_ready_case(
+    1:                 findings,
+    2:                 "Case is not ready for review: finding(s) "
+    3:                 f"{', '.join(f['finding_id'] for f in unverified)} are unverified, "
+                       "so no verified investigation case can be assembled.",
+                   )
+       
+  162:         missing_evidence = [
+    1:             f
+   82:             for f in findings
+   42:             if not isinstance(f.get("evidence"), dict)
+   42:             or "time_difference_minutes" not in f["evidence"]
+   41:             or "distance_km" not in f["evidence"]
+               ]
+   40:         if missing_evidence:
+    2:             logger.warning(
+    1:                 "Finding(s) are missing calculated evidence: %s",
+    3:                 [f["finding_id"] for f in missing_evidence],
+                   )
+    2:             return self._not_ready_case(
+    1:                 findings,
+    2:                 "Case is not ready for review: finding(s) "
+    3:                 f"{', '.join(f['finding_id'] for f in missing_evidence)} are missing "
+                       "calculated evidence.",
+                   )
+       
+   39:         missing_transactions = []
+   80:         for finding in findings:
+  123:             for transaction_id in finding["transaction_ids"]:
+   82:                 if transaction_id not in by_id:
+    1:                     missing_transactions.append(transaction_id)
+   39:         if missing_transactions:
+    2:             logger.warning(
+    1:                 "Referenced transaction(s) missing from supplied data: %s",
+    1:                 missing_transactions,
+                   )
+    2:             return self._not_ready_case(
+    1:                 findings,
+    2:                 "Case is not ready for review: referenced transaction(s) "
+    1:                 f"{', '.join(missing_transactions)} are missing from the supplied data.",
+                   )
+   38:         logger.info("Source transactions located: OK")
+       
+               # Evidence is copied from Agent 2 unchanged (preservation, not recalculation).
+   38:         evidence = []
+   78:         for finding in findings:
+   80:             evidence.append({
+   40:                 "type": "time_difference",
+   40:                 "value": finding["evidence"]["time_difference_minutes"],
+   40:                 "unit": "minutes",
+                   })
+   80:             evidence.append({
+   40:                 "type": "distance",
+   40:                 "value": finding["evidence"]["distance_km"],
+   40:                 "unit": "km",
+                   })
+   38:         logger.info("Evidence consistency checked: Agent 2 values preserved")
+       
+   38:         summary = self._build_summary(findings, by_id)
+   76:         summary = maybe_generate(
+   38:             "agent_3_summary",
+   38:             {
+   38:                 "case_id": "CASE001",
+  116:                 "finding_ids": [f["finding_id"] for f in findings],
+  116:                 "anomaly_ids": [f["anomaly_id"] for f in findings],
+   76:                 "transaction_ids": sorted(
+  196:                     {tid for f in findings for tid in f["transaction_ids"]}
+                       ),
+  154:                 "beneficiaries": sorted({
+   80:                     by_id[tid]["beneficiary_id"]
+   78:                     for f in findings
+  120:                     for tid in f["transaction_ids"]
+   80:                     if tid in by_id
+   80:                     and isinstance(by_id[tid].get("beneficiary_id"), str)
+   80:                     and by_id[tid]["beneficiary_id"]
+                       }),
+   38:                 "evidence": evidence,
+   38:                 "severity": self.severity,
+   38:                 "confidence": VERIFIED_CONFIDENCE,
+   38:                 "status": "requires_human_review",
+                   },
+   38:             summary,
+   38:             generator=self.narrative_generator,
+               )
+   38:         logger.info("Narrative generated")
+       
+   38:         case = {
+   38:             "case_id": "CASE001",
+   38:             "severity": self.severity,
+   38:             "status": "requires_human_review",
+  116:             "finding_ids": [f["finding_id"] for f in findings],
+   38:             "summary": summary,
+   38:             "evidence": evidence,
+   38:             "confidence": VERIFIED_CONFIDENCE,
+   38:             "recommended_action": "Human verification",
+               }
+   38:         logger.info("Case assembled")
+   38:         self._validate_case(case)
+   76:         logger.info(
+   38:             "Structured case validated: %s (status=%s)",
+   38:             case["case_id"],
+   38:             case["status"],
+               )
+   38:         return case
+       
+    1:     @staticmethod
+    1:     def _normalize_input(payload: dict):
+               """Accept ``{"findings": [...]}`` or ``{"finding": {...}}`` plus
+               optional ``"transactions"``. Returns (findings, transactions)."""
+   47:         if not isinstance(payload, dict):
+    1:             raise ValueError("payload must be an object with 'findings' (or 'finding')")
+   46:         findings = payload.get("findings")
+   46:         if findings is None:
+    2:             single = payload.get("finding")
+    2:             if single is None:
+    1:                 raise ValueError("payload must contain 'findings' (list) or 'finding' (single finding)")
+    1:             findings = [single]
+   45:         if not isinstance(findings, list) or not findings:
+    1:             raise ValueError("payload['findings'] must be a non-empty list of findings")
+   44:         transactions = payload.get("transactions", [])
+   44:         if not isinstance(transactions, list):
+                   raise ValueError("payload['transactions'] must be a list")
+   44:         return findings, transactions
+       
+    1:     @staticmethod
+    1:     def _validate_finding(finding) -> None:
+               """Reject malformed findings with a clear validation error."""
+   46:         if not isinstance(finding, dict):
+    1:             raise ValueError("Each finding must be an object")
+   45:         finding_id = finding.get("finding_id")
+   45:         anomaly_id = finding.get("anomaly_id")
+   45:         status = finding.get("status")
+   45:         transaction_ids = finding.get("transaction_ids")
+   45:         evidence = finding.get("evidence")
+   45:         if not isinstance(finding_id, str) or not finding_id:
+                   raise ValueError("Finding is missing a valid 'finding_id'")
+   45:         if not isinstance(anomaly_id, str) or not anomaly_id:
+                   raise ValueError(f"Finding {finding_id} is missing a valid 'anomaly_id'")
+   45:         if status not in ("verified", "unverified"):
+    1:             raise ValueError(f"Finding {finding_id} has invalid status: {status!r}")
+  132:         if (
+   44:             not isinstance(transaction_ids, list)
+   44:             or not transaction_ids
+  176:             or not all(isinstance(t, str) and t for t in transaction_ids)
+               ):
+                   raise ValueError(f"Finding {finding_id} has invalid 'transaction_ids'")
+   44:         if not isinstance(evidence, dict):
+                   raise ValueError(f"Finding {finding_id} has invalid 'evidence'")
+   44:         if status == "verified":
+  127:             for key in ("time_difference_minutes", "distance_km"):
+   85:                 if key in evidence:
+   83:                     value = evidence[key]
+   83:                     if not isinstance(value, (int, float)) or isinstance(value, bool):
+    2:                         raise ValueError(
+    1:                             f"Finding {finding_id} has malformed evidence value for '{key}'"
+                               )
+   43:         evidence_sources = finding.get("evidence_sources")
+   43:         if evidence_sources is not None and not isinstance(evidence_sources, list):
+                   raise ValueError(f"Finding {finding_id} has invalid 'evidence_sources'")
+       
+    1:     def _not_ready_case(self, findings: list, summary: str) -> dict:
+               """Build a contract-shaped case that is explicitly NOT ready."""
+    3:         case = {
+    3:             "case_id": "CASE001",
+    3:             "severity": NOT_READY_SEVERITY,
+    3:             "status": "not_ready",
+    9:             "finding_ids": [f["finding_id"] for f in findings],
+    3:             "summary": summary,
+    3:             "evidence": [],
+    3:             "confidence": NOT_READY_CONFIDENCE,
+    3:             "recommended_action": "Human verification",
+               }
+    3:         logger.info("Case assembled (not ready)")
+    3:         self._validate_case(case)
+    6:         logger.info(
+    3:             "Structured case validated: %s (status=%s)",
+    3:             case["case_id"],
+    3:             case["status"],
+               )
+    3:         return case
+       
+    1:     @staticmethod
+    1:     def _build_summary(findings: list, by_id: dict) -> str:
+               """Generate a deterministic narrative from actual input facts only."""
+   38:         if len(findings) == 1:
+   36:             finding = findings[0]
+   36:             transaction_ids = finding["transaction_ids"]
+   36:             time_diff = finding["evidence"]["time_difference_minutes"]
+   36:             distance = finding["evidence"]["distance_km"]
+  180:             beneficiaries = sorted({
+   72:                 by_id[tid]["beneficiary_id"]
+  108:                 for tid in transaction_ids
+   72:                 if tid in by_id
+   72:                 and isinstance(by_id[tid].get("beneficiary_id"), str)
+   72:                 and by_id[tid]["beneficiary_id"]
+                   })
+   36:             who = f" for beneficiary {', '.join(beneficiaries)}" if beneficiaries else ""
+   36:             return (
+  144:                 f"The referenced transactions {transaction_ids}{who} were recorded "
+   72:                 f"{time_diff:.2f} minutes apart at locations {distance:.2f} km apart, "
+                       f"calculated from the supplied transaction timestamps and coordinates. "
+   36:                 f"Finding {finding['finding_id']} was verified against the configured "
+                       "rapid-geographic-transaction criteria; this case requires human review."
+                   )
+   10:         details = "; ".join(
+   12:             f"finding {f['finding_id']} (anomaly {f['anomaly_id']}) recorded "
+    4:             f"{f['evidence']['time_difference_minutes']:.2f} minutes apart at "
+    4:             f"{f['evidence']['distance_km']:.2f} km"
+    6:             for f in findings
+               )
+    2:         return (
+    2:             f"A case was assembled from verified findings: {details}. Values were "
+                   "calculated from the supplied transaction timestamps and coordinates; "
+                   "this case requires human review."
+               )
+       
+    1:     @staticmethod
+    1:     def _validate_case(case: dict) -> None:
+               """Self-check that the case satisfies the documented contract."""
+   41:         required = set(CASE_FIELDS)
+   41:         if not required.issubset(case):
+                   raise ValueError(f"Invalid case: {case!r}")
+   41:         if case["status"] not in ("requires_human_review", "not_ready"):
+                   raise ValueError(f"Invalid case status: {case['status']!r}")
+   41:         if not isinstance(case["finding_ids"], list) or not case["finding_ids"]:
+                   raise ValueError(f"Case must reference at least one finding: {case!r}")
+   41:         if case["status"] == "requires_human_review" and not case["evidence"]:
+                   raise ValueError(f"A ready case must contain evidence: {case!r}")
+   41:         if not isinstance(case["confidence"], (int, float)) or not (0.0 <= case["confidence"] <= 1.0):
+                   raise ValueError(f"Case confidence must be in [0, 1]: {case!r}")
+  121:         for entry in case["evidence"]:
+  320:             if (
+   80:                 not isinstance(entry, dict)
+   80:                 or set(entry.keys()) != {"type", "value", "unit"}
+   80:                 or not isinstance(entry["value"], (int, float))
+   80:                 or isinstance(entry["value"], bool)
+                   ):
+                       raise ValueError(f"Case has malformed evidence entry: {entry!r}")

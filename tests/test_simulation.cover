@@ -1,0 +1,451 @@
+    1: """RationRight — Phase 10: Decision Support & What-If Simulation tests.
+       
+       Covers ``simulation.py``: the scenario type registry, database-driven
+       entities/current situation, the deterministic scenario engine (demand
+       change, supply delay, inventory change, FPS/district scoping), input
+       validation and documented bounds, edge cases (zero stock / zero
+       consumption), the INSUFFICIENT_DATA contract, persistence (scenario
+       metadata only — real records are never modified), history/detail with
+       lineage, AI interpretation with its deterministic fallback, and the API
+       surface.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import simulation as sim
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+    1: _SEED_COUNTER = [0]
+       
+       
+    1: def _seed(conn, with_inventory=True, months=4, stock=1000.0,
+                 monthly=1200.0, threshold=500.0):
+           """A real import with transactions + inventory for scenario math."""
+   26:     src = db.get_data_source_by_name(conn, "Uploaded Dataset")
+   77:     src_id = db.insert_data_source(
+   25:         conn, name="Uploaded Dataset", source_type="MANUAL",
+   25:         description="t", status="ACTIVE",
+   27:     ) if src is None else src["id"]
+   52:     imp_id = db.insert_data_import(
+   26:         conn, data_source_id=src_id, dataset_name="pds_aug",
+   26:         file_name="pds_aug.csv", file_type="CSV", record_count=100,
+   26:         successful_records=100, status="COMPLETED")
+   52:     db.upsert_beneficiaries(conn, [{"external_reference": "RB1",
+   26:                                     "district": "Lucknow",
+   26:                                     "ration_category": "AAY",
+   26:                                     "family_size": 4, "status": "ACTIVE"}])
+   26:     ben = db.beneficiary_ids(conn, ["RB1"])
+   52:     db.upsert_fps_centers(conn, [
+   52:         {"fps_code": "FPS1", "name": "Center One", "district": "Lucknow",
+   26:          "state": "UP", "status": "ACTIVE"},
+   52:         {"fps_code": "FPS2", "name": "Center Two", "district": "Kanpur",
+   26:          "state": "UP", "status": "ACTIVE"},
+           ])
+   26:     fps = db.fps_center_ids(conn, ["FPS1", "FPS2"])
+   26:     rows = []
+   26:     _SEED_COUNTER[0] += 1
+   26:     seed_n = _SEED_COUNTER[0]
+   26:     seq = 0
+  130:     for month in range(months):
+  104:         m = "%02d" % (5 + month)  # 2026-05 .. 2026-08
+  520:         for i in range(4):
+  416:             seq += 1
+  832:             fps_id, qty = (fps["FPS1"], 100.0 + i * 10) if i % 2 == 0 \
+  208:                 else (fps["FPS2"], 80.0 + i * 5)
+  832:             rows.append({
+  416:                 "external_transaction_id": "TX%03d-%04d" % (seed_n, seq),
+  416:                 "beneficiary_id": ben["RB1"], "fps_center_id": fps_id,
+  416:                 "transaction_date": "2026-%s-%02d" % (m, i + 1),
+  416:                 "commodity": "rice", "quantity": qty, "unit": "kg",
+  416:                 "latitude": 26.8, "longitude": 80.9, "status": "COMPLETED",
+  416:                 "source_import_id": imp_id,
+                   })
+   26:     db.insert_transactions_batch(conn, rows)
+   26:     if with_inventory:
+   50:         db.insert_inventory_batch(conn, [
+   50:             {"fps_center_id": fps["FPS1"], "commodity": "rice",
+   25:              "current_stock": stock, "monthly_consumption": monthly,
+   25:              "reorder_threshold": threshold, "source_import_id": imp_id},
+   50:             {"fps_center_id": fps["FPS2"], "commodity": "rice",
+   25:              "current_stock": stock * 2.4, "monthly_consumption": monthly * 2,
+   25:              "reorder_threshold": threshold, "source_import_id": imp_id},
+               ])
+   26:     conn.commit()
+   26:     return imp_id
+       
+       
+    2: class ScenarioMathTests(unittest.TestCase):
+    1:     def setUp(self):
+   11:         self._tmp = tempfile.TemporaryDirectory()
+   11:         self.db_path = Path(self._tmp.name) / "sim.db"
+   11:         self.addCleanup(self._tmp.cleanup)
+   11:         self.conn = db.open_db(self.db_path)
+   11:         self.imp_id = _seed(self.conn)
+   11:         self.conn.close()
+       
+    1:     def test_registry_types_are_real_and_described(self):
+    1:         types = sim.simulation_type_registry()
+    6:         keys = {t["key"] for t in types}
+    1:         self.assertEqual(keys, {"DEMAND_CHANGE", "SUPPLY_DELAY",
+                                       "INVENTORY_CHANGE", "COMBINED"})
+    5:         for t in types:
+    4:             self.assertTrue(t["label"] and t["description"])
+       
+    1:     def test_entities_come_from_the_database(self):
+    1:         e = sim.simulation_entities(self.imp_id, db_path=self.db_path)
+    1:         self.assertEqual(e["commodities"], ["rice"])
+    1:         self.assertEqual(e["districts"], ["Kanpur", "Lucknow"])
+    1:         self.assertEqual(e["fps"], ["FPS1", "FPS2"])
+       
+    1:     def test_current_situation_reports_real_metrics(self):
+    1:         sit = sim.current_situation(self.imp_id, db_path=self.db_path)
+    1:         self.assertEqual(sit["transaction_count"], 16)
+               # 400 kg/month across 4 months (FPS1 220 + FPS2 180 per month)
+    1:         self.assertEqual(sit["total_quantity_kg"], 1600.0)
+               # inventory 1000 + 2400 = 3400; consumption 1200 + 2400 = 3600/mo
+    1:         self.assertEqual(sit["inventory_stock_kg"], 3400.0)
+    1:         self.assertEqual(sit["monthly_consumption_kg"], 3600.0)
+    1:         self.assertEqual(sit["average_daily_consumption_kg"], 120.0)
+    2:         self.assertEqual(sit["estimated_coverage_days"],
+    1:                          round(3400 * 30 / 3600, 1))  # 28.3 days
+    1:         self.assertEqual(len(sit["high_risk_fps"]), 0)
+       
+    1:     def test_demand_plus_ten_percent_is_deterministic(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                              demand_change_pct=10, db_path=self.db_path)
+    1:         self.assertEqual(r["status"], "completed")
+               # baseline monthly demand: 1600 kg over 4 months = 400 kg/month
+    1:         self.assertEqual(r["baseline"]["monthly_demand_kg"], 400.0)
+    1:         self.assertEqual(r["scenario"]["projected_monthly_demand_kg"], 440.0)
+               # daily consumption 120 -> 132 kg/day; coverage 3400/132 = 25.8 days
+    1:         self.assertEqual(r["baseline"]["daily_consumption_kg"], 120.0)
+    1:         self.assertEqual(r["scenario"]["projected_daily_consumption_kg"], 132.0)
+    2:         self.assertEqual(r["scenario"]["projected_coverage_days"],
+    1:                          round(3400 / 132, 1))
+    1:         self.assertEqual(r["risk"], "WARNING")  # < 30-day threshold
+    1:         self.assertEqual(r["entity"]["id"], "whole_dataset")
+       
+    1:     def test_demand_minus_ten_percent(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                              demand_change_pct=-10, db_path=self.db_path)
+    1:         self.assertEqual(r["scenario"]["projected_monthly_demand_kg"], 360.0)
+    1:         self.assertEqual(r["scenario"]["projected_daily_consumption_kg"], 108.0)
+    2:         self.assertEqual(r["scenario"]["projected_coverage_days"],
+    1:                          round(3400 / 108, 1))
+    1:         self.assertEqual(r["risk"], "HEALTHY")
+       
+    1:     def test_supply_delay_consumes_stock(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                              supply_delay_days=7, db_path=self.db_path)
+    1:         sc = r["scenario"]
+    1:         self.assertEqual(sc["consumption_during_delay_kg"], 840.0)  # 120*7
+    1:         self.assertEqual(sc["projected_stock_after_delay_kg"], 2560.0)
+               # requirement: projected monthly demand 400 - stock after delay 2560 -> 0
+    1:         self.assertEqual(sc["simulated_reorder_requirement_kg"], 0.0)
+       
+    1:     def test_inventory_change_scale(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                              inventory_change_pct=-25, db_path=self.db_path)
+    1:         self.assertEqual(r["scenario"]["stock_after_inventory_change_kg"], 2550.0)
+    2:         self.assertEqual(r["scenario"]["projected_coverage_days"],
+    1:                          round(2550 / 120, 1))
+    2:         r2 = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                               inventory_change_pct=50, db_path=self.db_path)
+    1:         self.assertEqual(r2["scenario"]["stock_after_inventory_change_kg"], 5100.0)
+       
+    1:     def test_combined_scenario(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                              demand_change_pct=100, supply_delay_days=30,
+    1:                              inventory_change_pct=-50, db_path=self.db_path)
+    1:         sc = r["scenario"]
+    1:         self.assertEqual(sc["stock_after_inventory_change_kg"], 1700.0)
+    1:         self.assertEqual(sc["projected_daily_consumption_kg"], 240.0)
+    1:         self.assertEqual(sc["consumption_during_delay_kg"], 7200.0)
+    1:         self.assertEqual(sc["projected_stock_after_delay_kg"], 0.0)
+    1:         self.assertEqual(r["risk"], "CRITICAL")  # stock exhausted by the delay
+    2:         self.assertEqual(sc["simulated_reorder_requirement_kg"],
+    1:                          round(max(0.0, 800.0 - 0.0), 2))
+       
+    1:     def test_fps_scoping_uses_only_that_center(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice", fps_code="FPS2",
+    1:                              db_path=self.db_path)
+    1:         self.assertEqual(r["entity"]["id"], "FPS2")
+    1:         self.assertEqual(r["entity"]["type"], "fps_center")
+               # FPS2 only: stock 2400 kg, consumption 2400/mo -> daily 80
+    1:         self.assertEqual(r["baseline"]["current_stock_kg"], 2400.0)
+    1:         self.assertEqual(r["baseline"]["daily_consumption_kg"], 80.0)
+               # FPS2 monthly demand: 720 kg over 4 months = 180 kg/month
+    1:         self.assertEqual(r["baseline"]["monthly_demand_kg"], 180.0)
+       
+    1:     def test_district_scoping(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice", district="Kanpur",
+    1:                              db_path=self.db_path)
+    1:         self.assertEqual(r["entity"]["id"], "Kanpur")
+    1:         self.assertEqual(r["entity"]["type"], "district")
+    1:         self.assertEqual(r["baseline"]["current_stock_kg"], 2400.0)
+       
+    1:     def test_zero_inventory_is_critical_not_unknown(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             imp2 = _seed(conn, with_inventory=True, stock=0.0)
+               finally:
+    1:             conn.close()
+    1:         r = sim.run_scenario(imp2, commodity="rice", db_path=self.db_path)
+    1:         self.assertEqual(r["risk"], "CRITICAL")
+       
+       
+    2: class EdgeCaseAndSafetyTests(unittest.TestCase):
+    1:     def setUp(self):
+    8:         self._tmp = tempfile.TemporaryDirectory()
+    8:         self.db_path = Path(self._tmp.name) / "sim.db"
+    8:         self.addCleanup(self._tmp.cleanup)
+    8:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_zero_consumption_marks_coverage_not_calculable(self):
+    1:         imp_id = _seed(self.conn, with_inventory=True, monthly=0.0)
+    1:         r = sim.run_scenario(imp_id, commodity="rice", db_path=self.db_path)
+    1:         self.assertEqual(r["scenario"]["coverage_label"], "NOT CALCULABLE")
+    1:         self.assertEqual(r["baseline"]["daily_consumption_kg"], None)
+    1:         self.assertEqual(r["risk"], "UNKNOWN")
+       
+    1:     def test_no_inventory_means_no_stock_but_transactions_exist(self):
+    1:         imp_id = _seed(self.conn, with_inventory=False)
+    1:         r = sim.run_scenario(imp_id, commodity="rice", db_path=self.db_path)
+    1:         self.assertEqual(r["status"], "completed")
+    1:         self.assertEqual(r["baseline"]["current_stock_kg"], 0.0)
+    1:         self.assertEqual(r["risk"], "CRITICAL")
+       
+    1:     def test_missing_scope_data_returns_insufficient(self):
+    1:         imp_id = _seed(self.conn)
+    1:         r = sim.run_scenario(imp_id, commodity="wheat", db_path=self.db_path)
+    1:         self.assertEqual(r["status"], "INSUFFICIENT_DATA")
+    1:         self.assertIn("no transactions", r["reason"].lower())
+    1:         self.assertIsNone(r["scenario_id"])
+       
+    1:     def test_unknown_import_returns_insufficient(self):
+    1:         r = sim.run_scenario(99999, commodity="rice", db_path=self.db_path)
+    1:         self.assertEqual(r["status"], "INSUFFICIENT_DATA")
+       
+    1:     def test_validation_rejects_out_of_range_values(self):
+    1:         with self.assertRaises(sim.SimulationError):
+    3:             sim.run_scenario(self.imp_id if False else 1, commodity="rice",
+    1:                              demand_change_pct=101, db_path=self.db_path)
+    1:         with self.assertRaises(sim.SimulationError):
+    3:             sim.run_scenario(1, commodity="rice", demand_change_pct=-51,
+    1:                              db_path=self.db_path)
+    1:         with self.assertRaises(sim.SimulationError):
+    3:             sim.run_scenario(1, commodity="rice", supply_delay_days=366,
+    1:                              db_path=self.db_path)
+    1:         with self.assertRaises(sim.SimulationError):
+    3:             sim.run_scenario(1, commodity="rice", supply_delay_days=-1,
+    1:                              db_path=self.db_path)
+    1:         with self.assertRaises(sim.SimulationError):
+    3:             sim.run_scenario(1, commodity="rice", inventory_change_pct=101,
+    1:                              db_path=self.db_path)
+    1:         with self.assertRaises(sim.SimulationError):
+    2:             sim.run_scenario(1, commodity=None, db_path=self.db_path)
+       
+    1:     def test_boundary_values_are_accepted(self):
+    1:         imp_id = _seed(self.conn)
+    2:         r = sim.run_scenario(imp_id, commodity="rice", demand_change_pct=100,
+    1:                              supply_delay_days=0, inventory_change_pct=-100,
+    1:                              db_path=self.db_path)
+    1:         self.assertEqual(r["status"], "completed")
+    1:         self.assertEqual(r["scenario"]["stock_after_inventory_change_kg"], 0.0)
+    1:         self.assertEqual(r["risk"], "CRITICAL")
+       
+    1:     def test_scenario_never_modifies_real_records(self):
+    1:         imp_id = _seed(self.conn)
+    1:         conn = db.open_db(self.db_path)
+    1:         before = {
+    1:             "stock": conn.execute("SELECT COALESCE(SUM(current_stock),0) FROM inventory").fetchone()[0],
+    1:             "tx": conn.execute("SELECT COUNT(*) FROM ration_transactions").fetchone()[0],
+    1:             "ben": conn.execute("SELECT COUNT(*) FROM beneficiaries").fetchone()[0],
+               }
+    1:         conn.close()
+    2:         sim.run_scenario(imp_id, commodity="rice", demand_change_pct=50,
+    1:                          supply_delay_days=30, inventory_change_pct=-50,
+    1:                          db_path=self.db_path)
+    1:         conn = db.open_db(self.db_path)
+    1:         after = {
+    1:             "stock": conn.execute("SELECT COALESCE(SUM(current_stock),0) FROM inventory").fetchone()[0],
+    1:             "tx": conn.execute("SELECT COUNT(*) FROM ration_transactions").fetchone()[0],
+    1:             "ben": conn.execute("SELECT COUNT(*) FROM beneficiaries").fetchone()[0],
+               }
+    1:         conn.close()
+    1:         self.assertEqual(before, after)
+       
+    1:     def test_ai_interpretation_fallback_and_injection(self):
+    1:         imp_id = _seed(self.conn)
+               # no LLM enabled -> deterministic fallback, flagged honestly
+    2:         r = sim.run_scenario(imp_id, commodity="rice", demand_change_pct=10,
+    1:                              db_path=self.db_path)
+    2:         self.assertEqual(r["interpretation"]["generated_by"],
+    1:                          "deterministic_fallback")
+    1:         self.assertIn("scenario result, not a prediction", r["interpretation"]["summary"])
+               # injected generator -> llm path (deterministic math unchanged)
+    1:         calls = []
+    1:         def fake_gen(kind, context, fallback):
+    1:             calls.append(kind)
+    2:             return "AI: %s demand moves coverage from %s to %s days." % (
+    1:                 context["demand_change_pct"],
+    1:                 context["coverage_days_current"], context["coverage_days_projected"])
+    2:         r2 = sim.run_scenario(imp_id, commodity="rice", demand_change_pct=10,
+    1:                               db_path=self.db_path, generator=fake_gen)
+    1:         self.assertEqual(calls, ["scenario_interpretation"])
+    1:         self.assertEqual(r2["interpretation"]["generated_by"], "llm")
+    2:         self.assertEqual(r2["scenario"]["projected_monthly_demand_kg"],
+    1:                          r["scenario"]["projected_monthly_demand_kg"])
+               # an injected generator that throws must not break the scenario
+    2:         r3 = sim.run_scenario(imp_id, commodity="rice", demand_change_pct=10,
+    1:                               db_path=self.db_path,
+    2:                               generator=lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    1:         self.assertEqual(r3["status"], "completed")
+       
+       
+    2: class PersistenceAndLineageTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.db_path = Path(self._tmp.name) / "sim.db"
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.conn = db.open_db(self.db_path)
+    3:         self.imp_id = _seed(self.conn)
+    3:         self.conn.close()
+       
+    1:     def test_scenario_persisted_with_lineage(self):
+    2:         r = sim.run_scenario(self.imp_id, commodity="rice", district="Lucknow",
+    1:                              demand_change_pct=10, supply_delay_days=7,
+    1:                              db_path=self.db_path)
+    1:         self.assertRegex(r["scenario_id"], r"^SIM-\d{4}-\d{4}$")
+    1:         self.assertEqual(r["lineage"]["data_import_id"], self.imp_id)
+    1:         self.assertEqual(r["lineage"]["dataset_name"], "pds_aug")
+    1:         self.assertEqual(r["lineage"]["source_name"], "Uploaded Dataset")
+               # persisted detail
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    2:             row = conn.execute(
+    1:                 "SELECT * FROM scenarios WHERE scenario_id = :s",
+    1:                 {"s": r["scenario_id"]}).fetchone()
+    1:             self.assertIsNotNone(row)
+    1:             self.assertEqual(row["risk"], r["risk"])
+    1:             self.assertEqual(row["entity_id"], "Lucknow")
+    1:             params = json.loads(row["parameters"])
+    1:             self.assertEqual(params["demand_change_pct"], 10)
+    1:             self.assertEqual(params["supply_delay_days"], 7)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_history_and_detail_reproduce_the_scenario(self):
+    2:         sim.run_scenario(self.imp_id, commodity="rice", demand_change_pct=10,
+    1:                          db_path=self.db_path)
+    2:         sim.run_scenario(self.imp_id, commodity="rice", fps_code="FPS1",
+    1:                          supply_delay_days=5, db_path=self.db_path)
+    1:         hist = sim.scenario_history(db_path=self.db_path)
+    1:         self.assertEqual(hist["total"], 2)
+    1:         self.assertEqual(len(hist["scenarios"]), 2)
+    1:         first = hist["scenarios"][0]
+    1:         self.assertIn("dataset_name", first)
+    1:         self.assertIn("source_name", first)
+    1:         self.assertEqual(first["source_name"], "Uploaded Dataset")
+    1:         detail = sim.scenario_detail(first["id"], db_path=self.db_path)
+    1:         self.assertEqual(detail["scenario_id"], first["scenario_id"])
+    1:         self.assertEqual(detail["results"]["status"], "completed")
+    1:         self.assertEqual(detail["parameters"]["commodity"], "rice")
+    1:         self.assertEqual(detail["dataset_name"], "pds_aug")
+    1:         self.assertIsNotNone(detail["ai_interpretation"]["summary"])
+       
+    1:     def test_run_again_creates_a_new_scenario(self):
+    2:         r1 = sim.run_scenario(self.imp_id, commodity="rice", demand_change_pct=10,
+    1:                               db_path=self.db_path)
+    2:         r2 = sim.run_scenario(self.imp_id, commodity="rice", demand_change_pct=10,
+    1:                               db_path=self.db_path)
+    1:         self.assertNotEqual(r1["scenario_id"], r2["scenario_id"])
+    2:         self.assertEqual(r1["scenario"]["projected_monthly_demand_kg"],
+    1:                          r2["scenario"]["projected_monthly_demand_kg"])
+       
+       
+    2: class SimulationApiTests(unittest.TestCase):
+    1:     def setUp(self):
+    5:         self._tmp = tempfile.TemporaryDirectory()
+    5:         self.db_path = Path(self._tmp.name) / "sim-api.db"
+    5:         self.addCleanup(self._tmp.cleanup)
+    5:         self.conn = db.open_db(self.db_path)
+    5:         self.imp_id = _seed(self.conn)
+    5:         self.conn.close()
+    5:         server = make_server(host="127.0.0.1", port=0, db_path=self.db_path)
+    5:         self.thread = threading.Thread(target=server.serve_forever, daemon=True)
+    5:         self.thread.start()
+    5:         self.port = server.server_address[1]
+       
+    1:     def _get(self, path):
+    5:         with urllib.request.urlopen(BASE + ":" + str(self.port) + path, timeout=10) as resp:
+    5:             return resp.status, json.loads(resp.read().decode())
+       
+    1:     def _post(self, path, body):
+    8:         req = urllib.request.Request(
+    4:             BASE + ":" + str(self.port) + path,
+    4:             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    4:         with urllib.request.urlopen(req, timeout=10) as resp:
+    2:             return resp.status, json.loads(resp.read().decode())
+       
+    1:     def test_types_endpoint(self):
+    1:         status, payload = self._get("/api/simulation/types")
+    1:         self.assertEqual(status, 200)
+    7:         self.assertEqual({t["key"] for t in payload["types"]},
+    1:                          {"DEMAND_CHANGE", "SUPPLY_DELAY", "INVENTORY_CHANGE", "COMBINED"})
+       
+    1:     def test_entities_and_situation_endpoints(self):
+    1:         status, e = self._get("/api/simulation/entities?import_id=%d" % self.imp_id)
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(e["commodities"], ["rice"])
+    1:         status, sit = self._get("/api/simulation/situation?import_id=%d" % self.imp_id)
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(sit["inventory_stock_kg"], 3400.0)
+       
+    1:     def test_run_endpoint_completes_and_persists(self):
+    2:         status, r = self._post("/api/simulation/run", {
+    1:             "import_id": self.imp_id, "commodity": "rice",
+    1:             "demand_change_pct": 50, "supply_delay_days": 30,
+    1:             "inventory_change_pct": -50})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(r["status"], "completed")
+    1:         self.assertEqual(r["risk"], "CRITICAL")  # stock exhausted by delay
+    1:         status, hist = self._get("/api/simulation/history")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(hist["total"], 1)
+    1:         status, detail = self._get("/api/simulation/history/%d" % hist["scenarios"][0]["id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(detail["scenario_id"], r["scenario_id"])
+       
+    1:     def test_run_endpoint_400_on_invalid_input(self):
+    1:         with self.assertRaises(urllib.error.HTTPError) as ctx:
+    3:             self._post("/api/simulation/run", {
+    1:                 "import_id": self.imp_id, "commodity": "rice",
+    1:                 "demand_change_pct": 200})
+    1:         self.assertEqual(ctx.exception.code, 400)
+    1:         with self.assertRaises(urllib.error.HTTPError) as ctx:
+    2:             self._post("/api/simulation/run", {"commodity": "rice"})
+    1:         self.assertEqual(ctx.exception.code, 400)
+       
+    1:     def test_run_endpoint_insufficient_data_is_200(self):
+    2:         status, r = self._post("/api/simulation/run", {
+    1:             "import_id": self.imp_id, "commodity": "sugar"})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(r["status"], "INSUFFICIENT_DATA")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

@@ -1,0 +1,719 @@
+    1: """RationAI — data pipeline status, quality, freshness, lineage (Phase 8).
+       
+       The user-facing Data Pipeline experience is driven entirely from real
+       database state — nothing here invents numbers. It answers:
+       
+           Where does data come from?        -> data_sources
+           How does it enter RationAI?       -> data_imports (fetch counts)
+           How is it validated/normalized?   -> stored valid/failed/warnings counts
+           How are duplicates handled?       -> stored duplicate counts
+           How does it reach the database?   -> live table counts
+           How do analytics consume it?      -> the Phase 5 analytics service
+           How do AI agents consume it?      -> analysis_runs + ai_insights
+       
+       The quality score reuses the exact Phase 4 formula (``quality_report``) —
+       there is only one quality calculation in the system. Freshness thresholds
+       are documented constants below. Analysis runs are recorded by the server
+       after every real workflow execution (see ``record_analysis_run``), giving
+       every AI insight a durable lineage chain:
+       
+           AI insight <- analysis run <- data import <- data source
+       
+       No LLM calls, no API keys, no secrets anywhere in this module.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime, timezone
+    1: from typing import Callable, Optional
+       
+    1: from connectors.errors import (
+           AuthError,
+           ConnectorError,
+           HttpStatusError,
+           RateLimitError,
+           TimeoutError as ConnectorTimeoutError,
+           UnreachableError,
+       )
+    1: from connectors.fetcher import http_get_bytes
+    1: from connectors.profiles import get_profile
+    1: from database import (
+           DEFAULT_DB_PATH,
+           get_analysis_runs_for_import,
+           get_data_source,
+           insert_analysis_run,
+           open_db,
+       )
+    1: from ingestion.validation import quality_report
+       
+    1: logger = logging.getLogger("rationright.pipeline")
+       
+       #: Freshness thresholds (documented, configurable): FRESH under 24h,
+       #: RECENT under 7 days, STALE under 30 days; older or unknown = UNKNOWN.
+    1: FRESH_MAX_SECONDS = 24 * 3600
+    1: RECENT_MAX_SECONDS = 7 * 24 * 3600
+    1: STALE_MAX_SECONDS = 30 * 24 * 3600
+       
+       #: Duplicate-rate warning threshold for the DEDUPLICATE stage.
+    1: DUPLICATE_WARN_PCT = 5.0
+       
+    1: PIPELINE_STAGES = [
+           ("source", "Source", "Where data comes from"),
+           ("extract", "Extract", "Fetch / parse raw records"),
+           ("validate", "Validate", "Required fields + business rules"),
+           ("normalize", "Normalize", "Dates, numbers, commodities, units"),
+           ("deduplicate", "Deduplicate", "Exact + possible duplicate handling"),
+           ("database", "Database", "Normalized tables with provenance"),
+           ("analytics", "Analytics", "Phase 5 aggregation layer"),
+           ("ai", "AI", "Multi-agent analysis"),
+       ]
+       
+       
+    1: def _now() -> datetime:
+   45:     return datetime.now(timezone.utc)
+       
+       
+    1: def _parse_ts(ts) -> Optional[datetime]:
+   43:     if not ts:
+   25:         return None
+   18:     try:
+   18:         parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+           except ValueError:
+               return None
+   18:     if parsed.tzinfo is None:
+               # Stored naive timestamps are UTC (``_now_iso`` writes an explicit
+               # offset; legacy rows may be naive) — treat them as UTC so age
+               # calculations never mix naive and aware datetimes.
+    1:         parsed = parsed.replace(tzinfo=timezone.utc)
+   18:     return parsed
+       
+       
+    1: def _fmt_age(seconds: float) -> str:
+   36:     if seconds < 3600:
+   32:         return "%d minutes" % max(1, int(seconds // 60))
+    4:     if seconds < 86400:
+    2:         return "%d hours" % int(seconds // 3600)
+    2:     return "%d days" % int(seconds // 86400)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Analysis run recording (called by the server after each workflow execution)
+       # ---------------------------------------------------------------------------
+       
+    1: def record_analysis_run(
+           result: dict,
+           *,
+           dataset_mode: str,
+    1:     data_import_id: Optional[int] = None,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     analysis_types: Optional[list] = None,
+    1:     filters: Optional[dict] = None,
+    1:     timings: Optional[dict] = None,
+    1:     duration_ms: Optional[int] = None,
+       ) -> dict:
+           """Persist durable metadata about one workflow run; returns the run dict.
+       
+           The full workflow result continues to be returned to the UI live — this
+           only records the provenance/count summary so lineage survives page loads.
+           ``analysis_types`` / ``filters`` / ``timings`` / ``duration_ms`` are
+           stored with the run so Analysis History can reproduce each run (Phase 9).
+           """
+   17:     anomalies = result.get("anomalies") or []
+   17:     findings = result.get("findings") or []
+   17:     cases = result.get("cases") or []
+   17:     alerts = result.get("alerts") or []
+   17:     insights = result.get("insights") or []
+   17:     skipped = bool(result.get("skipped_reason"))
+   17:     types_status = result.get("types") or {}
+       
+   17:     if result.get("errors"):
+               status = "FAILED"
+               summary = "; ".join(str(e) for e in result["errors"])[:300]
+   17:     elif skipped:
+    1:         status = "INSUFFICIENT_DATA"
+    1:         summary = str(result.get("skipped_reason"))[:300]
+           else:
+   16:         status = "COMPLETED"
+   32:         summary = "%d anomaly(ies) -> %d finding(s) -> %d case(s) -> %d alert(s)" % (
+   16:             len(anomalies), len(findings), len(cases), len(alerts),
+               )
+       
+   17:     conn = open_db(db_path)
+   17:     try:
+   17:         seq = conn.execute("SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"] + 1
+   17:         analysis_id = "RA-%04d-%04d" % (_now().year, seq)
+   34:         insert_analysis_run(
+   17:             conn,
+   17:             analysis_id=analysis_id,
+   17:             data_import_id=data_import_id,
+   17:             dataset_mode=dataset_mode,
+   17:             status=status,
+   17:             anomaly_count=len(anomalies),
+   17:             finding_count=len(findings),
+   17:             case_count=len(cases),
+   17:             alert_count=len(alerts),
+   17:             insight_count=len(insights),
+   17:             analysis_types=analysis_types,
+   17:             filters=filters,
+   17:             timings=timings,
+   17:             duration_ms=duration_ms,
+   17:             summary=summary,
+               )
+   17:         conn.commit()
+           finally:
+   17:         conn.close()
+   17:     return {
+   17:         "analysis_id": analysis_id,
+   17:         "status": status,
+   17:         "summary": summary,
+   17:         "dataset_mode": dataset_mode,
+   17:         "data_import_id": data_import_id,
+   17:         "insight_count": len(insights),
+   17:         "types": types_status,
+   17:         "timings": timings,
+   17:         "duration_ms": duration_ms,
+   17:         "created_at": None,  # resolved by run_detail/lineage queries
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Pipeline status (8 stages + overall + checks)
+       # ---------------------------------------------------------------------------
+       
+    1: def _stage(key, label, sub, status, records, detail, last_execution=None):
+   40:     return {
+   40:         "key": key, "label": label, "sub": sub, "status": status,
+   40:         "records": records, "detail": detail, "last_execution": last_execution,
+           }
+       
+       
+    1: def pipeline_status(db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Overall pipeline health + per-stage state, computed from the database.
+       
+           Every stage reports real counts from data_sources / data_imports /
+           ration_transactions / beneficiaries / inventory / analysis_runs /
+           ai_insights and the Phase 5 analytics service. Stages whose metric does
+           not exist yet report ``status: \"unknown\"`` and ``records: None`` — the
+           UI renders those as \"Not available\", never as fake numbers.
+           """
+    5:     conn = open_db(db_path)
+    5:     try:
+    5:         sources = conn.execute("SELECT * FROM data_sources ORDER BY id").fetchall()
+   20:         source_rows = [dict(r) for r in sources]
+       
+   10:         totals = conn.execute(
+    5:             "SELECT COALESCE(SUM(record_count),0) AS fetched, "
+                   " COALESCE(SUM(successful_records),0) AS valid, "
+                   " COALESCE(SUM(failed_records),0) AS invalid, "
+                   " COALESCE(SUM(duplicate_records),0) AS dupes, "
+                   " COALESCE(SUM(warnings_count),0) AS warnings "
+                   "FROM data_imports"
+               ).fetchone()
+   10:         last_import = conn.execute(
+    5:             "SELECT i.*, s.name AS source_name FROM data_imports i "
+                   "JOIN data_sources s ON s.id = i.data_source_id "
+                   "ORDER BY i.id DESC LIMIT 1"
+               ).fetchone()
+       
+    5:         db_counts = {
+    5:             "transactions": conn.execute("SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"],
+    5:             "beneficiaries": conn.execute("SELECT COUNT(*) AS n FROM beneficiaries").fetchone()["n"],
+    5:             "centers": conn.execute("SELECT COUNT(*) AS n FROM fps_centers").fetchone()["n"],
+    5:             "inventory": conn.execute("SELECT COUNT(*) AS n FROM inventory").fetchone()["n"],
+               }
+    5:         analysis_runs = conn.execute("SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"]
+    5:         ai_insights = conn.execute("SELECT COUNT(*) AS n FROM ai_insights").fetchone()["n"]
+   15:         latest_import_at = conn.execute(
+    5:             "SELECT MAX(completed_at) AS ts FROM data_imports "
+                   "WHERE status IN ('COMPLETED','PARTIAL')"
+    5:         ).fetchone()["ts"]
+           finally:
+    5:         conn.close()
+       
+    5:     fetched, valid, invalid, dupes, warnings = (
+    5:         totals["fetched"], totals["valid"], totals["invalid"],
+    5:         totals["dupes"], totals["warnings"],
+           )
+    5:     last_import_dict = dict(last_import) if last_import is not None else None
+    5:     last_import_status = (last_import_dict or {}).get("status")
+    5:     has_data = db_counts["transactions"] > 0 or db_counts["beneficiaries"] > 0
+       
+           # ---- per-stage status -------------------------------------------------
+    5:     stages = []
+   10:     stages.append(_stage(
+    5:         "source", "Source", PIPELINE_STAGES[0][2],
+    5:         "error" if not source_rows else "ok",
+    5:         len(source_rows), "%d configured source(s)" % len(source_rows),
+           ))
+   10:     stages.append(_stage(
+    5:         "extract", "Extract", PIPELINE_STAGES[1][2],
+    5:         "warn" if fetched == 0 else "ok",
+   20:         fetched, "records fetched across %d import(s)" % (len([s for s in source_rows]) if source_rows else 0),
+    5:         last_import_dict.get("completed_at") if last_import_dict else None,
+           ))
+    5:     if invalid > 0:
+    3:         validate_status = "warn"
+    3:         validate_detail = "%d valid, %d invalid, %d warnings" % (valid, invalid, warnings)
+    2:     elif fetched == 0:
+               validate_status = "warn"
+               validate_detail = "no records to validate yet"
+           else:
+    2:         validate_status = "ok"
+    2:         validate_detail = "all %d record(s) valid, %d warning(s)" % (valid, warnings)
+   10:     stages.append(_stage("validate", "Validate", PIPELINE_STAGES[2][2], validate_status, valid, validate_detail,
+    5:                          last_import_dict.get("completed_at") if last_import_dict else None))
+   10:     stages.append(_stage(
+    5:         "normalize", "Normalize", PIPELINE_STAGES[3][2],
+    5:         "warn" if valid == 0 else "ok",
+    5:         valid, "normalized records (dates, numbers, commodities, units)",
+    5:         last_import_dict.get("completed_at") if last_import_dict else None,
+           ))
+    5:     duplicate_pct = (dupes / fetched * 100) if fetched else 0.0
+   10:     stages.append(_stage(
+    5:         "deduplicate", "Deduplicate", PIPELINE_STAGES[4][2],
+    5:         "warn" if fetched and duplicate_pct > DUPLICATE_WARN_PCT else "ok",
+    5:         dupes, "duplicates (%.1f%% of fetched)" % duplicate_pct if fetched else "no records yet",
+           ))
+   10:     stages.append(_stage(
+    5:         "database", "Database", PIPELINE_STAGES[5][2],
+    5:         "warn" if not has_data else "ok",
+    5:         sum(db_counts.values()),
+   10:         "stored: %d transaction(s), %d beneficiary(ies), %d center(s), %d inventory" % (
+    5:             db_counts["transactions"], db_counts["beneficiaries"],
+    5:             db_counts["centers"], db_counts["inventory"]),
+           ))
+       
+           # Analytics stage: ask the Phase 5 service whether it can compute.
+    5:     try:
+    5:         import analytics  # noqa: PLC0415
+    5:         aconn = analytics.analytics(db_path=db_path)
+    5:         try:
+    5:             overview = analytics.overview(aconn)
+               finally:
+    5:             aconn.close()
+    5:         analytics_ok = True
+    5:         analytics_detail = "KPIs computed: %d metric(s)" % len(overview)
+           except Exception:  # noqa: BLE001
+               analytics_ok = False
+               analytics_detail = "analytics service unavailable"
+   10:     stages.append(_stage(
+    5:         "analytics", "Analytics", PIPELINE_STAGES[6][2],
+    5:         "ok" if analytics_ok else "error",
+    5:         None if not analytics_ok else (len(overview) if analytics_ok else None),
+    5:         analytics_detail,
+           ))
+       
+    5:     ai_status = "ok" if analysis_runs > 0 else ("warn" if has_data else "unknown")
+    5:     ai_detail = "%d analysis run(s), %d persisted AI insight(s)" % (analysis_runs, ai_insights)
+    5:     if analysis_runs == 0:
+    3:         ai_detail = "no analysis run yet — run the multi-agent workflow"
+    5:     stages.append(_stage("ai", "AI", PIPELINE_STAGES[7][2], ai_status, analysis_runs, ai_detail))
+       
+           # ---- checks + overall -------------------------------------------------
+   20:     external = [s for s in source_rows if s["name"] in ("ogd_pds_resource",)]
+   12:     external_ready = all(
+    1:         s["status"] in ("ACTIVE", "SYNCING") and s.get("last_successful_sync_at")
+    2:         for s in external
+    9:     ) if external else True
+       
+    5:     checks = [
+   10:         {"label": "Source configured", "ok": bool(source_rows),
+    5:          "detail": "%d source(s)" % len(source_rows)},
+   10:         {"label": "External source available", "ok": external_ready,
+    6:          "detail": "Official OGD connector ready but not live (no API key configured)"
+   10:                    if external and not external_ready else "No external source configured"},
+   10:         {"label": "Last import successful", "ok": last_import_status in (None, "COMPLETED", "PARTIAL"),
+    5:          "detail": last_import_status or "no imports yet"},
+   10:         {"label": "Database synchronized", "ok": has_data,
+    5:          "detail": "%d stored record(s)" % sum(db_counts.values())},
+    5:         {"label": "Analytics available", "ok": analytics_ok, "detail": analytics_detail},
+   10:         {"label": "AI available", "ok": analysis_runs > 0,
+    5:          "detail": "%d analysis run(s)" % analysis_runs},
+           ]
+       
+    5:     overall = "HEALTHY"
+    5:     if not source_rows or (last_import_status == "FAILED") or not analytics_ok:
+    1:         overall = "ERROR"
+    4:     elif not has_data or last_import_status == "PARTIAL" or not external_ready or analysis_runs == 0:
+    3:         overall = "WARNING"
+       
+    5:     return {
+    5:         "overall": overall,
+    5:         "stages": stages,
+    5:         "checks": checks,
+    5:         "generated_at": _now().isoformat(timespec="seconds"),
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Freshness
+       # ---------------------------------------------------------------------------
+       
+    1: def freshness(db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Data freshness from the latest successful import timestamp.
+       
+           No timestamp -> UNKNOWN (never assumed). Thresholds documented in the
+           module constants.
+           """
+   43:     conn = open_db(db_path)
+   43:     try:
+  129:         latest = conn.execute(
+   43:             "SELECT MAX(completed_at) AS ts FROM data_imports "
+                   "WHERE status IN ('COMPLETED','PARTIAL')"
+   43:         ).fetchone()["ts"]
+           finally:
+   43:         conn.close()
+       
+   43:     parsed = _parse_ts(latest)
+   43:     if parsed is None:
+   50:         return {"latest_data_at": None, "age_seconds": None, "age_label": None,
+   25:                 "status": "UNKNOWN", "detail": "No successful import recorded yet."}
+   18:     age = (_now() - parsed).total_seconds()
+   18:     if age < FRESH_MAX_SECONDS:
+   17:         status = "FRESH"
+    1:     elif age < RECENT_MAX_SECONDS:
+               status = "RECENT"
+    1:     elif age < STALE_MAX_SECONDS:
+               status = "STALE"
+           else:
+    1:         status = "UNKNOWN"
+   18:     return {
+   18:         "latest_data_at": latest,
+   18:         "age_seconds": round(age, 1),
+   18:         "age_label": _fmt_age(age),
+   18:         "status": status,
+   36:         "detail": "Latest data %s ago (thresholds: FRESH < 24h, RECENT < 7d, STALE < 30d)."
+   18:                   % _fmt_age(age),
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Data quality panel (reuses the single Phase 4 formula)
+       # ---------------------------------------------------------------------------
+       
+    1: def quality_panel(db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Aggregated quality across imports, using the exact Phase 4 formula.
+       
+           The overall score is the record-count-weighted mean of each import's
+           ``quality_report`` score (transparent and deterministic). Completeness
+           (missing required fields) is not stored per import, so it is reported
+           as ``None`` — the UI renders \"Not available\" rather than inventing it.
+           """
+   41:     conn = open_db(db_path)
+   41:     try:
+   82:         rows = conn.execute(
+   41:             "SELECT id, dataset_name, record_count, successful_records, "
+                   " failed_records, duplicate_records, warnings_count, status, completed_at "
+                   "FROM data_imports ORDER BY id"
+               ).fetchall()
+           finally:
+   41:         conn.close()
+       
+   41:     entries = []
+   41:     total_weight = 0
+   41:     weighted = 0.0
+   41:     totals = {"records": 0, "valid": 0, "invalid": 0, "duplicates": 0, "warnings": 0}
+   80:     for row in rows:
+   39:         r = dict(row)
+   39:         if r["record_count"] > 0:
+   78:             report = quality_report(
+   39:                 total=r["record_count"],
+   39:                 invalid=r["failed_records"],
+   39:                 duplicates=r["duplicate_records"],
+   39:                 warnings=r["warnings_count"],
+                   )
+   39:             weight = r["record_count"]
+   39:             weighted += report["score"] * weight
+   39:             total_weight += weight
+               else:
+                   report = {"score": None, "valid_pct": None, "duplicate_pct": None, "warning_pct": None}
+   39:         totals["records"] += r["record_count"]
+   39:         totals["valid"] += r["successful_records"]
+   39:         totals["invalid"] += r["failed_records"]
+   39:         totals["duplicates"] += r["duplicate_records"]
+   39:         totals["warnings"] += r["warnings_count"]
+   78:         entries.append({
+   39:             "data_import_id": r["id"],
+   39:             "dataset_name": r["dataset_name"],
+   39:             "status": r["status"],
+   39:             "completed_at": r["completed_at"],
+   39:             "score": report["score"],
+   39:             "records": r["record_count"],
+               })
+       
+   41:     overall = round(weighted / total_weight, 1) if total_weight else None
+   41:     n = max(len(entries), 1)
+   41:     validity = round(100.0 - (totals["invalid"] / totals["records"] * 100), 1) if totals["records"] else None
+   41:     duplicate_rate = round(totals["duplicates"] / totals["records"] * 100, 1) if totals["records"] else None
+   41:     consistency = round(100.0 - (totals["warnings"] / totals["records"] * 100), 1) if totals["records"] else None
+       
+   41:     return {
+   41:         "overall_score": overall,
+   41:         "import_count": len(entries),
+   41:         "totals": totals,
+   41:         "breakdown": {
+   41:             "validity": validity,
+   41:             "consistency": consistency,
+   41:             "duplicate_rate": duplicate_rate,
+   41:             "completeness": None,
+               },
+   41:         "formula": "Phase 4 quality_report: 100 - 3.0*invalid%% - 2.0*duplicates%% - 0.5*warnings%%",
+   41:         "entries": entries,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Pipeline runs (import history with filters/search/pagination)
+       # ---------------------------------------------------------------------------
+       
+    2: def pipeline_runs(
+    1:     db_path: str = DEFAULT_DB_PATH,
+           *,
+    1:     source: Optional[int] = None,
+    1:     status: Optional[str] = None,
+    1:     q: Optional[str] = None,
+    1:     from_date: Optional[str] = None,
+    1:     to_date: Optional[str] = None,
+    1:     page: int = 1,
+    1:     per_page: int = 10,
+       ) -> dict:
+           """Import history as pipeline runs: real DataImport records, filtered and
+           paginated server-side. Each run carries its deterministic quality score."""
+    9:     conn = open_db(db_path)
+    9:     try:
+    9:         where = []
+    9:         params = {}
+    9:         if source is not None:
+    1:             where.append("i.data_source_id = :source")
+    1:             params["source"] = source
+    9:         if status:
+    1:             where.append("i.status = :status")
+    1:             params["status"] = status
+    9:         if q:
+    4:             where.append(
+    2:                 "(i.dataset_name LIKE :q OR i.file_name LIKE :q OR s.name LIKE :q)"
+                   )
+    2:             params["q"] = "%" + q + "%"
+    9:         if from_date:
+                   where.append("i.completed_at >= :from_date")
+                   params["from_date"] = from_date
+    9:         if to_date:
+                   where.append("i.completed_at <= :to_date")
+                   params["to_date"] = to_date
+    9:         clause = ("WHERE " + " AND ".join(where)) if where else ""
+       
+   18:         count_row = conn.execute(
+   18:             "SELECT COUNT(*) AS n FROM data_imports i "
+    9:             "JOIN data_sources s ON s.id = i.data_source_id " + clause,
+    9:             params,
+               ).fetchone()
+    9:         total = count_row["n"]
+       
+   18:         rows = conn.execute(
+   27:             "SELECT i.id, i.dataset_name, i.file_name, i.file_type, i.record_count, "
+                   " i.successful_records, i.failed_records, i.duplicate_records, "
+                   " i.warnings_count, i.status, i.error_summary, i.started_at, "
+                   " i.completed_at, s.name AS source_name, s.type AS source_type "
+                   "FROM data_imports i JOIN data_sources s ON s.id = i.data_source_id "
+   18:             + clause + " ORDER BY i.id DESC LIMIT :limit OFFSET :offset",
+    9:             dict(params, limit=per_page, offset=(page - 1) * per_page),
+               ).fetchall()
+       
+    9:         sources = conn.execute("SELECT id, name FROM data_sources ORDER BY id").fetchall()
+   18:         statuses = conn.execute(
+    9:             "SELECT DISTINCT status FROM data_imports ORDER BY status"
+               ).fetchall()
+           finally:
+    9:         conn.close()
+       
+    9:     runs = []
+   22:     for row in rows:
+   13:         r = dict(row)
+   13:         score = None
+   13:         if r["record_count"] > 0:
+   39:             score = quality_report(
+   13:                 total=r["record_count"], invalid=r["failed_records"],
+   13:                 duplicates=r["duplicate_records"], warnings=r["warnings_count"],
+   13:             )["score"]
+   13:         r["quality_score"] = score
+   13:         runs.append(r)
+       
+    9:     return {
+    9:         "runs": runs,
+    9:         "total": total,
+    9:         "page": page,
+    9:         "per_page": per_page,
+    9:         "pages": max(1, -(-total // per_page)),
+   40:         "sources": [dict(s) for s in sources],
+   38:         "statuses": [dict(s)["status"] for s in statuses],
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Run detail / lineage
+       # ---------------------------------------------------------------------------
+       
+    1: def run_detail(import_id: int, db_path: str = DEFAULT_DB_PATH):
+           """Full lineage for one pipeline run:
+       
+               source -> import -> records -> database -> analytics -> analysis -> AI
+           """
+    4:     conn = open_db(db_path)
+    4:     try:
+    8:         row = conn.execute(
+    4:             "SELECT i.*, s.name AS source_name, s.type AS source_type, "
+                   " s.status AS source_status "
+                   "FROM data_imports i JOIN data_sources s ON s.id = i.data_source_id "
+                   "WHERE i.id = :imp",
+    4:             {"imp": import_id},
+               ).fetchone()
+    4:         if row is None:
+    4:             return None
+    2:         imp = dict(row)
+       
+    2:         db_counts = {
+    6:             "transactions": conn.execute(
+    2:                 "SELECT COUNT(*) AS n FROM ration_transactions WHERE source_import_id = :imp",
+    4:                 {"imp": import_id}).fetchone()["n"],
+    6:             "beneficiaries": conn.execute(
+    2:                 "SELECT COUNT(DISTINCT b.id) AS n FROM ration_transactions t "
+                       "JOIN beneficiaries b ON b.id = t.beneficiary_id "
+                       "WHERE t.source_import_id = :imp",
+    4:                 {"imp": import_id}).fetchone()["n"],
+    6:             "inventory": conn.execute(
+    2:                 "SELECT COUNT(*) AS n FROM inventory WHERE source_import_id = :imp",
+    4:                 {"imp": import_id}).fetchone()["n"],
+               }
+    6:         ai_insights = conn.execute(
+    2:             "SELECT COUNT(*) AS n FROM ai_insights WHERE source_import_id = :imp",
+    4:             {"imp": import_id}).fetchone()["n"]
+    2:         runs = get_analysis_runs_for_import(conn, import_id=import_id)
+           finally:
+    4:         conn.close()
+       
+    6:     quality = quality_report(
+    2:         total=imp["record_count"], invalid=imp["failed_records"],
+    2:         duplicates=imp["duplicate_records"], warnings=imp["warnings_count"],
+    2:     ) if imp["record_count"] > 0 else None
+       
+    2:     return {
+    2:         "import": {
+    2:             "data_import_id": imp["id"],
+    2:             "dataset_name": imp["dataset_name"],
+    2:             "file_name": imp["file_name"],
+    2:             "file_type": imp["file_type"],
+    2:             "status": imp["status"],
+    2:             "error_summary": imp["error_summary"],
+    2:             "started_at": imp["started_at"],
+    2:             "completed_at": imp["completed_at"],
+               },
+    2:         "source": {
+    2:             "data_source_id": imp.get("data_source_id"),
+    2:             "name": imp["source_name"],
+    2:             "type": imp["source_type"],
+    2:             "status": imp.get("source_status"),
+               },
+    2:         "records": {
+    2:             "record_count": imp["record_count"],
+    2:             "successful_records": imp["successful_records"],
+    2:             "failed_records": imp["failed_records"],
+    2:             "duplicate_records": imp["duplicate_records"],
+    2:             "warnings_count": imp["warnings_count"],
+    2:             "quality": quality,
+               },
+    2:         "database": db_counts,
+    2:         "analytics": {"available": True, "detail": "Phase 5 analytics query this import's records"},
+    2:         "analysis_runs": runs,
+    2:         "ai_insights": ai_insights,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Connection test (real probe, never faked)
+       # ---------------------------------------------------------------------------
+       
+    1: def test_connection(
+           source_id: int,
+           *,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     request_host: Optional[str] = None,
+    1:     fetcher: Callable = http_get_bytes,
+    1:     timeout: float = 6.0,
+       ) -> dict:
+           """Probe one configured source and report the actual outcome.
+       
+           Auth-required sources without a server-side key are reported as
+           NOT_CONFIGURED WITHOUT fetching (never claimed as connected). The probe
+           is a single request (no retries) with a short timeout so the UI responds
+           quickly. ``fetcher`` is injectable for tests.
+           """
+    5:     checked_at = _now().isoformat(timespec="seconds")
+    5:     conn = open_db(db_path)
+    5:     try:
+    5:         source = get_data_source(conn, source_id)
+           finally:
+    5:         conn.close()
+    5:     if source is None:
+    2:         return {"status": "error", "category": "UNKNOWN_SOURCE",
+    1:                 "detail": "Unknown data source.", "checked_at": checked_at}
+    4:     profile = get_profile(source["name"])
+    4:     if profile is None:
+               return {"status": "error", "category": "NOT_CONFIGURED",
+                       "detail": "No connector profile is registered for this source.",
+                       "checked_at": checked_at}
+       
+    4:     from connectors.profiles import _ogd_api_key
+    4:     if profile.get("requires_auth") and not _ogd_api_key():
+    1:         return {
+    1:             "status": "not_configured", "category": "AUTH_NOT_CONFIGURED",
+    2:             "detail": "Connector is implemented, but no API key is configured "
+                             "server-side (set %s). Connection was NOT tested."
+    1:                       % profile.get("auth_env_var"),
+    1:             "checked_at": checked_at,
+    1:             "source_name": source["name"],
+               }
+       
+    3:     base_url = source.get("base_url") or profile.get("base_url")
+    3:     if not base_url:
+               return {"status": "error", "category": "NOT_CONFIGURED",
+                       "detail": "No endpoint URL is configured for this source.",
+                       "checked_at": checked_at}
+    3:     if base_url.startswith("/"):
+    3:         if not request_host:
+                   return {"status": "error", "category": "NOT_CONFIGURED",
+                           "detail": "Relative source URL requires the request host.",
+                           "checked_at": checked_at}
+    3:         url = "http://%s%s" % (request_host, base_url)
+           else:
+               url = base_url
+       
+    3:     try:
+    3:         body = fetcher(url, timeout=timeout, max_attempts=1)
+    2:     except AuthError as exc:
+    2:         return {"status": "error", "category": "AUTH_FAILED",
+    1:                 "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+    1:     except RateLimitError as exc:
+               return {"status": "error", "category": "RATE_LIMITED",
+                       "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+    1:     except ConnectorTimeoutError as exc:
+               return {"status": "error", "category": "TIMEOUT",
+                       "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+    1:     except UnreachableError as exc:
+    2:         return {"status": "error", "category": "UNREACHABLE",
+    1:                 "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+           except HttpStatusError as exc:
+               return {"status": "error", "category": "HTTP_ERROR",
+                       "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+           except ConnectorError as exc:
+               return {"status": "error", "category": "ERROR",
+                       "detail": str(exc), "checked_at": checked_at, "source_name": source["name"]}
+           except Exception:  # noqa: BLE001
+               logger.error("Connection probe failed unexpectedly:", exc_info=True)
+               return {"status": "error", "category": "ERROR",
+                       "detail": "The connection test failed for an unexpected reason.",
+                       "checked_at": checked_at, "source_name": source["name"]}
+       
+    2:     return {"status": "ok", "category": "CONNECTION_OK",
+    1:             "detail": "Connection successful — received %d byte(s)." % len(body),
+    1:             "checked_at": checked_at, "source_name": source["name"]}

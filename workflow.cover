@@ -1,0 +1,267 @@
+    1: """RationRight — multi-agent workflow orchestrator (Phase 6).
+       
+       Chains the four independently tested agents into one end-to-end workflow:
+       
+           Synthetic Dataset
+               -> Agent 1 (Transaction Analyst)    -> anomaly candidates
+               -> Agent 2 (Anomaly Investigator)   -> verified findings
+               -> Agent 3 (Evidence Case Builder)  -> investigation case
+               -> Agent 4 (Alert Generator)        -> human-review alert
+       
+       The orchestrator is normal application logic, NOT another AI agent: it
+       controls execution order, passes structured outputs between agents, records
+       stage-attributed failures, and never fabricates results. Every anomaly
+       candidate from Agent 1 is investigated independently by Agent 2; only verified
+       findings feed Agent 3. Per-candidate and per-stage failures are recorded in
+       ``errors`` (with stage/anomaly attribution) and do not abort the whole
+       workflow unnecessarily.
+       
+       Returned result (workflow-level, not an agent contract):
+       
+           {
+             "workflow_status": "completed" | "partial_failure" | "failed",
+             "stages": {"agent_1": ..., "agent_2": ..., "agent_3": ..., "agent_4": ...},
+             "anomalies": [...],            # all Agent 1 candidates
+             "unverified_findings": [...],  # Agent 2 findings that were NOT verified
+             "findings": [...],             # verified findings (fed to Agent 3)
+             "cases": [...],                # investigation cases
+             "alerts": [...],               # human-review alerts
+             "errors": [...]                # stage-attributed failures
+           }
+       
+       IDs are preserved end to end (anomaly_id -> finding.anomaly_id ->
+       case.finding_ids -> alert.case_id), so every alert stays traceable back to the
+       source transactions. Zero anomalies is a normal, successful outcome.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: import time
+    1: from datetime import datetime, timezone
+       
+    1: from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst
+    1: from agents.agent_2_anomaly_investigator import (
+           DEFAULT_MAX_INTERVAL_MINUTES,
+           DEFAULT_MIN_DISTANCE_KM,
+           Agent2AnomalyInvestigator,
+       )
+    1: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+    1: from agents.agent_4_alert_generator import Agent4AlertGenerator
+       
+    1: logger = logging.getLogger("rationright.workflow")
+       
+       
+    1: def run_workflow(
+           transactions,
+           *,
+    1:     max_interval_minutes=DEFAULT_MAX_INTERVAL_MINUTES,
+    1:     min_distance_km=DEFAULT_MIN_DISTANCE_KM,
+    1:     agent_1=None,
+    1:     agent_2=None,
+    1:     agent_3=None,
+    1:     agent_4=None,
+       ) -> dict:
+           """Run the complete RationRight workflow and return the final result.
+       
+           ``agent_1``..``agent_4`` are optional injected agent instances (each must
+           expose the same ``run`` interface); by default the real agents are used.
+           """
+   29:     result = {
+   29:         "workflow_status": "completed",
+   29:         "stages": {
+   29:             "agent_1": "pending",
+   29:             "agent_2": "pending",
+   29:             "agent_3": "pending",
+   29:             "agent_4": "pending",
+               },
+   29:         "timings": {},
+   29:         "anomalies": [],
+   29:         "unverified_findings": [],
+   29:         "findings": [],
+   29:         "cases": [],
+   29:         "alerts": [],
+   29:         "errors": [],
+           }
+       
+   29:     _started = time.perf_counter()
+   29:     _wall_start = time.time()
+       
+   29:     def _elapsed() -> float:
+   86:         return time.perf_counter() - _started
+       
+   29:     def _record_timing(stage: str) -> None:
+               """Record a real wall-clock start/end/duration for one agent stage.
+       
+               The command center shows these timestamps verbatim — nothing is
+               invented. ``started_at`` is the first time this stage's clock is
+               observed, ``ended_at`` the last; ``duration_ms`` is measured.
+               """
+  109:         entry = result["timings"].get(stage) or {}
+  327:         entry["started_at"] = entry.get("started_at") or datetime.fromtimestamp(
+  109:             _wall_start, tz=timezone.utc
+  109:         ).isoformat(timespec="seconds")
+  327:         entry["ended_at"] = datetime.fromtimestamp(
+  109:             time.time(), tz=timezone.utc
+  109:         ).isoformat(timespec="seconds")
+  109:         entry["duration_ms"] = int((time.time() - _wall_start) * 1000)
+  109:         result["timings"][stage] = entry
+       
+   29:     logger.info("[RationRight] Workflow started")
+       
+           # ---- Stage 1: Agent 1 — detection -------------------------------------
+   29:     logger.info("[Agent 1] Loading transactions")
+   58:     stage_agent_1 = agent_1 if agent_1 is not None else Agent1TransactionAnalyst(
+   29:         max_interval_minutes=max_interval_minutes,
+   29:         min_distance_km=min_distance_km,
+           )
+   29:     try:
+   29:         agent_1_output = stage_agent_1.run(transactions)
+    1:     except Exception as exc:  # noqa: BLE001
+    1:         result["workflow_status"] = "failed"
+    1:         result["stages"]["agent_1"] = "failed"
+    1:         result["errors"].append({"stage": "agent_1", "status": "failed", "error": str(exc)})
+    1:         logger.error("[Agent 1] Failed: %s", exc)
+    1:         logger.info("[RationRight] Workflow failed at agent_1")
+    1:         return result
+       
+   28:     if not isinstance(agent_1_output, dict) or not isinstance(agent_1_output.get("anomalies"), list):
+               result["workflow_status"] = "failed"
+               result["stages"]["agent_1"] = "failed"
+               result["errors"].append({
+                   "stage": "agent_1",
+                   "status": "failed",
+                   "error": "Agent 1 returned an invalid result (expected {'anomalies': [...]})",
+               })
+               logger.error("[Agent 1] Returned an invalid result")
+               return result
+       
+   28:     anomalies = agent_1_output["anomalies"]
+   28:     result["stages"]["agent_1"] = "completed"
+   28:     result["anomalies"] = anomalies
+   28:     _record_timing("agent_1")
+   56:     logger.info(
+   28:         "[Agent 1] %d transaction(s) analyzed; %d anomaly candidate(s) detected "
+               "(%.3fs)",
+   28:         len(transactions),
+   28:         len(anomalies),
+   28:         _elapsed(),
+           )
+       
+   28:     if not anomalies:
+    7:         result["stages"]["agent_2"] = "skipped"
+    7:         result["stages"]["agent_3"] = "skipped"
+    7:         result["stages"]["agent_4"] = "skipped"
+    7:         _record_timing("agent_2")
+    7:         _record_timing("agent_3")
+    7:         _record_timing("agent_4")
+   14:         logger.info(
+    7:             "[RationRight] No anomalies detected; workflow completed with no "
+                   "findings, cases, or alerts"
+               )
+    7:         return result
+       
+           # ---- Stage 2: Agent 2 — verification (one run per candidate) ----------
+   40:     stage_agent_2 = agent_2 if agent_2 is not None else Agent2AnomalyInvestigator(
+   19:         max_interval_minutes=max_interval_minutes,
+   19:         min_distance_km=min_distance_km,
+           )
+   21:     verified_findings = []
+   21:     unverified_findings = []
+   44:     for index, anomaly in enumerate(anomalies, start=1):
+   23:         anomaly_id = anomaly.get("anomaly_id", "<unknown>")
+   23:         logger.info("[Agent 2] Investigating %s", anomaly_id)
+   23:         try:
+   46:             finding = stage_agent_2.run(
+   23:                 {"anomaly": anomaly, "transactions": transactions},
+   23:                 finding_id=f"FIND{index:03d}",
+                   )
+    1:         except Exception as exc:  # noqa: BLE001
+    2:             result["errors"].append({
+    1:                 "stage": "agent_2",
+    1:                 "anomaly_id": anomaly_id,
+    1:                 "status": "failed",
+    1:                 "error": str(exc),
+                   })
+    1:             logger.error("[Agent 2] Failed for %s: %s", anomaly_id, exc)
+    1:             continue
+   22:         if isinstance(finding, dict) and finding.get("status") == "verified":
+   21:             verified_findings.append(finding)
+   21:             logger.info("[Agent 2] Finding %s verified", finding.get("finding_id", "<unknown>"))
+               else:
+    1:             unverified_findings.append(finding)
+    2:             logger.info(
+    1:                 "[Agent 2] Finding %s unverified for %s",
+    1:                 finding.get("finding_id", "<unknown>") if isinstance(finding, dict) else "<invalid>",
+    1:                 anomaly_id,
+                   )
+   21:     result["stages"]["agent_2"] = "completed"
+   21:     result["findings"] = verified_findings
+   21:     result["unverified_findings"] = unverified_findings
+   21:     _record_timing("agent_2")
+   42:     logger.info("[Agent 2] %d verified, %d unverified (%.3fs)",
+   21:                 len(verified_findings), len(unverified_findings), _elapsed())
+       
+   21:     if not verified_findings:
+    1:         result["stages"]["agent_3"] = "skipped"
+    1:         result["stages"]["agent_4"] = "skipped"
+    1:         _record_timing("agent_3")
+    1:         _record_timing("agent_4")
+    2:         logger.info(
+    1:             "[RationRight] No verified findings; workflow completed without a case or alert"
+               )
+    1:         return _finalize(result)
+       
+           # ---- Stage 3: Agent 3 — case building ---------------------------------
+   20:     stage_agent_3 = agent_3 if agent_3 is not None else Agent3EvidenceCaseBuilder()
+   20:     logger.info("[Agent 3] Building case from %d finding(s)", len(verified_findings))
+   20:     try:
+   20:         case = stage_agent_3.run({"findings": verified_findings, "transactions": transactions})
+    1:     except Exception as exc:  # noqa: BLE001
+    1:         result["stages"]["agent_3"] = "failed"
+    1:         result["errors"].append({"stage": "agent_3", "status": "failed", "error": str(exc)})
+    1:         logger.error("[Agent 3] Failed: %s", exc)
+    1:         return _finalize(result)
+   19:     result["cases"].append(case)
+   19:     result["stages"]["agent_3"] = "completed"
+   19:     _record_timing("agent_3")
+   19:     logger.info("[Agent 3] Case %s %s (%.3fs)", case.get("case_id"), case.get("status"), _elapsed())
+       
+   19:     if case.get("status") != "requires_human_review":
+               result["stages"]["agent_4"] = "skipped"
+               _record_timing("agent_4")
+               logger.info("[Agent 4] Skipped: case %s is not ready for review", case.get("case_id"))
+               return _finalize(result)
+       
+           # ---- Stage 4: Agent 4 — alert generation ------------------------------
+   19:     stage_agent_4 = agent_4 if agent_4 is not None else Agent4AlertGenerator()
+   19:     logger.info("[Agent 4] Generating alert for %s", case["case_id"])
+   19:     try:
+   19:         alert = stage_agent_4.run(case)
+    1:     except Exception as exc:  # noqa: BLE001
+    1:         result["stages"]["agent_4"] = "failed"
+    2:         result["errors"].append({
+    1:             "stage": "agent_4",
+    1:             "case_id": case.get("case_id"),
+    1:             "status": "failed",
+    1:             "error": str(exc),
+               })
+    1:         logger.error("[Agent 4] Failed: %s", exc)
+    1:         return _finalize(result)
+   18:     result["alerts"].append(alert)
+   18:     result["stages"]["agent_4"] = "completed"
+   18:     _record_timing("agent_4")
+   18:     logger.info("[Agent 4] Alert %s ready for human review (%.3fs)", alert["alert_id"], _elapsed())
+       
+   18:     return _finalize(result)
+       
+       
+    1: def _finalize(result: dict) -> dict:
+           """Set the final workflow status and log completion."""
+   21:     result["workflow_status"] = "partial_failure" if result["errors"] else "completed"
+   42:     logger.info(
+   21:         "[RationRight] Workflow %s (stages: %s)",
+   21:         result["workflow_status"],
+   21:         result["stages"],
+           )
+   21:     return result

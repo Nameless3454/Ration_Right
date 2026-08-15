@@ -1,0 +1,419 @@
+    1: """RationAI — external data sync service (Phase 7).
+       
+       Orchestrates one sync:
+       
+           SYNC -> mark source SYNCING -> fetch -> parse -> map -> validate
+                -> run_import (Phase 4 pipeline: normalize, dedup, provenance)
+                -> update DataSource timestamps/status -> sync summary
+       
+       Reuses the existing ingestion pipeline end to end; no second parser or
+       importer exists. Safety rules honoured here:
+       
+       * A failed sync NEVER deletes or replaces existing data — the last
+         successful dataset stays in the database and the UI shows the last
+         successful timestamp alongside the error.
+       * Only REGISTERED sources (a numeric data_source_id whose row matches a
+         server-side profile) can be synced — users cannot submit URLs to fetch
+         (no SSRF).
+       * Credentials live only in server-side environment variables and are never
+         logged or returned.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime, timezone
+    1: from typing import Callable, Optional
+       
+    1: from connectors.base import connector_for, sha256_bytes
+    1: from connectors.errors import (
+           AuthError,
+           ConnectorError,
+           SourceNotConfiguredError,
+           SyncFailure,
+       )
+       
+    1: from connectors.fetcher import http_get_bytes
+    1: from connectors.profiles import get_profile, list_profiles
+    1: from database import (
+           DEFAULT_DB_PATH,
+           get_data_import,
+           get_data_source,
+           get_data_source_by_name,
+           insert_data_import,
+           insert_data_source,
+           open_db,
+           update_data_source_sync,
+       )
+       
+    1: logger = logging.getLogger("rationright.connectors")
+       
+       #: Exceptions that carry a user-safe message. Ingestion parse/mapping
+       #: errors (reused from the Phase 3 pipeline) are user-safe too.
+    1: from ingestion.parsers import EmptyDatasetError, ParseError  # noqa: E402
+    1: from ingestion.mapping import MappingError  # noqa: E402
+       
+    1: _USER_SAFE = (
+    1:     ConnectorError,
+    1:     SourceNotConfiguredError,
+    1:     SyncFailure,
+    1:     ParseError,
+    1:     EmptyDatasetError,
+    1:     MappingError,
+       )
+       
+       
+    1: def _now_iso() -> str:
+   30:     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+       
+       
+       # ---------------------------------------------------------------------------
+       # Registration (centralized configuration -> database rows)
+       # ---------------------------------------------------------------------------
+       
+    1: def register_configured_sources(db_path: str = DEFAULT_DB_PATH) -> list:
+           """Ensure every configured profile has a DataSource row.
+       
+           Idempotent: creates missing sources, refreshes their base_url/type/
+           description, and marks auth-required sources that lack a key as INACTIVE
+           with an actionable last_error (they remain visible but cannot sync).
+           """
+   60:     conn = open_db(db_path)
+   60:     try:
+   60:         registered = []
+  180:         for profile in list_profiles():
+  120:             existing = get_data_source_by_name(conn, profile["name"])
+  120:             needs_key = bool(profile.get("requires_auth"))
+  120:             from connectors.profiles import _ogd_api_key
+  120:             has_key = not needs_key or bool(_ogd_api_key())
+  120:             if existing is None:
+  220:                 source_id = insert_data_source(
+  110:                     conn,
+  110:                     name=profile["name"],
+  110:                     source_type=profile["type"],
+  110:                     description=profile.get("description"),
+  110:                     status="ACTIVE" if has_key else "INACTIVE",
+  110:                     base_url=profile.get("base_url"),
+                       )
+  110:                 if not has_key:
+  110:                     update_data_source_sync(
+   55:                         conn, source_id, status="INACTIVE",
+                               last_error=(
+  110:                             "Requires an API key — set the %s environment variable "
+   55:                             "server-side." % profile.get("auth_env_var")
+                               ),
+                           )
+  110:                 registered.append(profile["name"])
+                   else:
+   10:                 changed = False
+   10:                 if existing.get("base_url") != profile.get("base_url"):
+                           conn.execute(
+                               "UPDATE data_sources SET base_url = :url, updated_at = :now WHERE id = :id",
+                               {"url": profile.get("base_url"), "now": _now_iso(), "id": existing["id"]},
+                           )
+                           changed = True
+   10:                 if not has_key and existing.get("status") == "ACTIVE":
+                           update_data_source_sync(
+                               conn, existing["id"], status="INACTIVE",
+                               last_error="Requires an API key — set the %s environment "
+                                          "variable server-side." % profile.get("auth_env_var"),
+                           )
+                           changed = True
+   10:                 if changed:
+                           registered.append(profile["name"])
+   60:         conn.commit()
+  120:         return registered
+           finally:
+   60:         conn.close()
+       
+       
+       # ---------------------------------------------------------------------------
+       # Status helpers
+       # ---------------------------------------------------------------------------
+       
+    1: def connection_status(source: dict) -> str:
+           """Derive the UI-facing connection state from the DB row.
+       
+           Uses the existing status conventions (ACTIVE/INACTIVE/ERROR/SYNCING)
+           and maps them to the connector lifecycle the UI displays:
+           CONNECTED / SYNCING / PARTIAL / ERROR / DISCONNECTED.
+           """
+   15:     status = (source.get("status") or "").upper()
+   15:     if status == "SYNCING":
+               return "SYNCING"
+   15:     if status == "ERROR":
+               return "ERROR"
+   15:     if status == "INACTIVE":
+    6:         return "DISCONNECTED"
+    9:     if status == "ACTIVE":
+    9:         if source.get("last_successful_sync_at"):
+    1:             return "CONNECTED"
+    8:         if source.get("last_error"):
+                   return "DISCONNECTED"
+    8:         return "CONNECTED"
+           return "DISCONNECTED"
+       
+       
+    1: def source_view(conn, source: dict) -> dict:
+           """Public view of a source: row + derived connection state + last import."""
+   15:     view = {
+   15:         "data_source_id": source["id"],
+   15:         "name": source["name"],
+   15:         "type": source["type"],
+   15:         "description": source.get("description"),
+   15:         "base_url": source.get("base_url"),
+   15:         "status": source.get("status"),
+   15:         "connection_status": connection_status(source),
+   15:         "last_sync_at": source.get("last_sync_at"),
+   15:         "last_successful_sync_at": source.get("last_successful_sync_at"),
+   15:         "last_error": source.get("last_error"),
+           }
+   30:     last = conn.execute(
+   15:         "SELECT id, dataset_name, record_count, successful_records, failed_records, "
+               "duplicate_records, status, started_at, completed_at "
+               "FROM data_imports WHERE data_source_id = :sid "
+               "ORDER BY id DESC LIMIT 1",
+   15:         {"sid": source["id"]},
+           ).fetchone()
+   15:     if last is not None:
+    1:         view["last_import"] = {
+    1:             "data_import_id": last["id"],
+    1:             "dataset_name": last["dataset_name"],
+    1:             "record_count": last["record_count"],
+    1:             "successful_records": last["successful_records"],
+    1:             "failed_records": last["failed_records"],
+    1:             "duplicate_records": last["duplicate_records"],
+    1:             "status": last["status"],
+    1:             "completed_at": last["completed_at"],
+               }
+   15:     profile = get_profile(source["name"])
+   15:     if profile:
+   15:         view["format"] = profile.get("format")
+   15:         view["dataset_type"] = profile.get("dataset_type")
+   15:         view["requires_auth"] = bool(profile.get("requires_auth"))
+   15:         view["documentation_url"] = profile.get("documentation_url")
+   15:         view["label"] = profile.get("label")
+           # A source with a registered connector profile but no successful
+           # connection is CONNECTOR_READY, not merely DISCONNECTED — the UI must
+           # never imply a live connection that has not been verified (Phase 8).
+   15:     if view["connection_status"] == "DISCONNECTED" and profile:
+    6:         view["connection_status"] = "CONNECTOR_READY"
+   15:     return view
+       
+       
+    1: def list_sources(db_path: str = DEFAULT_DB_PATH) -> list:
+    5:     conn = open_db(db_path)
+    5:     try:
+    5:         rows = conn.execute("SELECT * FROM data_sources ORDER BY id").fetchall()
+   25:         return [source_view(conn, dict(r)) for r in rows]
+           finally:
+    5:         conn.close()
+       
+       
+    1: def get_source_status(source_id: int, db_path: str = DEFAULT_DB_PATH):
+    8:     conn = open_db(db_path)
+    8:     try:
+    8:         source = get_data_source(conn, source_id)
+    8:         if source is None:
+    6:             return None
+   10:         return source_view(conn, source)
+           finally:
+    8:         conn.close()
+       
+       
+    1: def list_source_imports(source_id: int, db_path: str = DEFAULT_DB_PATH) -> list:
+    1:     conn = open_db(db_path)
+    1:     try:
+    2:         rows = conn.execute(
+    1:             "SELECT id, dataset_name, file_name, file_type, record_count, "
+                   "successful_records, failed_records, duplicate_records, status, "
+                   "error_summary, started_at, completed_at "
+                   "FROM data_imports WHERE data_source_id = :sid ORDER BY id DESC",
+    1:             {"sid": source_id},
+               ).fetchall()
+    4:         return [dict(r) for r in rows]
+           finally:
+    1:         conn.close()
+       
+       
+       # ---------------------------------------------------------------------------
+       # Sync
+       # ---------------------------------------------------------------------------
+       
+    1: def _record_failed_import(
+           conn, source: dict, profile: dict, error: str
+       ) -> int:
+    8:     now = _now_iso()
+   16:     import_id = insert_data_import(
+    8:         conn,
+    8:         data_source_id=source["id"],
+    8:         dataset_name=profile.get("dataset_name") or source["name"],
+    8:         file_name=profile.get("file_name"),
+    8:         file_type=profile.get("format"),
+    8:         record_count=0,
+    8:         failed_records=1,
+    8:         status="FAILED",
+    8:         error_summary=error[:500],
+    8:         started_at=now,
+    8:         completed_at=now,
+           )
+    8:     conn.commit()
+    8:     return import_id
+       
+       
+    1: def sync_source(
+           source_id: int,
+           *,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     request_host: Optional[str] = None,
+    1:     fetcher: Callable = http_get_bytes,
+       ) -> dict:
+           """Sync one registered source. Returns a summary dict (never raises for
+           expected failures — those are recorded on the source/import and returned)."""
+   15:     conn = open_db(db_path)
+   15:     try:
+   15:         source = get_data_source(conn, source_id)
+   15:         if source is None:
+                   raise SyncFailure("Unknown data source id %r" % source_id)
+   15:         profile = get_profile(source["name"])
+   15:         if profile is None:
+                   raise SyncFailure(
+                       "Source %r has no connector profile configured." % source["name"]
+                   )
+       
+               # ---- auth pre-check (no fetch, no retry) ---------------------------
+   15:         from connectors.profiles import _ogd_api_key
+   15:         if profile.get("requires_auth") and not _ogd_api_key():
+    2:             error = (
+    4:                 "API key not configured. Set the %s environment variable "
+    2:                 "server-side, then retry." % profile.get("auth_env_var")
+                   )
+    2:             import_id = _record_failed_import(conn, source, profile, error)
+    4:             update_data_source_sync(
+    2:                 conn, source["id"], status="ERROR",
+    2:                 last_sync_at=_now_iso(), last_error=error,
+                   )
+    2:             conn.commit()
+    4:             return {
+    2:                 "status": "ERROR",
+    2:                 "source_name": source["name"],
+    2:                 "source_id": source["id"],
+    2:                 "data_import_id": import_id,
+    2:                 "fetched": 0,
+    2:                 "imported": 0,
+    2:                 "error": error,
+    2:                 "retryable": False,
+    2:                 "message": "Sync failed — see error. Existing data is unchanged.",
+                   }
+       
+               # ---- mark SYNCING --------------------------------------------------
+   13:         update_data_source_sync(conn, source["id"], status="SYNCING")
+   13:         conn.commit()
+       
+   13:         def resolve_url(base_url: str) -> str:
+   13:             if base_url.startswith("/"):
+   13:                 if not request_host:
+                           raise SourceNotConfiguredError(
+                               "Relative source URL requires the request host."
+                           )
+   13:                 return "http://%s%s" % (request_host, base_url)
+                   return base_url
+       
+   13:         try:
+   13:             connector = connector_for(profile)
+   13:             pages = connector.fetch(fetcher, resolve_url)
+   10:             headers, rows = connector.parse(pages)
+    7:             mapping = connector.map_columns(headers)
+   14:             summary = run_sync_import(
+    7:                 conn, source, profile, headers, rows, mapping, pages
+                   )
+    6:         except Exception as exc:  # noqa: BLE001
+    6:             error = _safe_error(exc)
+    6:             import_id = _record_failed_import(conn, source, profile, error)
+   12:             update_data_source_sync(
+    6:                 conn, source["id"], status="ERROR",
+    6:                 last_sync_at=_now_iso(), last_error=error,
+                   )
+    6:             conn.commit()
+   12:             return {
+    6:                 "status": "ERROR",
+    6:                 "source_name": source["name"],
+    6:                 "source_id": source["id"],
+    6:                 "data_import_id": import_id,
+    6:                 "fetched": 0,
+    6:                 "imported": 0,
+    6:                 "error": error,
+    6:                 "retryable": isinstance(exc, ConnectorError) and exc.retryable,
+    6:                 "message": "Sync failed — existing data is unchanged. "
+                                  "Showing the last successful dataset.",
+                   }
+       
+               # A re-sync that finds nothing new is a SUCCESS, not a failure:
+               # the importer reports 0 imported + all duplicates (nothing changed).
+               # Re-label that import record COMPLETED so provenance stays honest.
+    7:         if summary["status"] == "FAILED" and summary["failed"] == 0 and summary["duplicates"] > 0:
+    1:             sync_status = "UP_TO_DATE"
+    2:             conn.execute(
+    1:                 "UPDATE data_imports SET status = 'COMPLETED', error_summary = NULL "
+                       "WHERE id = :import_id",
+    1:                 {"import_id": summary["data_import_id"]},
+                   )
+               else:
+    6:             sync_status = "COMPLETED" if summary["status"] == "COMPLETED" else "PARTIAL"
+   14:         update_data_source_sync(
+    7:             conn, source["id"], status="ACTIVE",
+    7:             last_sync_at=_now_iso(), last_successful_sync_at=_now_iso(),
+    7:             last_error=None,
+               )
+    7:         conn.commit()
+   14:         return {
+    7:             "status": sync_status,
+    7:             "source_name": source["name"],
+    7:             "source_id": source["id"],
+    7:             "data_import_id": summary["data_import_id"],
+    7:             "fetched": summary["record_count"],
+    7:             "imported": summary["imported"],
+    7:             "failed": summary["failed"],
+    7:             "duplicates": summary["duplicates"],
+    7:             "duplicates_exact": summary["duplicates_exact"],
+    7:             "duplicates_possible": summary["duplicates_possible"],
+    7:             "warnings": summary["warnings"],
+    7:             "quality": summary["quality"],
+    7:             "pages_fetched": len(pages),
+    7:             "message": "Sync completed." if sync_status == "COMPLETED"
+    2:                        else "Sync completed — no new records (already up to date)."
+    2:                        if sync_status == "UP_TO_DATE"
+    1:                        else "Sync completed with partial failures.",
+               }
+           finally:
+   15:         conn.close()
+       
+       
+    1: def run_sync_import(
+           conn, source: dict, profile: dict, headers: list, rows: list,
+           mapping: dict, pages: list,
+       ) -> dict:
+           """Run the existing Phase 4 import pipeline on parsed source rows."""
+    8:     from ingestion.importer import run_import
+       
+    8:     payload = b"".join(pages)
+   16:     return run_import(
+    8:         conn,
+    8:         file_name=profile.get("file_name") or (source["name"] + "." + (profile.get("format") or "csv")),
+    8:         file_type=profile.get("format") or "csv",
+    8:         dataset_name=profile.get("dataset_name") or source["name"],
+    8:         source_name=source["name"],
+    8:         dataset_type=profile.get("dataset_type") or "ration_transactions",
+    8:         headers=headers,
+    8:         rows=rows,
+    8:         mapping=mapping,
+    8:         file_hash=sha256_bytes(payload),
+           )
+       
+       
+    1: def _safe_error(exc: Exception) -> str:
+           """User-safe error text: never leaks stack traces or credentials."""
+    6:     if isinstance(exc, _USER_SAFE):
+    6:         return str(exc)
+           logger.error("Sync failed (internal): %s", exc, exc_info=True)
+           return "The sync failed for an unexpected reason."

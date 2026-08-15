@@ -1,0 +1,707 @@
+    1: """RationRight — database analytics service (Phase 5).
+       
+       The dashboard's numbers come from HERE, never from the frontend: every metric
+       is an SQL aggregation over the normalized database (``data/rationright.db``),
+       so a change to a database record changes the dashboard on the next fetch.
+       
+       The database contains the seeded synthetic demo dataset (import source
+       "Synthetic Demo Dataset") plus any datasets uploaded through Phase 3/4. All
+       analytics operate over the full database — demo data is preserved and real
+       data simply adds to the aggregates, with per-source provenance reported so the
+       UI can show exactly which imports are contributing.
+       
+       Supported queries
+       -----------------
+       - ``overview``          KPI cards + provenance (time-range aware)
+       - ``distribution``      by commodity / district / center / status + trend
+       - ``inventory``         stock, consumption, days remaining, risk status
+       - ``beneficiaries``     searchable, filterable, paginated registry
+       - ``fps``               centers with distribution activity
+       - ``alerts``            deterministic operational alerts (no AI)
+       - ``transactions``      paginated transaction feed (agent-contract shape)
+       
+       Deterministic rules documented here (never computed in the UI):
+       
+       - **Inventory risk** — ``days_remaining = current_stock * 30 / monthly_consumption``
+         (30-day month assumption). ``CRITICAL`` below 15 days, ``WARNING`` below 30
+         days, otherwise ``HEALTHY``; ``UNKNOWN`` when no consumption is recorded.
+       - **Low-stock alert** — ``current_stock < reorder_threshold`` → HIGH.
+       - **High failure-rate alert** — at an FPS, ``failed / (failed + completed) >= 10%``
+         with at least 5 transactions → MEDIUM.
+       - **No recent distribution alert** — an FPS with zero completed transactions
+         in the last 30 days → LOW.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import sqlite3
+    1: from datetime import date, timedelta
+       
+    1: from database import DEFAULT_DB_PATH, as_agent_transaction, open_db
+       
+    1: RANGES = ("today", "7d", "30d", "all", "custom")
+    1: RANGE_LABELS = {
+    1:     "today": "Today",
+    1:     "7d": "Last 7 days",
+    1:     "30d": "Last 30 days",
+    1:     "all": "All time",
+    1:     "custom": "Custom range",
+       }
+    1: GRANULARITIES = ("day", "week", "month")
+    1: BENEFICIARY_SORTS = (
+           "external_reference", "transaction_count", "total_quantity",
+           "last_transaction", "district",
+       )
+    1: BENEFICIARY_DEFAULT_SORT = "external_reference"
+    1: BENEFICIARY_SORTS_SQL = {
+    1:     "external_reference": "b.external_reference COLLATE NOCASE",
+    1:     "transaction_count": "transaction_count DESC",
+    1:     "total_quantity": "total_quantity DESC",
+    1:     "last_transaction": "last_transaction DESC",
+    1:     "district": "b.district COLLATE NOCASE",
+       }
+       
+       # --- documented thresholds -------------------------------------------------
+    1: INVENTORY_CRITICAL_DAYS = 15
+    1: INVENTORY_WARNING_DAYS = 30
+    1: FAILURE_RATE_THRESHOLD = 0.10
+    1: FAILURE_MIN_TRANSACTIONS = 5
+    1: NO_RECENT_DISTRIBUTION_DAYS = 30
+       
+    1: MAX_PAGE_SIZE = 200
+    1: DEFAULT_PAGE_SIZE = 10
+       
+       
+    2: class AnalyticsError(ValueError):
+    1:     """Raised for invalid analytics parameters (mapped to HTTP 400)."""
+       
+       
+       # ---------------------------------------------------------------------------
+       # Range handling
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def resolve_range(range_key: str, from_date: str = None, to_date: str = None):
+           """Return ``(start_iso, end_iso)`` — inclusive, ``None`` when unfiltered.
+       
+           ``range_key`` must be one of RANGES. ``custom`` requires both ``from_date``
+           and ``to_date`` as ISO dates (``YYYY-MM-DD``) with from <= to. Date-only
+           comparison is used because the database stores both ``YYYY-MM-DD`` and
+           ``YYYY-MM-DDTHH:MM:SS`` values.
+           """
+   47:     if range_key not in RANGES:
+    4:         raise AnalyticsError(
+    2:             "Invalid range %r. Supported: %s" % (range_key, ", ".join(RANGES))
+               )
+   45:     if range_key == "all":
+   35:         return None, None
+   10:     if range_key == "custom":
+    9:         if not from_date or not to_date:
+    2:             raise AnalyticsError("Custom range requires both 'from' and 'to' (YYYY-MM-DD).")
+    7:         try:
+    7:             date.fromisoformat(from_date)
+    7:             date.fromisoformat(to_date)
+               except (TypeError, ValueError):
+                   raise AnalyticsError("Invalid date. Use YYYY-MM-DD.")
+    7:         if from_date > to_date:
+    2:             raise AnalyticsError("'from' must not be after 'to'.")
+    5:         return from_date, to_date
+    1:     today = date.today().isoformat()
+    1:     days = {"today": 0, "7d": 6, "30d": 29}[range_key]
+    1:     start = (date.today() - timedelta(days=days)).isoformat()
+    1:     return start, today
+       
+       
+    1: def _date_clause(range_key: str, from_date: str = None, to_date: str = None):
+           """SQL fragment + params filtering on ``substr(transaction_date, 1, 10)``."""
+   47:     start, end = resolve_range(range_key, from_date, to_date)
+   41:     if start is None:
+   35:         return "", {}
+    6:     return (
+    6:         " AND substr(transaction_date, 1, 10) BETWEEN :d_start AND :d_end",
+    6:         {"d_start": start, "d_end": end},
+           )
+       
+       
+    1: def _require_page(page, per_page):
+   16:     try:
+   16:         page = int(page)
+   16:         per_page = int(per_page)
+           except (TypeError, ValueError):
+               raise AnalyticsError("page and per_page must be integers.")
+   16:     if page < 1:
+    1:         raise AnalyticsError("page must be >= 1.")
+   15:     if per_page < 1 or per_page > MAX_PAGE_SIZE:
+    1:         raise AnalyticsError("per_page must be between 1 and %d." % MAX_PAGE_SIZE)
+   14:     return page, per_page
+       
+       
+       # ---------------------------------------------------------------------------
+       # Overview KPIs
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def overview(conn: sqlite3.Connection, range_key: str = "all",
+                    from_date: str = None, to_date: str = None) -> dict:
+   31:     clause, params = _date_clause(range_key, from_date, to_date)
+       
+   50:     tx_row = conn.execute(
+   50:         "SELECT COUNT(*) AS n, "
+               " COALESCE(SUM(quantity), 0) AS qty, "
+               " COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS completed, "
+               " COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, "
+               " COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pending, "
+               " COALESCE(SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled "
+   25:         " FROM ration_transactions WHERE 1 = 1" + clause,
+   25:         params,
+           ).fetchone()
+       
+   50:     ben_row = conn.execute(
+   25:         "SELECT COUNT(*) AS n, "
+               " COALESCE(SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END), 0) AS active "
+               " FROM beneficiaries"
+           ).fetchone()
+   50:     fps_row = conn.execute(
+   25:         "SELECT COUNT(*) AS n, "
+               " COALESCE(SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END), 0) AS active "
+               " FROM fps_centers"
+           ).fetchone()
+   50:     district_row = conn.execute(
+   25:         "SELECT COUNT(DISTINCT district) AS n FROM beneficiaries "
+               "WHERE district IS NOT NULL AND district != ''"
+           ).fetchone()
+       
+  143:     by_commodity = [
+  118:         dict(r) for r in conn.execute(
+   75:             "SELECT commodity, COALESCE(SUM(quantity), 0) AS quantity, COUNT(*) AS count "
+   25:             "FROM ration_transactions WHERE 1 = 1" + clause +
+   25:             " GROUP BY commodity ORDER BY quantity DESC",
+   25:             params,
+               )
+           ]
+   25:     by_status = {
+   25:         "COMPLETED": tx_row["completed"], "FAILED": tx_row["failed"],
+   25:         "PENDING": tx_row["pending"], "CANCELLED": tx_row["cancelled"],
+           }
+  118:     commodities = sorted({r["commodity"] for r in by_commodity if r["commodity"]})
+       
+  121:     sources = [
+   96:         dict(r) for r in conn.execute(
+   25:             "SELECT s.id, s.name, s.type, "
+                   " COUNT(t.id) AS transaction_count, "
+                   " MAX(i.completed_at) AS last_import_at "
+                   "FROM data_sources s "
+                   "LEFT JOIN data_imports i ON i.data_source_id = s.id "
+                   "LEFT JOIN ration_transactions t ON t.source_import_id = i.id "
+                   "GROUP BY s.id ORDER BY s.id"
+               )
+           ]
+   25:     last_import = None
+   25:     if sources:
+   92:         with_imports = [s for s in sources if s["last_import_at"]]
+   23:         if with_imports:
+   47:             newest = max(with_imports, key=lambda s: s["last_import_at"])
+   22:             last_import = {
+   22:                 "source_id": newest["id"],
+   22:                 "source_name": newest["name"],
+   22:                 "last_import_at": newest["last_import_at"],
+                   }
+       
+   25:     return {
+   25:         "range": range_key,
+   25:         "range_label": RANGE_LABELS.get(range_key, range_key),
+   25:         "total_beneficiaries": ben_row["n"],
+   25:         "active_beneficiaries": ben_row["active"],
+   25:         "total_fps_centers": fps_row["n"],
+   25:         "active_fps_centers": fps_row["active"],
+   25:         "total_transactions": tx_row["n"],
+   25:         "ration_distributed_kg": round(tx_row["qty"], 2),
+   25:         "distribution_count": tx_row["n"],
+   25:         "by_status": by_status,
+   25:         "districts_covered": district_row["n"],
+   25:         "commodities_distributed": commodities,
+   25:         "by_commodity": by_commodity,
+   25:         "data_sources": sources,
+   25:         "last_import": last_import,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Distribution analytics
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def distribution(conn: sqlite3.Connection, range_key: str = "all",
+                        granularity: str = "day",
+                        from_date: str = None, to_date: str = None) -> dict:
+   13:     if granularity not in GRANULARITIES:
+    2:         raise AnalyticsError(
+    1:             "Invalid granularity %r. Supported: %s" % (granularity, ", ".join(GRANULARITIES))
+               )
+   12:     clause, params = _date_clause(range_key, from_date, to_date)
+       
+   36:     total_quantity = conn.execute(
+   12:         "SELECT COALESCE(SUM(quantity), 0) AS q FROM ration_transactions WHERE 1 = 1" + clause,
+   12:         params,
+   12:     ).fetchone()["q"]
+       
+   77:     by_commodity = [
+   65:         dict(r) for r in conn.execute(
+   36:             "SELECT commodity, COALESCE(SUM(quantity), 0) AS quantity, COUNT(*) AS count "
+   12:             "FROM ration_transactions WHERE 1 = 1" + clause +
+   12:             " GROUP BY commodity ORDER BY quantity DESC",
+   12:             params,
+               )
+           ]
+   66:     by_district = [
+   54:         dict(r) for r in conn.execute(
+   36:             "SELECT COALESCE(NULLIF(b.district, ''), 'Unknown') AS district, "
+                   " COALESCE(SUM(t.quantity), 0) AS quantity, COUNT(t.id) AS count "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+   12:             "WHERE 1 = 1" + clause +
+   12:             " GROUP BY district ORDER BY quantity DESC",
+   12:             params,
+               )
+           ]
+   70:     by_center = [
+   58:         dict(r) for r in conn.execute(
+   36:             "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+                   " COALESCE(SUM(t.quantity), 0) AS quantity, COUNT(t.id) AS count "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+   12:             "WHERE 1 = 1" + clause +
+   12:             " GROUP BY fps_code ORDER BY quantity DESC",
+   12:             params,
+               )
+           ]
+   54:     by_status = [
+   42:         dict(r) for r in conn.execute(
+   36:             "SELECT COALESCE(status, 'UNKNOWN') AS status, COUNT(*) AS count "
+   12:             "FROM ration_transactions WHERE 1 = 1" + clause +
+   12:             " GROUP BY status ORDER BY count DESC",
+   12:             params,
+               )
+           ]
+       
+   24:     bucket_expr = {
+   12:         "day": "substr(transaction_date, 1, 10)",
+   12:         "week": "strftime('%Y-W%W', substr(transaction_date, 1, 10))",
+   12:         "month": "substr(transaction_date, 1, 7)",
+   12:     }[granularity]
+   24:     rows = conn.execute(
+   48:         ("SELECT %s AS bucket, commodity, COALESCE(SUM(quantity), 0) AS quantity "
+   12:          "FROM ration_transactions WHERE 1 = 1" + clause +
+   24:          " GROUP BY bucket, commodity ORDER BY bucket") % bucket_expr,
+   12:         params,
+           ).fetchall()
+       
+   12:     labels = []
+   12:     series = {}
+   12:     by_bucket = {}
+  148:     for row in rows:
+  136:         bucket = row["bucket"]
+  136:         if bucket not in by_bucket:
+   92:             by_bucket[bucket] = {}
+   92:             labels.append(bucket)
+  136:         by_bucket[bucket][row["commodity"]] = row["quantity"]
+  136:         series.setdefault(row["commodity"], {})
+   65:     commodities = sorted({r["commodity"] for r in by_commodity if r["commodity"]})
+   12:     trend = {
+   12:         "granularity": granularity,
+   12:         "labels": labels,
+   77:         "series": {
+  503:             commodity: [
+  380:                 round(by_bucket.get(label, {}).get(commodity, 0.0), 2)
+  421:                 for label in labels
+                   ]
+   53:             for commodity in commodities
+               },
+           }
+       
+   12:     return {
+   12:         "range": range_key,
+   12:         "range_label": RANGE_LABELS.get(range_key, range_key),
+   12:         "granularity": granularity,
+   12:         "total_quantity": round(total_quantity, 2),
+   12:         "by_commodity": by_commodity,
+   12:         "by_district": by_district,
+   12:         "by_center": by_center,
+   12:         "by_status": by_status,
+   12:         "trend": trend,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Inventory analytics
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def inventory(conn: sqlite3.Connection) -> dict:
+    5:     by_commodity = []
+   14:     for r in conn.execute(
+    5:         "SELECT commodity, "
+               " COALESCE(SUM(current_stock), 0) AS current_stock, "
+               " COALESCE(SUM(monthly_consumption), 0) AS monthly_consumption, "
+               " MIN(reorder_threshold) AS reorder_threshold, "
+               " COUNT(DISTINCT fps_center_id) AS center_count "
+               "FROM inventory GROUP BY commodity ORDER BY current_stock DESC"
+           ):
+    4:         stock = r["current_stock"]
+    4:         consumption = r["monthly_consumption"]
+    4:         if consumption and consumption > 0:
+    4:             days_remaining = round(stock * 30.0 / consumption, 1)
+    4:             status = (
+    4:                 "CRITICAL" if days_remaining < INVENTORY_CRITICAL_DAYS
+    2:                 else "WARNING" if days_remaining < INVENTORY_WARNING_DAYS
+    2:                 else "HEALTHY"
+                   )
+               else:
+                   days_remaining = None
+                   status = "UNKNOWN"
+    8:         by_commodity.append({
+    4:             "commodity": r["commodity"],
+    4:             "current_stock": stock,
+    4:             "monthly_consumption": consumption,
+    4:             "reorder_threshold": r["reorder_threshold"],
+    4:             "center_count": r["center_count"],
+    4:             "days_remaining": days_remaining,
+    4:             "status": status,
+               })
+       
+   19:     items = [dict(r) for r in conn.execute(
+    5:         "SELECT i.id, i.commodity, i.current_stock, i.monthly_consumption, "
+               " i.reorder_threshold, COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+               " substr(i.last_updated, 1, 10) AS last_updated "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "ORDER BY i.commodity, fps_code"
+           )]
+   19:     low_stock = [
+   11:         item for item in items
+    4:         if item["reorder_threshold"] is not None
+    4:         and item["current_stock"] < item["reorder_threshold"]
+           ]
+   18:     by_center = [
+   13:         dict(r) for r in conn.execute(
+    5:             "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+                   " COALESCE(SUM(i.current_stock), 0) AS current_stock, COUNT(i.id) AS items "
+                   "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+                   "GROUP BY fps_code ORDER BY current_stock DESC"
+               )
+           ]
+       
+    5:     return {
+   14:         "total_stock_kg": round(sum(r["current_stock"] for r in by_commodity), 2),
+    5:         "by_commodity": by_commodity,
+    5:         "items": items,
+    5:         "by_center": by_center,
+    5:         "low_stock_items": low_stock,
+   19:         "critical_commodities": [
+    9:             r for r in by_commodity if r["status"] in ("CRITICAL", "WARNING")
+               ],
+    5:         "thresholds": {
+    5:             "critical_days": INVENTORY_CRITICAL_DAYS,
+    5:             "warning_days": INVENTORY_WARNING_DAYS,
+    5:             "method": "days_remaining = current_stock * 30 / monthly_consumption",
+               },
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Beneficiary analytics (server-side search / filter / pagination / sort)
+       # ---------------------------------------------------------------------------
+       
+       
+    2: def beneficiaries(conn: sqlite3.Connection, *, q: str = None, state: str = None,
+    1:                   district: str = None, category: str = None, status: str = None,
+    1:                   page: int = 1, per_page: int = DEFAULT_PAGE_SIZE,
+    1:                   sort: str = BENEFICIARY_DEFAULT_SORT) -> dict:
+   12:     page, per_page = _require_page(page, per_page)
+   10:     if sort not in BENEFICIARY_SORTS:
+    2:         raise AnalyticsError(
+    1:             "Invalid sort %r. Supported: %s" % (sort, ", ".join(BENEFICIARY_SORTS))
+               )
+       
+    9:     where = []
+    9:     params = {}
+    9:     if q:
+    2:         where.append("b.external_reference LIKE :q ESCAPE '\\'")
+    2:         params["q"] = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+   45:     for field, column in (("state", "b.state"), ("district", "b.district"),
+                                 ("ration_category", "b.ration_category"), ("status", "b.status")):
+   36:         value = locals().get(field)
+   36:         if value and value != "all":
+    2:             where.append("%s = :%s" % (column, field))
+    2:             params[field] = value
+    9:     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+       
+    9:     base = (
+    9:         "SELECT b.id, b.external_reference, b.state, b.district, b.block, "
+               " b.ration_category, b.family_size, b.status, "
+               " COUNT(t.id) AS transaction_count, "
+               " COALESCE(SUM(t.quantity), 0) AS total_quantity, "
+               " MIN(substr(t.transaction_date, 1, 10)) AS first_transaction, "
+               " MAX(substr(t.transaction_date, 1, 10)) AS last_transaction, "
+               " AVG(t.latitude) AS avg_latitude, AVG(t.longitude) AS avg_longitude "
+               "FROM beneficiaries b LEFT JOIN ration_transactions t ON t.beneficiary_id = b.id"
+           )
+    9:     group_sql = " GROUP BY b.id"
+   27:     total = conn.execute(
+    9:         "SELECT COUNT(*) AS n FROM (" + base + where_sql + group_sql + ")",
+    9:         params,
+    9:     ).fetchone()["n"]
+   27:     active = conn.execute(
+    9:         "SELECT COUNT(*) AS n FROM beneficiaries WHERE status = 'ACTIVE'"
+    9:     ).fetchone()["n"]
+       
+    9:     order_sql = " ORDER BY " + BENEFICIARY_SORTS_SQL[sort]
+    9:     if sort != "external_reference":
+    2:         order_sql += ", b.external_reference COLLATE NOCASE"
+   18:     rows = conn.execute(
+   18:         base + where_sql + group_sql + order_sql +
+    9:         " LIMIT :limit OFFSET :offset",
+    9:         {**params, "limit": per_page, "offset": (page - 1) * per_page},
+           ).fetchall()
+    9:     result_rows = []
+   27:     for r in rows:
+   18:         row = dict(r)
+   18:         row["avg_latitude"] = round(row["avg_latitude"], 4) if row["avg_latitude"] is not None else None
+   18:         row["avg_longitude"] = round(row["avg_longitude"], 4) if row["avg_longitude"] is not None else None
+   18:         result_rows.append(row)
+       
+    9:     def distinct(column):
+  137:         return [
+  110:             r[0] for r in conn.execute(
+   54:                 "SELECT DISTINCT %s FROM beneficiaries WHERE %s IS NOT NULL AND %s != '' "
+   27:                 "ORDER BY 1" % (column, column, column)
+                   )
+               ]
+       
+    9:     return {
+    9:         "total": total,
+    9:         "active": active,
+    9:         "page": page,
+    9:         "per_page": per_page,
+    9:         "sort": sort,
+    9:         "rows": result_rows,
+    9:         "filters": {
+    9:             "states": distinct("state"),
+    9:             "districts": distinct("district"),
+    9:             "categories": distinct("ration_category"),
+   43:             "statuses": [r[0] for r in conn.execute(
+    9:                 "SELECT DISTINCT status FROM beneficiaries ORDER BY 1"
+                   )],
+               },
+           }
+       
+       
+    1: def beneficiary_detail(conn: sqlite3.Connection, external_reference: str) -> dict:
+           """One beneficiary plus its transactions (agent-contract shape)."""
+    6:     ben = conn.execute(
+    3:         "SELECT * FROM beneficiaries WHERE external_reference = :ref",
+    3:         {"ref": external_reference},
+           ).fetchone()
+    3:     if ben is None:
+    2:         raise AnalyticsError("Beneficiary %r was not found." % external_reference)
+    5:     transactions = [
+    4:         as_agent_transaction(dict(r)) for r in conn.execute(
+    1:             "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+                   "WHERE t.beneficiary_id = :id ORDER BY t.transaction_date",
+    1:             {"id": ben["id"]},
+               )
+           ]
+    1:     return {"beneficiary": dict(ben), "transactions": transactions}
+       
+       
+       # ---------------------------------------------------------------------------
+       # FPS analytics
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def fps(conn: sqlite3.Connection) -> dict:
+    2:     centers = []
+    7:     for r in conn.execute(
+    2:         "SELECT f.id, f.fps_code, f.name, f.state, f.district, f.location, "
+               " f.latitude, f.longitude, f.capacity, f.status, "
+               " COUNT(t.id) AS transaction_count, "
+               " COALESCE(SUM(t.quantity), 0) AS quantity_distributed, "
+               " (SELECT COUNT(*) FROM inventory i WHERE i.fps_center_id = f.id) AS inventory_count "
+               "FROM fps_centers f LEFT JOIN ration_transactions t ON t.fps_center_id = f.id "
+               "GROUP BY f.id ORDER BY quantity_distributed DESC"
+           ):
+    3:         row = dict(r)
+    3:         row["latitude"] = round(row["latitude"], 4) if row["latitude"] is not None else None
+    3:         row["longitude"] = round(row["longitude"], 4) if row["longitude"] is not None else None
+    3:         centers.append(row)
+    7:     active = sum(1 for c in centers if c["status"] == "ACTIVE")
+    2:     return {
+    2:         "total": len(centers),
+    2:         "active": active,
+    2:         "centers": centers,
+    7:         "total_transactions": sum(c["transaction_count"] for c in centers),
+    7:         "total_quantity_kg": round(sum(c["quantity_distributed"] for c in centers), 2),
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Deterministic operational alerts (no AI)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def _next_alert_id():
+           # deterministic ids: sequential per request (sorted output)
+    3:     counter = [0]
+       
+    3:     def _make(prefix, key):
+    6:         counter[0] += 1
+    6:         return "OP-%s-%03d" % (prefix, counter[0])
+       
+    3:     return _make
+       
+       
+    1: def operational_alerts(conn: sqlite3.Connection,
+    1:                        recent_days: int = NO_RECENT_DISTRIBUTION_DAYS) -> dict:
+    3:     alerts = []
+    3:     make_id = _next_alert_id()
+       
+           # 1. LOW INVENTORY — current_stock < reorder_threshold
+    8:     for r in conn.execute(
+    3:         "SELECT i.commodity, i.current_stock, i.reorder_threshold, i.fps_center_id, "
+               " COALESCE(f.fps_code, 'Unknown') AS fps_code "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "WHERE i.reorder_threshold IS NOT NULL AND i.current_stock < i.reorder_threshold "
+               "ORDER BY (i.reorder_threshold - i.current_stock) DESC"
+           ):
+    4:         alerts.append({
+    2:             "alert_id": make_id("INV", r["fps_code"]),
+    2:             "category": "LOW_INVENTORY",
+    2:             "severity": "high",
+    2:             "title": "Inventory below reorder threshold",
+    4:             "message": "Stock of %s at %s is below the reorder threshold "
+    4:                        "(%.2f < %.2f)." % (r["commodity"], r["fps_code"],
+    2:                                            r["current_stock"], r["reorder_threshold"]),
+    2:             "entity_type": "fps_center",
+    2:             "entity_id": r["fps_code"],
+    2:             "commodity": r["commodity"],
+    2:             "current_stock": r["current_stock"],
+    2:             "reorder_threshold": r["reorder_threshold"],
+               })
+       
+           # 2. HIGH FAILURE RATE — per FPS
+   14:     for r in conn.execute(
+    3:         "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+               " COALESCE(SUM(CASE WHEN t.status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, "
+               " COALESCE(SUM(CASE WHEN t.status IN ('COMPLETED','FAILED') THEN 1 ELSE 0 END), 0) AS total "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+               "GROUP BY fps_code"
+           ):
+    8:         total = r["total"]
+    8:         if total < FAILURE_MIN_TRANSACTIONS:
+    4:             continue
+    4:         rate = r["failed"] / total
+    4:         if rate >= FAILURE_RATE_THRESHOLD:
+    4:             alerts.append({
+    2:                 "alert_id": make_id("FAIL", r["fps_code"]),
+    2:                 "category": "HIGH_FAILURE_RATE",
+    2:                 "severity": "medium",
+    2:                 "title": "Transaction failure rate is elevated",
+    4:                 "message": "%d of %d transactions at %s failed (%.0f%% >= %.0f%% threshold). "
+    2:                            "Requires human review." % (
+    2:                                r["failed"], total, r["fps_code"], rate * 100,
+    2:                                FAILURE_RATE_THRESHOLD * 100),
+    2:                 "entity_type": "fps_center",
+    2:                 "entity_id": r["fps_code"],
+    2:                 "failed": r["failed"],
+    2:                 "total": total,
+    2:                 "failure_rate": round(rate, 4),
+                   })
+       
+           # 3. NO RECENT DISTRIBUTION — per FPS
+    3:     cutoff = (date.today() - timedelta(days=recent_days)).isoformat()
+    8:     for r in conn.execute(
+    3:         "SELECT f.id, f.fps_code, f.name, f.district, "
+               " COALESCE(SUM(CASE WHEN t.status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS completed "
+               "FROM fps_centers f LEFT JOIN ration_transactions t "
+               "  ON t.fps_center_id = f.id AND substr(t.transaction_date, 1, 10) >= :cutoff "
+               "GROUP BY f.id HAVING completed = 0",
+    3:         {"cutoff": cutoff},
+           ):
+    4:         alerts.append({
+    2:             "alert_id": make_id("QUIET", r["fps_code"]),
+    2:             "category": "NO_RECENT_DISTRIBUTION",
+    2:             "severity": "low",
+    2:             "title": "No recent distribution activity detected",
+    4:             "message": "FPS %s (%s) has no completed transactions in the last "
+    2:                        "%d days. Verify the center is operating." % (
+    2:                            r["fps_code"], r["district"] or "district unknown",
+    2:                            recent_days),
+    2:             "entity_type": "fps_center",
+    2:             "entity_id": r["fps_code"],
+    2:             "recent_days": recent_days,
+               })
+       
+    9:     alerts.sort(key=lambda a: ({"high": 0, "medium": 1, "low": 2}.get(a["severity"], 3), a["alert_id"]))
+    3:     return {
+    3:         "generated_at": date.today().isoformat(),
+    3:         "recent_days": recent_days,
+    3:         "count": len(alerts),
+    3:         "alerts": alerts,
+    3:         "rules": {
+    3:             "LOW_INVENTORY": "current_stock < reorder_threshold",
+    3:             "HIGH_FAILURE_RATE": "failed / (failed + completed) >= 10% with >= 5 transactions",
+    3:             "NO_RECENT_DISTRIBUTION": "no completed transactions in the last %d days" % recent_days,
+               },
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Transaction feed
+       # ---------------------------------------------------------------------------
+       
+       
+    2: def transactions(conn: sqlite3.Connection, range_key: str = "all",
+    1:                  status: str = None, page: int = 1,
+    1:                  per_page: int = DEFAULT_PAGE_SIZE,
+    1:                  from_date: str = None, to_date: str = None) -> dict:
+    4:     page, per_page = _require_page(page, per_page)
+    4:     clause, params = _date_clause(range_key, from_date, to_date)
+    4:     if status:
+    2:         if status not in ("COMPLETED", "PENDING", "FAILED", "CANCELLED"):
+    2:             raise AnalyticsError(
+    1:                 "Invalid status %r. Supported: COMPLETED, PENDING, FAILED, CANCELLED." % status
+                   )
+    1:         clause += " AND t.status = :status"
+    1:         params["status"] = status
+       
+    9:     total = conn.execute(
+    3:         "SELECT COUNT(*) AS n FROM ration_transactions t WHERE 1 = 1" + clause,
+    3:         params,
+    3:     ).fetchone()["n"]
+   27:     rows = [
+   24:         as_agent_transaction(dict(r)) for r in conn.execute(
+    9:             "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+    3:             "WHERE 1 = 1" + clause +
+    3:             " ORDER BY t.transaction_date, t.id LIMIT :limit OFFSET :offset",
+    3:             {**params, "limit": per_page, "offset": (page - 1) * per_page},
+               )
+           ]
+    3:     return {
+    3:         "total": total,
+    3:         "page": page,
+    3:         "per_page": per_page,
+    3:         "rows": rows,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Convenience
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def analytics(db_path=DEFAULT_DB_PATH):
+           """Context helper: open a connection for an analytics call."""
+   23:     return open_db(db_path)

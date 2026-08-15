@@ -1,0 +1,1043 @@
+    1: """RationRight — Phase 3: dataset ingestion tests.
+       
+       Covers the full pipeline — parsers (CSV/JSON/XLSX), column mapping, record
+       validation, duplicate detection, database import states (COMPLETED/PARTIAL/
+       FAILED), large datasets, file security, the API flow (upload -> validate ->
+       confirm -> history), and preservation of the existing demo data.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import io
+    1: import json
+    1: import os
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: import zipfile
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import ingestion.service as service
+    1: from ingestion import mapping as mapmod
+    1: from ingestion import validation
+    1: from ingestion.parsers import (
+           EmptyDatasetError,
+           ParseError,
+           UnsupportedFileTypeError,
+           parse_csv,
+           parse_file,
+           parse_json,
+           parse_xlsx,
+           sniff_file_type,
+       )
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+       # ---------------------------------------------------------------------------
+       # Test data builders
+       # ---------------------------------------------------------------------------
+       
+    1: TRANSACTION_CSV = (
+    1:     "Transaction ID,Beneficiary ID,FPS Code,Transaction Date,Commodity,Quantity,Unit\n"
+           "TX1001,BEN001,FPS01,2026-08-01,rice,10,kg\n"
+           "TX1002,BEN001,FPS01,2026-08-02,rice,5,kg\n"
+           "TX1003,BEN002,FPS02,2026-08-01,wheat,8,kg\n"
+       )
+       
+    1: TRANSACTION_CSV_QUOTED = (
+    1:     'id,beneficiary,commodity,"quantity, kg",date\n'
+           "T1,BEN1,\"rice, basmati\",\"1,200\",2026-08-01\n"
+           "T2,BEN2,wheat,840,2026-08-02\n"
+       )
+       
+    1: BENEFICIARY_CSV = (
+    1:     "Beneficiary ID,State,District,Ration Category,Family Size,Status\n"
+           "BEN101,Maharashtra,Pune,AAY,4,ACTIVE\n"
+           "BEN102,Maharashtra,Nagpur,PHH,3,ACTIVE\n"
+       )
+       
+    1: FPS_CSV = (
+    1:     "FPS Code,Name,District,State,Capacity\n"
+           "FPS01,Kanpur Center #04,Kanpur,UP,5000\n"
+           "FPS02,Lucknow Center #11,Lucknow,UP,4200\n"
+       )
+       
+    1: INVENTORY_CSV = (
+    1:     "FPS Code,Commodity,Current Stock,Monthly Consumption,Reorder Threshold\n"
+           "FPS01,rice,1200,300,200\n"
+           "FPS01,wheat,800,250,150\n"
+       )
+       
+    1: COMBINED_CSV = (
+    1:     "Transaction ID,Beneficiary ID,State,District,FPS Code,Transaction Date,Commodity,Quantity\n"
+           "C1,BEN201,UP,Lucknow,FPS01,2026-08-01,rice,10\n"
+           "C2,BEN201,UP,Lucknow,FPS01,2026-08-03,wheat,5\n"
+       )
+       
+       
+    1: def write_temp(data: bytes, suffix: str) -> Path:
+   16:     fd, path = tempfile.mkstemp(suffix=suffix)
+   16:     with os.fdopen(fd, "wb") as fh:
+   16:         fh.write(data)
+   16:     return Path(path)
+       
+       
+    1: def _col_letter(index: int) -> str:
+   27:     out = ""
+   27:     index += 1
+   54:     while index:
+   27:         index, remainder = divmod(index - 1, 26)
+   27:         out = chr(65 + remainder) + out
+   27:     return out
+       
+       
+    1: def _cell_xml(ref: str, value):
+   21:     if isinstance(value, bool):
+               return '<c r="%s" t="b"><v>%d</v></c>' % (ref, 1 if value else 0)
+   21:     if isinstance(value, (int, float)):
+    4:         return '<c r="%s"><v>%s</v></c>' % (ref, value)
+   17:     return '<c r="%s" t="inlineStr"><is><t>%s</t></is></c>' % (ref, value)
+       
+       
+    1: def build_xlsx(sheets):
+           """Build a minimal XLSX in memory. ``sheets`` = [(name, [rows...]), ...]."""
+    4:     buf = io.BytesIO()
+    4:     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    4:         sheet_count = len(sheets)
+   18:         overrides = "".join(
+   12:             '<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+   16:             % (i + 1) for i in range(sheet_count)
+               )
+    8:         z.writestr("[Content_Types].xml", (
+   12:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    8:             + overrides + "</Types>"
+               ))
+    8:         z.writestr("_rels/.rels", (
+    4:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                   "</Relationships>"
+               ))
+   18:         sheets_xml = "".join(
+    6:             '<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (name, i + 1, i + 1)
+   10:             for i, (name, _) in enumerate(sheets)
+               )
+    8:         z.writestr("xl/workbook.xml", (
+   12:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                   'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+    8:             "<sheets>" + sheets_xml + "</sheets></workbook>"
+               ))
+   18:         rels = "".join(
+   12:             '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>'
+   16:             % (i + 1, i + 1) for i in range(sheet_count)
+               )
+    8:         z.writestr("xl/_rels/workbook.xml.rels", (
+   12:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    8:             + rels + "</Relationships>"
+               ))
+   10:         for i, (_, rows) in enumerate(sheets):
+    6:             sheet_data = ""
+   17:             for r_idx, row in enumerate(rows, start=1):
+   54:                 cells = "".join(
+   21:                     _cell_xml(_col_letter(c), value)
+   32:                     for c, value in enumerate(row)
+                       )
+   11:                 sheet_data += '<row r="%d">%s</row>' % (r_idx, cells)
+   12:             z.writestr("xl/worksheets/sheet%d.xml" % (i + 1), (
+   18:                 '<?xml version="1.0" encoding="UTF-8"?>'
+                       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+   12:                 "<sheetData>" + sheet_data + "</sheetData></worksheet>"
+                   ))
+    4:     return buf.getvalue()
+       
+       
+    1: def build_xlsx_shared_strings(rows):
+           """XLSX using the shared-strings table (the common Excel export layout)."""
+    1:     strings = []
+    4:     for row in rows:
+    9:         for value in row:
+    6:             if isinstance(value, str) and value not in strings:
+    4:                 strings.append(value)
+    1:     buf = io.BytesIO()
+    1:     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    2:         z.writestr("[Content_Types].xml", (
+    1:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                   '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+                   "</Types>"
+               ))
+    2:         z.writestr("_rels/.rels", (
+    1:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                   "</Relationships>"
+               ))
+    2:         z.writestr("xl/workbook.xml", (
+    1:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                   'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                   '<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+               ))
+    2:         z.writestr("xl/_rels/workbook.xml.rels", (
+    1:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                   "</Relationships>"
+               ))
+    6:         sst = "".join("<si><t>%s</t></si>" % s for s in strings)
+    2:         z.writestr("xl/sharedStrings.xml", (
+    2:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="%d" uniqueCount="%d">%s</sst>'
+    1:             % (len(strings), len(strings), sst)
+               ))
+    1:         sheet_data = ""
+    4:         for r_idx, row in enumerate(rows, start=1):
+    3:             cells = ""
+    9:             for c, value in enumerate(row):
+    6:                 ref = _col_letter(c) + str(r_idx)
+    6:                 if isinstance(value, str):
+    4:                     idx = strings.index(value)
+    4:                     cells += '<c r="%s" t="s"><v>%d</v></c>' % (ref, idx)
+                       else:
+    2:                     cells += '<c r="%s"><v>%s</v></c>' % (ref, value)
+    3:             sheet_data += '<row r="%d">%s</row>' % (r_idx, cells)
+    2:         z.writestr("xl/worksheets/sheet1.xml", (
+    3:             '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    2:             "<sheetData>" + sheet_data + "</sheetData></worksheet>"
+               ))
+    1:     return buf.getvalue()
+       
+       
+    1: def cleanup_upload(token):
+   17:     if token:
+   17:         service._drop_entry(token)
+       
+       
+       # ---------------------------------------------------------------------------
+       # 1. Parsers
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class TestParsers(unittest.TestCase):
+    1:     def test_valid_csv(self):
+    1:         path = write_temp(TRANSACTION_CSV.encode("utf-8"), ".csv")
+    1:         parsed = parse_csv(path)
+    1:         self.assertEqual(parsed["headers"], ["Transaction ID", "Beneficiary ID", "FPS Code", "Transaction Date", "Commodity", "Quantity", "Unit"])
+    1:         self.assertEqual(len(parsed["rows"]), 3)
+       
+    1:     def test_csv_quoted_fields_commas_utf8(self):
+    1:         path = write_temp(TRANSACTION_CSV_QUOTED.encode("utf-8"), ".csv")
+    1:         parsed = parse_csv(path)
+    1:         self.assertEqual(parsed["rows"][0], ["T1", "BEN1", "rice, basmati", "1,200", "2026-08-01"])
+               # semicolon delimiter + BOM
+    1:         semicolon = "\ufeffDate;Quantity;Commodity\n2026-08-01;10;rice\n".encode("utf-8")
+    1:         path2 = write_temp(semicolon, ".csv")
+    1:         parsed2 = parse_csv(path2)
+    1:         self.assertEqual(parsed2["headers"], ["Date", "Quantity", "Commodity"])
+    1:         self.assertEqual(parsed2["rows"][0], ["2026-08-01", "10", "rice"])
+       
+    1:     def test_invalid_csv(self):
+    1:         path = write_temp(b'id,qty\n"unterminated,10\n', ".csv")
+    1:         with self.assertRaises(ParseError):
+    2:             parse_csv(path)
+       
+    1:     def test_empty_csv(self):
+    1:         path = write_temp(b"id,qty\n", ".csv")
+    1:         with self.assertRaises(EmptyDatasetError):
+    2:             parse_csv(path)
+       
+    1:     def test_valid_json_array_and_wrapped(self):
+    4:         path = write_temp(json.dumps([
+    1:             {"fps_code": "UP-001", "district": "Lucknow", "commodity": "Rice", "quantity": 120},
+    1:             {"fps_code": "UP-002", "district": "Kanpur", "commodity": "Wheat", "quantity": 80},
+    2:         ]).encode("utf-8"), ".json")
+    1:         parsed = parse_json(path)
+    1:         self.assertEqual(parsed["headers"], ["fps_code", "district", "commodity", "quantity"])
+    1:         self.assertEqual(len(parsed["rows"]), 2)
+       
+    4:         wrapped = write_temp(json.dumps({"data": [
+    1:             {"fps_code": "UP-001", "quantity": 10},
+    1:             {"fps_code": "UP-002", "quantity": 20},
+    2:         ]}).encode("utf-8"), ".json")
+    1:         parsed2 = parse_json(wrapped)
+    1:         self.assertEqual(len(parsed2["rows"]), 2)
+       
+    1:     def test_invalid_json(self):
+    1:         path = write_temp(b"{not json", ".json")
+    1:         with self.assertRaises(ParseError):
+    2:             parse_json(path)
+       
+    1:     def test_unrecognized_json_structure(self):
+    1:         path = write_temp(json.dumps({"nested": {"a": [1, 2]}}).encode("utf-8"), ".json")
+    1:         with self.assertRaises(ParseError):
+    2:             parse_json(path)
+       
+    1:     def test_valid_xlsx_inline_strings(self):
+    2:         rows = [["Transaction ID", "Commodity", "Quantity"],
+    1:                 ["T1", "rice", 10],
+    1:                 ["T2", "wheat", 5]]
+    1:         path = write_temp(build_xlsx([("Transactions", rows)]), ".xlsx")
+    1:         parsed = parse_xlsx(path)
+    1:         self.assertEqual(parsed["headers"], ["Transaction ID", "Commodity", "Quantity"])
+    1:         self.assertEqual(parsed["rows"], [["T1", "rice", "10"], ["T2", "wheat", "5"]])
+    1:         self.assertEqual(parsed["sheets"], ["Transactions"])
+       
+    1:     def test_valid_xlsx_shared_strings(self):
+    1:         rows = [["Commodity", "Quantity"], ["Rice", 100], ["Wheat", 50]]
+    1:         path = write_temp(build_xlsx_shared_strings(rows), ".xlsx")
+    1:         parsed = parse_xlsx(path)
+    1:         self.assertEqual(parsed["headers"], ["Commodity", "Quantity"])
+    1:         self.assertEqual(parsed["rows"], [["Rice", "100"], ["Wheat", "50"]])
+       
+    1:     def test_xlsx_multiple_sheets_and_selection(self):
+    1:         data = [
+    1:             ("Transactions", [["Transaction ID", "Quantity"], ["T1", 10]]),
+    1:             ("Inventory", [["Commodity", "Current Stock"], ["rice", 500]]),
+    1:             ("Beneficiaries", [["Beneficiary ID"], ["B1"]]),
+               ]
+    1:         path = write_temp(build_xlsx(data), ".xlsx")
+    1:         parsed = parse_xlsx(path)
+    1:         self.assertEqual(parsed["sheets"], ["Transactions", "Inventory", "Beneficiaries"])
+    1:         self.assertEqual(parsed["headers"], ["Transaction ID", "Quantity"])
+    1:         picked = parse_xlsx(path, sheet="Inventory")
+    1:         self.assertEqual(picked["headers"], ["Commodity", "Current Stock"])
+    1:         picked2 = parse_xlsx(path, sheet=3)  # 1-based: 1=Transactions, 2=Inventory, 3=Beneficiaries
+    1:         self.assertEqual(picked2["headers"], ["Beneficiary ID"])
+    1:         with self.assertRaises(ParseError):
+    2:             parse_xlsx(path, sheet="Missing")
+       
+    1:     def test_invalid_xlsx(self):
+    1:         path = write_temp(b"this is not a zip file", ".xlsx")
+    1:         with self.assertRaises(ParseError):
+    2:             parse_xlsx(path)
+       
+    1:     def test_empty_xlsx(self):
+    1:         path = write_temp(build_xlsx([("Empty", [["A"]] )]), ".xlsx")
+               # header only, no data rows
+    1:         path = write_temp(build_xlsx([("Empty", [["A"]])]), ".xlsx")
+    1:         with self.assertRaises(EmptyDatasetError):
+    2:             parse_xlsx(path)
+       
+    1:     def test_sniff_file_type(self):
+    1:         self.assertEqual(sniff_file_type("data.csv", "text/csv"), "csv")
+    1:         self.assertEqual(sniff_file_type("data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), "xlsx")
+    1:         self.assertEqual(sniff_file_type("data.json", "application/json"), "json")
+    1:         with self.assertRaises(UnsupportedFileTypeError):
+    2:             sniff_file_type("data.txt", "text/plain")
+    1:         with self.assertRaises(UnsupportedFileTypeError):
+    2:             sniff_file_type("data.csv", "application/json")  # content type mismatch
+       
+    1:     def test_parse_file_dispatch(self):
+    1:         path = write_temp(TRANSACTION_CSV.encode("utf-8"), ".csv")
+    1:         parsed = parse_file(path, "csv")
+    1:         self.assertEqual(len(parsed["rows"]), 3)
+    1:         with self.assertRaises(UnsupportedFileTypeError):
+    2:             parse_file(path, "pdf")
+       
+       
+       # ---------------------------------------------------------------------------
+       # 2. Mapping
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class TestMapping(unittest.TestCase):
+    1:     def test_normalize_header(self):
+    1:         self.assertEqual(mapmod.normalize_header("District Name"), "districtname")
+    1:         self.assertEqual(mapmod.normalize_header("Qty Distributed"), "qtydistributed")
+       
+    1:     def test_auto_mapping_aliases(self):
+    1:         headers = ["FPS Code", "District Name", "Commodity", "Quantity Distributed", "Transaction Date"]
+    1:         result = mapmod.detect_mapping(headers, "ration_transactions")
+    7:         by_external = {m["external"]: m["internal"] for m in result["mapping"]}
+    1:         self.assertEqual(by_external["FPS Code"], "fps_center_id")
+    1:         self.assertEqual(by_external["District Name"], "district")
+    1:         self.assertEqual(by_external["Commodity"], "commodity")
+    1:         self.assertEqual(by_external["Quantity Distributed"], "quantity")
+    1:         self.assertEqual(by_external["Transaction Date"], "transaction_date")
+       
+    1:     def test_missing_required_reported(self):
+    1:         result = mapmod.detect_mapping(["Commodity", "Quantity"], "ration_transactions")
+    1:         self.assertIn("transaction_date", result["missing_required"])
+       
+    1:     def test_validate_mapping_rejects_duplicates_and_unknown(self):
+    2:         ok = mapmod.validate_mapping(
+    2:             [{"external": "A", "internal": "fps_center_id"},
+    1:              {"external": "B", "internal": "commodity"},
+    1:              {"external": "C", "internal": "quantity"},
+    2:              {"external": "D", "internal": "transaction_date"}], "ration_transactions")
+    1:         self.assertEqual(ok, [])
+    1:         with self.assertRaises(mapmod.MappingError):
+    2:             mapmod.validate_mapping(
+    2:                 [{"external": "A", "internal": "fps_center_id"},
+    1:                  {"external": "B", "internal": "commodity"},
+    1:                  {"external": "C", "internal": "commodity"},
+    1:                  {"external": "D", "internal": "quantity"},
+    2:                  {"external": "E", "internal": "transaction_date"}], "ration_transactions")
+    1:         with self.assertRaises(mapmod.MappingError):
+    2:             mapmod.validate_mapping([{"external": "A", "internal": "not_a_field"}], "ration_transactions")
+       
+    1:     def test_infer_dataset_type(self):
+    1:         self.assertEqual(mapmod.infer_dataset_type(["FPS Code", "Commodity", "Quantity", "Date"]), "ration_transactions")
+    1:         self.assertEqual(mapmod.infer_dataset_type(["FPS Code", "Name", "District"]), "fps_centers")
+    1:         self.assertEqual(mapmod.infer_dataset_type(["Beneficiary ID", "State", "Family Size"]), "beneficiaries")
+    1:         self.assertEqual(mapmod.infer_dataset_type(["FPS Code", "Commodity", "Current Stock"]), "inventory")
+       
+       
+       # ---------------------------------------------------------------------------
+       # 3. Validation
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class TestValidation(unittest.TestCase):
+    1:     def test_quantity_with_commas_and_units(self):
+    1:         self.assertEqual(validation.parse_number("1,200"), 1200.0)
+    1:         self.assertEqual(validation.parse_number("1200 kg"), 1200.0)
+    1:         self.assertEqual(validation.parse_number(42), 42.0)
+    1:         self.assertIsNone(validation.parse_number("abc"))
+       
+    1:     def test_dates_iso_and_excel_serial(self):
+    1:         self.assertEqual(validation.parse_date("2026-08-01"), "2026-08-01")
+    1:         self.assertEqual(validation.parse_date("2026/08/01"), "2026-08-01")
+    1:         self.assertEqual(validation.parse_date("01/08/2026"), "2026-08-01")
+    1:         self.assertEqual(validation.parse_date("2026-08-01T10:00:00"), "2026-08-01T10:00:00")
+    1:         self.assertEqual(validation.parse_date(45200), "2023-10-01")
+    1:         self.assertIsNone(validation.parse_date("not-a-date"))
+    1:         self.assertIsNone(validation.parse_date(99999999))
+       
+    1:     def test_validate_transaction_record(self):
+    2:         good = {"external_transaction_id": "T1", "beneficiary_id": "B1",
+    1:                 "fps_center_id": "FPS01", "transaction_date": "2026-08-01",
+    1:                 "commodity": "rice", "quantity": "10"}
+    1:         normalized, errors, _ = validation.validate_record(good, "ration_transactions")
+    1:         self.assertEqual(errors, [])
+    1:         self.assertEqual(normalized["quantity"], 10.0)
+    1:         self.assertNotIn("status", normalized)  # absent status is left unset (defaults later)
+       
+    1:         bad_qty = dict(good, quantity="abc")
+    1:         _, errors, _ = validation.validate_record(bad_qty, "ration_transactions")
+    2:         self.assertTrue(any("not numeric" in e for e in errors))
+       
+    1:         bad_date = dict(good, transaction_date="31-13-2020")
+    1:         _, errors, _ = validation.validate_record(bad_date, "ration_transactions")
+    2:         self.assertTrue(any("not a valid date" in e for e in errors))
+       
+    8:         missing = {k: v for k, v in good.items() if k != "quantity"}
+    1:         _, errors, _ = validation.validate_record(missing, "ration_transactions")
+    2:         self.assertTrue(any("missing required" in e for e in errors))
+       
+    1:     def test_status_validation(self):
+    2:         rec = {"fps_center_id": "FPS01", "transaction_date": "2026-08-01",
+    1:                "commodity": "rice", "quantity": 1, "status": "REFUNDED"}
+    1:         _, errors, _ = validation.validate_record(rec, "ration_transactions")
+    2:         self.assertTrue(any("status" in e for e in errors))
+    1:         rec2 = dict(rec, status="cancelled")
+    1:         normalized, errors, _ = validation.validate_record(rec2, "ration_transactions")
+    1:         self.assertEqual(errors, [])
+    1:         self.assertEqual(normalized["status"], "CANCELLED")
+       
+       
+       # ---------------------------------------------------------------------------
+       # 3b. Phase 4 — normalization & quality (column/string/commodity/date/number/
+       # unit normalization, required-field & business validation, structured
+       # warnings/errors, duplicate classification, quality score)
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class Phase4NormalizationTests(unittest.TestCase):
+           # 1. Column normalization (extendable alias table)
+    1:     def test_column_name_normalization(self):
+    1:         fps_aliases = ["FPS Code", "FPS_ID", "FPS Id", "Fair Price Shop Code"]
+    1:         district_aliases = ["District", "District Name", "District_Name"]
+    1:         qty_aliases = ["Qty", "Quantity", "Quantity Distributed", "Qty Distributed"]
+    1:         date_aliases = ["Date", "Transaction Date", "Transaction_Date"]
+    5:         for header in fps_aliases:
+    4:             mapping = mapmod.detect_mapping([header], "ration_transactions")
+    4:             self.assertEqual(mapping["mapping"][0]["internal"], "fps_center_id", header)
+    4:         for header in district_aliases:
+    3:             mapping = mapmod.detect_mapping([header], "ration_transactions")
+    3:             self.assertEqual(mapping["mapping"][0]["internal"], "district", header)
+    5:         for header in qty_aliases:
+    4:             mapping = mapmod.detect_mapping([header], "ration_transactions")
+    4:             self.assertEqual(mapping["mapping"][0]["internal"], "quantity", header)
+    4:         for header in date_aliases:
+    3:             mapping = mapmod.detect_mapping([header], "ration_transactions")
+    3:             self.assertEqual(mapping["mapping"][0]["internal"], "transaction_date", header)
+               # each internal field is used at most once — a later alias for an
+               # already-mapped field resolves to ignore
+    1:         mapping = mapmod.detect_mapping(["FPS Code", "FPS_ID"], "ration_transactions")
+    4:         internals = [m["internal"] for m in mapping["mapping"]]
+    1:         self.assertEqual(internals, ["fps_center_id", None])
+       
+           # 2. String normalization
+    1:     def test_string_normalization(self):
+    1:         self.assertEqual(validation.normalize_string(" Lucknow ")[0], "Lucknow")
+    1:         self.assertEqual(validation.normalize_string("LUCKNOW", title=True)[0], "Lucknow")
+    1:         self.assertEqual(validation.normalize_string("rice")[0], "rice")  # case kept for non-geo
+    1:         self.assertEqual(validation.normalize_string(""), (None, False, None))
+               # abbreviations are preserved (state codes must not become "Up")
+    1:         self.assertEqual(validation.normalize_string("UP", title=True)[0], "UP")
+    1:         self.assertEqual(validation.normalize_string("   ")[0], None)
+       
+           # 3. Commodity normalization
+    1:     def test_commodity_normalization(self):
+   10:         for raw, expected in [("rice", "rice"), ("RICE", "rice"), ("Rice Grain", "rice"),
+                                     ("wheat", "wheat"), ("WHEAT", "wheat"), ("Pulses", "pulses"),
+                                     ("Sugar", "sugar"), ("Cooking Oil", "oil"), ("Kerosene", "kerosene")]:
+    9:             canonical, _, warning = validation.normalize_commodity(raw)
+    9:             self.assertEqual(canonical, expected, raw)
+               # unknown commodities are warned, never silently mapped
+    1:         canonical, _, warning = validation.normalize_commodity("Biryani")
+    1:         self.assertEqual(canonical, "Biryani")
+    1:         self.assertIsNotNone(warning)
+       
+           # 4. Date normalization
+    1:     def test_date_normalization(self):
+    7:         for raw, expected in [("2026-08-01", "2026-08-01"), ("01-08-2026", "2026-08-01"),
+                                     ("08/01/2026", "2026-01-08"), ("01 Aug 2026", "2026-08-01"),
+                                     ("1 August 2026", "2026-08-01"), ("2026/08/01", "2026-08-01")]:
+    6:             self.assertEqual(validation.parse_date(raw), expected, raw)
+               # ambiguous DD/MM dates are flagged, not silently assumed
+    1:         iso, warnings = validation.parse_date_detailed("01/02/2026")
+    1:         self.assertEqual(iso, "2026-02-01")
+    2:         self.assertTrue(any("ambiguous" in w for w in warnings))
+               # impossible dates rejected
+    1:         self.assertIsNone(validation.parse_date("31-13-2020"))
+    1:         self.assertIsNone(validation.parse_date("45/99/2026"))
+       
+           # 5. Numeric normalization
+    1:     def test_numeric_normalization(self):
+    1:         self.assertEqual(validation.parse_number("1200"), 1200.0)
+    1:         self.assertEqual(validation.parse_number("1,200"), 1200.0)
+    1:         self.assertEqual(validation.parse_number("1200 kg"), 1200.0)
+    1:         self.assertIsNone(validation.parse_number("abc"))
+    1:         self.assertIsNone(validation.parse_number(""))
+       
+           # 6. Unit normalization
+    1:     def test_unit_normalization(self):
+    6:         for raw in ["kg", "KG", "kilogram", "kilograms", "Kgs"]:
+    5:             unit, _, warning = validation.normalize_unit(raw)
+    5:             self.assertEqual(unit, "kg", raw)
+    1:         unit, _, warning = validation.normalize_unit("litre")
+    1:         self.assertEqual(unit, "litre")
+    1:         self.assertIsNotNone(warning)  # kept as-is with a warning
+       
+           # 7. Required-field validation per dataset type
+    1:     def test_required_field_validation(self):
+    2:         tx = {"external_transaction_id": "T1", "fps_center_id": "FPS01",
+    1:               "transaction_date": "2026-08-01", "commodity": "rice", "quantity": 1}
+    1:         self.assertEqual(validation.validate_record(tx, "ration_transactions")[1], [])
+    7:         missing_fps = {k: v for k, v in tx.items() if k != "fps_center_id"}
+    1:         _, errors, _ = validation.validate_record(missing_fps, "ration_transactions")
+    2:         self.assertTrue(any("FPS Code (ref)" in e for e in errors))
+       
+    2:         ben = {"external_reference": "B1", "district": "Lucknow",
+    1:                "family_size": 4, "ration_category": "AAY"}
+    1:         self.assertEqual(validation.validate_record(ben, "beneficiaries")[1], [])
+    6:         missing_cat = {k: v for k, v in ben.items() if k != "ration_category"}
+    1:         _, errors, _ = validation.validate_record(missing_cat, "beneficiaries")
+    2:         self.assertTrue(any("Ration Category" in e for e in errors))
+       
+    1:         fps = {"fps_code": "FPS01", "district": "Kanpur"}
+    1:         self.assertEqual(validation.validate_record(fps, "fps_centers")[1], [])
+       
+    1:         inv = {"fps_center_id": "FPS01", "commodity": "rice", "current_stock": 100}
+    1:         self.assertEqual(validation.validate_record(inv, "inventory")[1], [])
+       
+           # 8. Business validation
+    1:     def test_business_validation(self):
+    2:         good = {"fps_center_id": "FPS01", "transaction_date": "2026-08-01",
+    1:                 "commodity": "rice", "quantity": 10}
+    3:         for bad in [dict(good, quantity=0), dict(good, quantity=-5)]:
+    2:             _, errors, _ = validation.validate_record(bad, "ration_transactions")
+    4:             self.assertTrue(any("positive" in e for e in errors), bad)
+    1:         ben = {"external_reference": "B1", "district": "D", "ration_category": "AAY", "family_size": 0}
+    1:         _, errors, _ = validation.validate_record(ben, "beneficiaries")
+    2:         self.assertTrue(any("family_size" in e for e in errors))
+    1:         inv = {"fps_center_id": "FPS01", "commodity": "rice", "current_stock": -1}
+    1:         _, errors, _ = validation.validate_record(inv, "inventory")
+    2:         self.assertTrue(any("positive" in e for e in errors))
+               # coordinates validated too
+    1:         tx = dict(good, latitude=95)
+    1:         _, errors, _ = validation.validate_record(tx, "ration_transactions")
+    2:         self.assertTrue(any("latitude" in e for e in errors))
+       
+           # 10. Structured warnings
+    1:     def test_structured_warnings(self):
+    2:         good = {"fps_center_id": "FPS01", "transaction_date": "2026-08-01",
+    1:                 "commodity": "rice", "quantity": 10,
+    1:                 "district": " LUCKNOW ", "state": "UP"}
+    1:         normalized, errors, warnings = validation.validate_record(good, "ration_transactions")
+    1:         self.assertEqual(errors, [])
+    1:         self.assertEqual(normalized["district"], "Lucknow")
+    1:         self.assertEqual(normalized["state"], "UP")
+    2:         self.assertTrue(any("normalized" in w for w in warnings))
+       
+           # 11. Structured record results
+    1:     def test_record_result_structured(self):
+    2:         good = {"fps_center_id": "FPS01", "transaction_date": "2026-08-01",
+    1:                 "commodity": "rice", "quantity": 10}
+    1:         result = validation.record_result(good, "ration_transactions")
+    1:         self.assertEqual(result["status"], "VALID")
+    1:         self.assertEqual(result["errors"], [])
+    1:         self.assertEqual(result["normalized"]["quantity"], 10.0)
+    1:         bad = dict(good, quantity="abc")
+    1:         result = validation.record_result(bad, "ration_transactions")
+    1:         self.assertEqual(result["status"], "INVALID")
+    2:         self.assertTrue(any("numeric" in e for e in result["errors"]))
+       
+           # 9. Duplicate classification
+    1:     def test_duplicate_classification(self):
+    1:         headers = ["id", "fps", "date", "commodity", "quantity"]
+    2:         mapping = {"id": "external_transaction_id", "fps": "fps_center_id",
+    1:                    "date": "transaction_date", "commodity": "commodity", "quantity": "quantity"}
+    1:         rows = [
+    1:             ["T1", "FPS01", "2026-08-01", "rice", "10"],
+    1:             ["T1", "FPS01", "2026-08-01", "rice", "10"],   # EXACT (same id)
+    1:             ["T2", "FPS01", "2026-08-01", "rice", "10"],   # POSSIBLE (same content, new id)
+    1:             ["T3", "FPS01", "2026-08-02", "wheat", "5"],   # UNIQUE
+               ]
+    1:         result = validation.classify_duplicates(rows, "ration_transactions", headers, mapping)
+    1:         self.assertEqual(result["unique"], 2)
+    1:         self.assertEqual(result["exact"], 1)
+    1:         self.assertEqual(result["possible"], 1)
+       
+           # 13. Quality score — transparent, deterministic formula
+    1:     def test_quality_score_formula(self):
+    1:         self.assertEqual(validation.quality_score(total=100, invalid=0, duplicates=0, warnings=0), 100.0)
+    1:         self.assertEqual(validation.quality_score(total=100, invalid=1, duplicates=0, warnings=0), 97.0)
+    1:         self.assertEqual(validation.quality_score(total=100, invalid=0, duplicates=1, warnings=0), 98.0)
+    1:         self.assertEqual(validation.quality_score(total=100, invalid=0, duplicates=0, warnings=1), 99.5)
+    1:         self.assertEqual(validation.quality_score(total=100, invalid=50, duplicates=0, warnings=0), 0.0)  # clamped
+               # same input -> same score (deterministic, no randomness)
+    2:         self.assertEqual(validation.quality_score(124821, 181, 128, 34),
+    1:                          validation.quality_score(124821, 181, 128, 34))
+               # 100 - (3*1% invalid + 2*1% duplicates + 0.5*2% warnings) = 94
+    1:         report = validation.quality_report(100, invalid=1, duplicates=1, warnings=2)
+    1:         self.assertEqual(report["score"], 94.0)
+    1:         self.assertEqual(report["valid_pct"], 98.0)
+       
+       
+       # ---------------------------------------------------------------------------
+       # 4. Import states (service-level, temp database)
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class ImportFlowTestCase(unittest.TestCase):
+    1:     def setUp(self):
+   17:         self._tmp = tempfile.TemporaryDirectory()
+   17:         self.db_path = Path(self._tmp.name) / "ingest.db"
+   17:         self.addCleanup(self._tmp.cleanup)
+       
+    1:     def _upload_and_validate(self, data: bytes, filename: str, dataset_type=None, mapping=None):
+   14:         upload = service.handle_upload(data, filename, "application/octet-stream")
+   14:         self.addCleanup(cleanup_upload, upload["token"])
+   28:         validated = service.validate_step(
+   14:             upload["token"], dataset_type=dataset_type or upload["dataset_type"],
+   14:             mapping=mapping, db_path=self.db_path,
+               )
+   14:         return upload, validated
+       
+    1:     def test_successful_transaction_import(self):
+    1:         data = TRANSACTION_CSV.encode("utf-8")
+    1:         upload, validated = self._upload_and_validate(data, "up_aug_2026.csv")
+    1:         self.assertEqual(validated["valid_records"], 3)
+    1:         self.assertEqual(validated["invalid_records"], 0)
+    1:         self.assertEqual(validated["duplicate_records"], 0)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         self.assertEqual(summary["imported"], 3)
+    1:         self.assertEqual(summary["failed"], 0)
+       
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             agent_rows = db.get_transactions_for_agent(conn)
+    1:             self.assertEqual(len(agent_rows), 3)
+    1:             self.assertEqual(agent_rows[0]["transaction_id"], "TX1001")
+    1:             self.assertEqual(agent_rows[0]["beneficiary_id"], "BEN001")
+                   # provenance: import -> source
+    1:             tx = db.get_transaction_by_external_id(conn, "TX1001")
+    1:             imp = db.get_data_import(conn, tx["source_import_id"])
+    1:             self.assertEqual(imp["status"], "COMPLETED")
+    1:             self.assertEqual(imp["successful_records"], 3)
+    1:             src = db.get_data_source(conn, imp["data_source_id"])
+    1:             self.assertEqual(src["name"], "Uploaded Dataset")
+                   # beneficiaries were auto-created from the refs
+    4:             refs = sorted(b["external_reference"] for b in db.list_beneficiaries(conn))
+    1:             self.assertEqual(refs, ["BEN001", "BEN002"])
+               finally:
+    1:             conn.close()
+       
+    1:     def test_partial_import(self):
+    1:         csv = "id,fps,date,commodity,quantity\nT1,FPS01,2026-08-01,rice,10\nT2,FPS01,2026-08-01,rice,abc\nT3,FPS01,2026-08-01,wheat,5\n"
+    1:         upload, validated = self._upload_and_validate(csv.encode("utf-8"), "partial.csv")
+    1:         self.assertEqual(validated["valid_records"], 2)
+    1:         self.assertEqual(validated["invalid_records"], 1)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "PARTIAL")
+    1:         self.assertEqual(summary["imported"], 2)
+    1:         self.assertEqual(summary["failed"], 1)
+    1:         self.assertIn("Row 3", summary["error_summary"])
+       
+    1:     def test_failed_import(self):
+    1:         csv = "id,fps,date,commodity,quantity\nT1,FPS01,not-a-date,rice,10\nT2,FPS01,2026-08-01,rice,abc\n"
+    1:         upload, _ = self._upload_and_validate(csv.encode("utf-8"), "bad.csv")
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "FAILED")
+    1:         self.assertEqual(summary["imported"], 0)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             self.assertEqual(db.get_transactions_for_agent(conn), [])
+               finally:
+    1:             conn.close()
+       
+    1:     def test_duplicate_detection_within_file(self):
+    1:         csv = "id,fps,date,commodity,quantity\nT1,FPS01,2026-08-01,rice,10\nT1,FPS01,2026-08-01,rice,10\nT2,FPS01,2026-08-02,wheat,5\n"
+    1:         upload, validated = self._upload_and_validate(csv.encode("utf-8"), "dupes.csv")
+    1:         self.assertEqual(validated["duplicate_records"], 1)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["duplicates"], 1)
+    1:         self.assertEqual(summary["imported"], 2)
+       
+    1:     def test_duplicate_against_existing_database(self):
+               # Import once, then import the same file again: idempotent — the
+               # second upload of identical bytes (same file hash) is refused and
+               # points at the existing import instead of duplicating records.
+    1:         csv = "id,fps,date,commodity,quantity\nT1,FPS01,2026-08-01,rice,10\n"
+    1:         upload, _ = self._upload_and_validate(csv.encode("utf-8"), "once.csv")
+    1:         first = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(first["status"], "COMPLETED")
+    1:         self.assertEqual(first["imported"], 1)
+    1:         upload2, validated2 = self._upload_and_validate(csv.encode("utf-8"), "twice.csv")
+               # the validate step already flags the repeated dataset
+    1:         self.assertIsNotNone(validated2["already_imported"])
+    1:         self.assertEqual(validated2["already_imported"]["data_import_id"], first["data_import_id"])
+    1:         summary2 = service.confirm_step(upload2["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary2["status"], "ALREADY_IMPORTED")
+    1:         self.assertEqual(summary2["existing_import"]["data_import_id"], first["data_import_id"])
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             self.assertEqual(len(db.get_transactions_for_agent(conn)), 1)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_composite_key_without_transaction_id(self):
+    1:         csv = "beneficiary,fps,date,commodity,quantity\nB1,FPS01,2026-08-01,rice,10\nB1,FPS01,2026-08-01,rice,10\nB1,FPS01,2026-08-02,wheat,5\n"
+    1:         upload, validated = self._upload_and_validate(csv.encode("utf-8"), "noid.csv")
+    1:         self.assertEqual(validated["duplicate_records"], 1)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["imported"], 2)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             rows = db.get_transactions_for_agent(conn)
+    1:             self.assertEqual(len(rows), 2)
+                   # generated deterministic IDs, all traceable to the import
+    4:             self.assertTrue(all(r["transaction_id"].startswith("IMP") for r in rows))
+               finally:
+    1:             conn.close()
+       
+    1:     def test_missing_required_column_rejected(self):
+    1:         csv = "id,commodity,quantity\nT1,rice,10\n"  # no date column
+    1:         upload = service.handle_upload(csv.encode("utf-8"), "nocol.csv", "application/octet-stream")
+    1:         self.addCleanup(cleanup_upload, upload["token"])
+    1:         with self.assertRaises(mapmod.MappingError):
+    2:             service.validate_step(upload["token"], dataset_type="ration_transactions", db_path=self.db_path)
+       
+    1:     def test_empty_dataset_rejected(self):
+    1:         with self.assertRaises(EmptyDatasetError):
+    2:             service.handle_upload(b"id,date,commodity,quantity\n", "empty.csv", "text/csv")
+       
+    1:     def test_unsupported_file_rejected(self):
+    1:         with self.assertRaises(UnsupportedFileTypeError):
+    2:             service.handle_upload(b"hello", "notes.txt", "text/plain")
+       
+    1:     def test_oversized_file_rejected(self):
+    1:         big = b"x" * (service.get_max_upload_bytes() + 1)
+    1:         with self.assertRaises(ParseError):
+    2:             service.handle_upload(big, "big.csv", "text/csv")
+       
+    1:     def test_beneficiaries_import(self):
+    1:         upload, validated = self._upload_and_validate(BENEFICIARY_CSV.encode("utf-8"), "bens.csv", dataset_type="beneficiaries")
+    1:         self.assertEqual(validated["valid_records"], 2)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             rows = db.list_beneficiaries(conn)
+    1:             self.assertEqual(len(rows), 2)
+    1:             self.assertEqual(db.get_beneficiary_by_external_ref(conn, "BEN101")["district"], "Pune")
+    1:             self.assertEqual(db.get_beneficiary_by_external_ref(conn, "BEN101")["ration_category"], "AAY")
+               finally:
+    1:             conn.close()
+       
+    1:     def test_fps_centers_import(self):
+    1:         upload, _ = self._upload_and_validate(FPS_CSV.encode("utf-8"), "centers.csv", dataset_type="fps_centers")
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             self.assertEqual(len(db.list_fps_centers(conn)), 2)
+    1:             self.assertEqual(db.get_fps_center_by_code(conn, "FPS01")["capacity"], 5000)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_inventory_import(self):
+    1:         upload, validated = self._upload_and_validate(INVENTORY_CSV.encode("utf-8"), "inv.csv", dataset_type="inventory")
+    1:         self.assertEqual(validated["valid_records"], 2)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             center_id = db.get_fps_center_by_code(conn, "FPS01")
+    1:             self.assertIsNotNone(center_id)
+    1:             rows = db.get_inventory_for_center(conn, center_id["id"])
+    1:             self.assertEqual(len(rows), 2)
+    1:             self.assertEqual(rows[0]["current_stock"], 1200.0)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_combined_import_creates_beneficiaries_and_transactions(self):
+    1:         upload, validated = self._upload_and_validate(COMBINED_CSV.encode("utf-8"), "combined.csv", dataset_type="combined")
+    1:         self.assertEqual(validated["valid_records"], 2)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             ben = db.get_beneficiary_by_external_ref(conn, "BEN201")
+    1:             self.assertIsNotNone(ben)
+    1:             self.assertEqual(ben["district"], "Lucknow")
+    1:             self.assertEqual(ben["state"], "UP")
+    1:             self.assertEqual(len(db.get_transactions_for_agent(conn)), 2)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_demo_data_preserved_alongside_imports(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         db.seed_synthetic(conn)
+    1:         conn.close()
+    1:         data = "id,fps,date,commodity,quantity\nR1,FPS01,2026-08-01,rice,10\nR2,FPS01,2026-08-02,wheat,5\n"
+    1:         upload, _ = self._upload_and_validate(data.encode("utf-8"), "real.csv")
+    1:         service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    4:             sources = {s["name"] for s in db.list_data_sources(conn)}
+    1:             self.assertIn("Synthetic Demo Dataset", sources)
+    1:             self.assertIn("Uploaded Dataset", sources)
+    1:             self.assertEqual(len(db.get_transactions_for_agent(conn)), 25 + 2)
+                   # demo rows still traceable to the synthetic import
+    1:             demo = db.get_transaction_by_external_id(conn, "TX001")
+    2:             self.assertEqual(db.get_data_source(conn, db.get_data_import(conn, demo["source_import_id"])["data_source_id"])["name"],
+    1:                              "Synthetic Demo Dataset")
+               finally:
+    1:             conn.close()
+       
+    1:     def test_large_dataset_import(self):
+               # Distinct quantities keep every composite key unique (a repeated
+               # composite under a different id would be a POSSIBLE duplicate).
+    1:         rows = ["id,fps,date,commodity,quantity"]
+10003:         rows.extend(
+10000:             "T%05d,FPS01,2026-08-01,rice,%d" % (i, (i % 10000) + 1)
+10001:             for i in range(1, 10001)
+               )
+    1:         csv = "\n".join(rows) + "\n"
+    1:         upload, validated = self._upload_and_validate(csv.encode("utf-8"), "large.csv")
+    1:         self.assertEqual(validated["valid_records"], 10000)
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         self.assertEqual(summary["imported"], 10000)
+    1:         self.assertLess(summary["processing_time_seconds"], 30)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             self.assertEqual(len(db.get_transactions_for_agent(conn)), 10000)
+               finally:
+    1:             conn.close()
+       
+    1:     def test_import_history_and_status(self):
+    1:         data = "id,fps,date,commodity,quantity\nH1,FPS01,2026-08-01,rice,10\n"
+    1:         upload, _ = self._upload_and_validate(data.encode("utf-8"), "hist.csv")
+    1:         summary = service.confirm_step(upload["token"], db_path=self.db_path)
+    1:         history = service.import_history(db_path=self.db_path)
+    1:         self.assertEqual(len(history), 1)
+    1:         entry = history[0]
+    1:         self.assertEqual(entry["dataset_name"], "hist")
+    1:         self.assertEqual(entry["status"], "COMPLETED")
+    1:         self.assertEqual(entry["successful_records"], 1)
+    1:         self.assertEqual(entry["source_name"], "Uploaded Dataset")
+    1:         status = service.import_status(summary["data_import_id"], db_path=self.db_path)
+    1:         self.assertEqual(status["record_count"], 1)
+       
+       
+       # ---------------------------------------------------------------------------
+       # 5. API flow (real server, temp database)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def http_request(method, url, data=None, headers=None):
+   14:     headers = dict(headers or {})
+   14:     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+   14:     try:
+   14:         with urllib.request.urlopen(req, timeout=60) as response:
+    7:             return response.status, response.read().decode("utf-8")
+    7:     except urllib.error.HTTPError as exc:
+    7:         return exc.code, exc.read().decode("utf-8")
+       
+       
+    2: class TestIngestionAPI(unittest.TestCase):
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls._tmp = tempfile.TemporaryDirectory()
+    1:         cls.db_path = Path(cls._tmp.name) / "api.db"
+    1:         cls.server = make_server("127.0.0.1", 0, db_path=cls.db_path)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = "%s:%d" % (BASE, cls.port)
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+    1:         cls._tmp.cleanup()
+       
+    1:     def test_full_api_flow_with_real_csv(self):
+               # 1. upload
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=TRANSACTION_CSV.encode("utf-8"),
+    1:             headers={"X-Filename": "up_aug_2026.csv", "Content-Type": "text/csv"},
+               )
+    1:         self.assertEqual(status, 200)
+    1:         upload = json.loads(body)
+    1:         self.assertEqual(upload["file_type"], "csv")
+    1:         self.assertEqual(upload["record_count"], 3)
+    1:         self.assertEqual(upload["dataset_type"], "ration_transactions")
+    1:         token = upload["token"]
+       
+               # 2. validate
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/uploads/%s/validate" % token,
+    1:             data=json.dumps({"dataset_type": "ration_transactions"}).encode("utf-8"),
+    1:             headers={"Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 200)
+    1:         validated = json.loads(body)
+    1:         self.assertEqual(validated["valid_records"], 3)
+    1:         self.assertEqual(validated["invalid_records"], 0)
+       
+               # 3. confirm
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/uploads/%s/confirm" % token,
+    1:             data=b"{}", headers={"Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 200)
+    1:         summary = json.loads(body)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         self.assertEqual(summary["imported"], 3)
+       
+               # 4. history + status
+    1:         status, body = http_request("GET", self.base + "/api/imports")
+    1:         self.assertEqual(status, 200)
+    1:         history = json.loads(body)
+    1:         self.assertEqual(len(history), 1)
+    1:         self.assertEqual(history[0]["dataset_name"], "up_aug_2026")
+       
+    1:         status, body = http_request("GET", self.base + "/api/imports/%d" % summary["data_import_id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(json.loads(body)["status"], "COMPLETED")
+       
+               # The confirm deleted the temp file: a second confirm is a 404.
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/uploads/%s/confirm" % token, data=b"{}",
+    1:             headers={"Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 404)
+       
+    1:     def test_api_rejects_unsupported_file(self):
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=b"hello",
+    1:             headers={"X-Filename": "notes.txt", "Content-Type": "text/plain"},
+               )
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("Unsupported file type", body)
+       
+    1:     def test_api_rejects_oversized_file(self):
+    1:         old = service.get_max_upload_bytes()
+    1:         os.environ["RATIONRIGHT_MAX_UPLOAD_MB"] = "0.0001"
+    1:         try:
+    2:             status, body = http_request(
+    1:                 "POST", self.base + "/api/upload", data=b"x" * 4096,
+    1:                 headers={"X-Filename": "big.csv", "Content-Type": "text/csv"},
+                   )
+    1:             self.assertEqual(status, 413)
+               finally:
+    1:             os.environ.pop("RATIONRIGHT_MAX_UPLOAD_MB", None)
+    1:             self.assertIsNotNone(old)
+       
+    1:     def test_api_rejects_path_traversal_filename(self):
+               # The filename is used only for type detection — a traversal name must
+               # never touch the filesystem and must simply be accepted as CSV.
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=TRANSACTION_CSV.encode("utf-8"),
+    1:             headers={"X-Filename": "../../../etc/passwd.csv", "Content-Type": "text/csv"},
+               )
+    1:         self.assertEqual(status, 200)
+    1:         upload = json.loads(body)
+    1:         self.assertEqual(upload["file_type"], "csv")
+    1:         cleanup_upload(upload["token"])
+       
+    1:     def test_api_invalid_json_upload(self):
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=b"{not json",
+    1:             headers={"X-Filename": "data.json", "Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 400)
+       
+    1:     def test_api_empty_dataset(self):
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=b"id,qty\n",
+    1:             headers={"X-Filename": "empty.csv", "Content-Type": "text/csv"},
+               )
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("no data rows", body)
+       
+    1:     def test_api_mapping_validation_error(self):
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/upload", data=TRANSACTION_CSV.encode("utf-8"),
+    1:             headers={"X-Filename": "t.csv", "Content-Type": "text/csv"},
+               )
+    1:         upload = json.loads(body)
+               # force a bad dataset type choice -> required fields not mappable
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/uploads/%s/validate" % upload["token"],
+    1:             data=json.dumps({"dataset_type": "inventory"}).encode("utf-8"),
+    1:             headers={"Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 400)
+    1:         cleanup_upload(upload["token"])
+       
+    1:     def test_api_unknown_token_404(self):
+    2:         status, body = http_request(
+    1:             "POST", self.base + "/api/uploads/deadbeef/validate", data=b"{}",
+    1:             headers={"Content-Type": "application/json"},
+               )
+    1:         self.assertEqual(status, 404)
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

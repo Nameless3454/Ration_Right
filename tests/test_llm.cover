@@ -1,0 +1,296 @@
+    1: """Phase 10 tests — optional LLM narrative layer.
+       
+       Covers the ``agents.llm`` module (activation, fail-open behavior, safety
+       guards) and the agent wiring (Agent 2 explanation, Agent 3 summary, Agent 4
+       message) with injected generators. The real OpenAI/OpenRouter API is never
+       called in tests: ``generator`` injection and a mocked ``_chat_completion``
+       make every path testable deterministically.
+       """
+       
+    1: import os
+    1: import unittest
+    1: import urllib.error
+    1: from unittest import mock
+       
+    1: from agents import llm
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+    1: from agents.agent_4_alert_generator import Agent4AlertGenerator
+    1: from scripts.validate_dataset import load_dataset
+       
+    1: TX = load_dataset("data/synthetic/transactions.json")["transactions"]
+       
+    1: A2_PAYLOAD = {
+    1:     "anomaly": {
+    1:         "anomaly_id": "ANOM001",
+    1:         "anomaly_type": "rapid_geographic_transaction",
+    1:         "transaction_ids": ["TX001", "TX002"],
+    1:         "beneficiary_id": "BEN001",
+    1:         "reason": "Two transactions occurred within a short time interval at distant locations.",
+    1:         "severity": "high",
+           },
+    1:     "transactions": TX,
+       }
+       
+    1: A2_VERIFIED = Agent2AnomalyInvestigator().run(A2_PAYLOAD, finding_id="FIND001")
+    1: A3_CASE = Agent3EvidenceCaseBuilder().run({"findings": [A2_VERIFIED], "transactions": TX})
+    1: A4_ALERT = Agent4AlertGenerator().run(A3_CASE)
+       
+       
+    1: def _enable_llm():
+    9:     os.environ["RATIONRIGHT_LLM_ENABLED"] = "1"
+    9:     os.environ["OPENAI_API_KEY"] = "sk-test"
+       
+       
+    2: class TestLLMModule(unittest.TestCase):
+    1:     """Direct tests of agents/llm.py."""
+       
+    1:     def tearDown(self):
+   75:         for name in ("RATIONRIGHT_LLM_ENABLED", "OPENAI_API_KEY", "RATIONRIGHT_LLM_MODEL",
+                            "RATIONRIGHT_LLM_BASE_URL"):
+   60:             os.environ.pop(name, None)
+       
+    1:     def test_disabled_by_default_returns_fallback(self):
+    1:         self.assertFalse(llm.llm_enabled())
+    2:         self.assertEqual(
+    1:             llm.maybe_generate("agent_3_summary", {"x": 1}, "fallback text"),
+    1:             "fallback text",
+               )
+       
+    1:     def test_enabled_requires_key(self):
+    1:         os.environ["RATIONRIGHT_LLM_ENABLED"] = "1"
+    1:         self.assertFalse(llm.llm_enabled())
+    1:         os.environ["OPENAI_API_KEY"] = "sk-test"
+    1:         self.assertTrue(llm.llm_enabled())
+       
+    1:     def test_no_network_call_when_disabled(self):
+    1:         with mock.patch.object(llm, "_chat_completion") as chat:
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_3_summary", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+    1:             chat.assert_not_called()
+       
+    1:     def test_unknown_kind_returns_fallback_without_call(self):
+    1:         _enable_llm()
+    1:         with mock.patch.object(llm, "_chat_completion") as chat:
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("unknown_kind", {}, "fallback text"),
+    1:                 "fallback text",
+                   )
+    1:             chat.assert_not_called()
+       
+    1:     def test_transport_failure_returns_fallback(self):
+    1:         _enable_llm()
+    2:         with mock.patch.object(
+    1:             llm, "_chat_completion", side_effect=RuntimeError("connection reset")
+               ):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_3_summary", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_http_error_returns_fallback(self):
+    1:         _enable_llm()
+    2:         error = urllib.error.HTTPError(
+    1:             "https://example.invalid/chat/completions", 401, "Unauthorized", None, None
+               )
+    1:         with mock.patch.object(llm, "_chat_completion", side_effect=error):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_3_summary", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_success_uses_response(self):
+    1:         _enable_llm()
+    2:         with mock.patch.object(
+    1:             llm, "_chat_completion", return_value=" A concise summary of the case. "
+    1:         ) as chat:
+    2:             result = llm.generate_narrative(
+    1:                 "agent_3_summary", {"case_id": "CASE001"}, "fallback text"
+                   )
+    1:         self.assertEqual(result, "A concise summary of the case.")
+    1:         self.assertEqual(chat.call_count, 1)
+    1:         kwargs = chat.call_args.kwargs
+    1:         self.assertEqual(kwargs["api_key"], "sk-test")
+    1:         self.assertEqual(kwargs["base_url"], llm.DEFAULT_BASE_URL)
+    1:         self.assertEqual(kwargs["model"], llm.DEFAULT_MODEL)
+    1:         self.assertEqual(kwargs["timeout"], llm.DEFAULT_TIMEOUT_SECONDS)
+    1:         self.assertIn("CASE001", kwargs["user_text"])
+       
+    1:     def test_custom_base_url_is_used(self):
+    1:         _enable_llm()
+    1:         os.environ["RATIONRIGHT_LLM_BASE_URL"] = "https://openrouter.ai/api/v1"
+    1:         with mock.patch.object(llm, "_chat_completion", return_value="fine") as chat:
+    1:             llm.generate_narrative("agent_3_summary", {}, "fallback text")
+    2:         self.assertEqual(
+    1:             chat.call_args.kwargs["base_url"], "https://openrouter.ai/api/v1"
+               )
+       
+    1:     def test_empty_response_returns_fallback(self):
+    1:         _enable_llm()
+    1:         with mock.patch.object(llm, "_chat_completion", return_value="   "):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_4_message", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_non_string_response_returns_fallback(self):
+    1:         _enable_llm()
+    1:         with mock.patch.object(llm, "_chat_completion", return_value=None):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_4_message", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_forbidden_guilt_language_returns_fallback(self):
+    1:         _enable_llm()
+    2:         with mock.patch.object(
+    1:             llm, "_chat_completion", return_value="The beneficiary committed fraud."
+               ):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_4_message", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_oversized_response_returns_fallback(self):
+    1:         _enable_llm()
+    2:         with mock.patch.object(
+    1:             llm, "_chat_completion", return_value="word " * (llm.MAX_NARRATIVE_CHARS + 50)
+               ):
+    2:             self.assertEqual(
+    1:                 llm.generate_narrative("agent_3_summary", {"x": 1}, "fallback text"),
+    1:                 "fallback text",
+                   )
+       
+    1:     def test_generator_raising_returns_fallback(self):
+    1:         def boom(kind, context, fallback):
+    1:             raise RuntimeError("LLM exploded")
+       
+    2:         self.assertEqual(
+    1:             llm.maybe_generate("agent_3_summary", {}, "fallback text", generator=boom),
+    1:             "fallback text",
+               )
+       
+    1:     def test_generator_returning_garbage_returns_fallback(self):
+    2:         self.assertEqual(
+    2:             llm.maybe_generate("agent_3_summary", {}, "fallback text", generator=lambda k, c, f: 42),
+    1:             "fallback text",
+               )
+       
+    1:     def test_explicit_generator_honored_when_llm_disabled(self):
+               # Dependency injection is opt-in by the caller, not env-gated.
+    2:         self.assertEqual(
+    2:             llm.maybe_generate("agent_3_summary", {}, "fallback", generator=lambda k, c, f: "custom"),
+    1:             "custom",
+               )
+       
+       
+    2: class TestAgentWiring(unittest.TestCase):
+    1:     """Injected generators must replace narratives but never structured fields."""
+       
+    1:     def test_agent_2_explanation_replaced_evidence_untouched(self):
+    1:         generator = mock.MagicMock(return_value="LLM explanation of the verified anomaly.")
+    2:         finding = Agent2AnomalyInvestigator(narrative_generator=generator).run(
+    1:             A2_PAYLOAD, finding_id="FIND001"
+               )
+    1:         self.assertEqual(finding["explanation"], "LLM explanation of the verified anomaly.")
+    2:         self.assertEqual(
+    1:             finding["evidence"],
+    1:             {"time_difference_minutes": 12.0, "distance_km": 1148.09},
+               )
+    1:         self.assertEqual(finding["status"], "verified")
+    1:         self.assertEqual(finding["transaction_ids"], ["TX001", "TX002"])
+    1:         self.assertEqual(finding["anomaly_id"], "ANOM001")
+    1:         generator.assert_called_once()
+    1:         kind, context, _ = generator.call_args[0]
+    1:         self.assertEqual(kind, "agent_2_explanation")
+    1:         self.assertEqual(context["time_difference_minutes"], 12.0)
+    1:         self.assertEqual(context["distance_km"], 1148.09)
+       
+    1:     def test_agent_2_generator_failure_falls_back(self):
+    1:         def boom(kind, context, fallback):
+    1:             raise RuntimeError("LLM down")
+       
+    2:         finding = Agent2AnomalyInvestigator(narrative_generator=boom).run(
+    1:             A2_PAYLOAD, finding_id="FIND001"
+               )
+    1:         self.assertIn("12.00 minutes apart", finding["explanation"])
+    1:         self.assertEqual(finding["evidence"]["distance_km"], 1148.09)
+       
+    1:     def test_agent_3_summary_replaced_evidence_untouched(self):
+    1:         generator = mock.MagicMock(return_value="LLM case summary for review.")
+    2:         case = Agent3EvidenceCaseBuilder(narrative_generator=generator).run(
+    1:             {"findings": [A2_VERIFIED], "transactions": TX}
+               )
+    1:         self.assertEqual(case["summary"], "LLM case summary for review.")
+    1:         self.assertEqual(case["status"], "requires_human_review")
+    1:         self.assertEqual(case["severity"], "high")
+    1:         self.assertEqual(case["confidence"], 0.9)
+    1:         self.assertEqual(case["finding_ids"], ["FIND001"])
+    2:         self.assertEqual(
+    1:             case["evidence"],
+    1:             [
+    1:                 {"type": "time_difference", "value": 12.0, "unit": "minutes"},
+    1:                 {"type": "distance", "value": 1148.09, "unit": "km"},
+                   ],
+               )
+    1:         kind, context, _ = generator.call_args[0]
+    1:         self.assertEqual(kind, "agent_3_summary")
+    1:         self.assertEqual(context["transaction_ids"], ["TX001", "TX002"])
+    1:         self.assertEqual(context["beneficiaries"], ["BEN001"])
+       
+    1:     def test_agent_3_generator_failure_falls_back(self):
+    1:         def boom(kind, context, fallback):
+    1:             raise RuntimeError("LLM down")
+       
+    2:         case = Agent3EvidenceCaseBuilder(narrative_generator=boom).run(
+    1:             {"findings": [A2_VERIFIED], "transactions": TX}
+               )
+    1:         self.assertIn("TX001", case["summary"])
+    1:         self.assertIn("12.00 minutes apart", case["summary"])
+    1:         self.assertEqual(case["evidence"][1]["value"], 1148.09)
+       
+    1:     def test_agent_4_message_replaced_evidence_untouched(self):
+    1:         generator = mock.MagicMock(return_value="LLM alert message for the reviewer.")
+    1:         alert = Agent4AlertGenerator(narrative_generator=generator).run(A3_CASE)
+    1:         self.assertEqual(alert["message"], "LLM alert message for the reviewer.")
+    1:         self.assertEqual(alert["status"], "open")
+    1:         self.assertEqual(alert["severity"], "high")
+    1:         self.assertEqual(alert["case_id"], "CASE001")
+    1:         self.assertEqual(alert["recommended_action"], "Human verification")
+    1:         kind, context, _ = generator.call_args[0]
+    1:         self.assertEqual(kind, "agent_4_message")
+    1:         self.assertEqual(context["case_id"], "CASE001")
+       
+    1:     def test_agent_4_generator_failure_falls_back(self):
+    1:         def boom(kind, context, fallback):
+    1:             raise RuntimeError("LLM down")
+       
+    1:         alert = Agent4AlertGenerator(narrative_generator=boom).run(A3_CASE)
+    1:         self.assertIn("1148.09 km apart", alert["message"])
+    1:         self.assertEqual(alert["status"], "open")
+       
+    1:     def test_default_path_unchanged_without_env(self):
+               # Without env vars, no generator is invoked and deterministic text is used.
+    1:         self.assertNotIn("RATIONRIGHT_LLM_ENABLED", os.environ)
+    1:         finding = Agent2AnomalyInvestigator().run(A2_PAYLOAD, finding_id="FIND001")
+    1:         self.assertIn("12.00 minutes apart", finding["explanation"])
+    1:         case = Agent3EvidenceCaseBuilder().run({"findings": [A2_VERIFIED], "transactions": TX})
+    1:         self.assertIn("12.00 minutes apart", case["summary"])
+    1:         alert = Agent4AlertGenerator().run(A3_CASE)
+    1:         self.assertIn("12.0 minutes apart", alert["message"])
+       
+    1:     def test_agent_4_llm_generation_never_touches_evidence_field(self):
+               # Phase 9 guard: the Alert schema has no evidence field, so there is
+               # nothing for the LLM to overwrite; the message is the only narrative.
+    1:         generator = mock.MagicMock(return_value="Custom alert text.")
+    1:         alert = Agent4AlertGenerator(narrative_generator=generator).run(A3_CASE)
+    1:         self.assertEqual(set(alert.keys()), {
+                   "alert_id", "case_id", "severity", "title", "message",
+                   "recommended_action", "status",
+               })
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

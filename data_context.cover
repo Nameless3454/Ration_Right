@@ -1,0 +1,300 @@
+    1: """RationAI — data context layer (Phase 6).
+       
+       The step between the database and the existing multi-agent workflow:
+       
+           Database
+               |  (SQL selection + aggregation, NOT raw table dumps)
+               v
+           Data context (relevant records + compact dataset summary)
+               |
+               v
+           run_workflow(transactions)  -- the unchanged orchestrator + 4 agents
+       
+       The existing agents keep their exact contracts. This service only decides
+       WHICH real dataset to analyze, exports its transactions in the documented
+       7-field agent shape, checks data sufficiency BEFORE any agent runs, and
+       attaches provenance (data_import_id, dataset name, record counts, data
+       quality) to the workflow result so every AI insight stays traceable to the
+       dataset that produced it.
+       
+       No LLM calls live here. No fake data is ever produced: if a dataset has too
+       few records to analyze, the workflow returns a structured insufficient-data
+       result instead of asking agents to guess.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from typing import Optional
+       
+    1: from database import (
+           DEFAULT_DB_PATH,
+           as_agent_transaction,
+           get_transactions_for_agent,
+           open_db,
+       )
+    1: from workflow import run_workflow
+       
+    1: logger = logging.getLogger("rationright.data_context")
+       
+       #: Minimum number of transactions required before Agent 1 runs. A single
+       #: record cannot form a time/geographic pattern, so running the agents on
+       #: fewer than this would be meaningless. Documented, deterministic threshold.
+    1: MIN_TRANSACTIONS_FOR_AGENTS = 2
+       
+       #: Structured description of what is missing when a dataset is insufficient.
+    1: REQUIRED_DATA_FOR_ANALYSIS = [
+    1:     "transaction records (external_transaction_id, beneficiary, fps, "
+           "transaction_date, commodity, quantity, latitude, longitude)",
+    1:     "at least %d transaction records" % MIN_TRANSACTIONS_FOR_AGENTS,
+       ]
+       
+       
+    1: def _dataset_block_for_import(imp: dict, transactions: list) -> dict:
+           """Build the provenance/quality block attached to workflow results."""
+   11:     record_count = imp.get("record_count") or 0
+   11:     successful = imp.get("successful_records") or 0
+   11:     quality = None
+   11:     if record_count > 0:
+   11:         quality = round(successful / record_count, 4)
+   78:     timestamps = sorted(
+   56:         t["timestamp"] for t in transactions if t.get("timestamp")
+           )
+   67:     commodities = sorted({t["ration_type"] for t in transactions if t.get("ration_type")})
+   11:     return {
+   11:         "mode": "real",
+   11:         "data_import_id": imp["id"],
+   11:         "dataset_name": imp.get("dataset_name"),
+   11:         "source_name": imp.get("source_name"),
+   11:         "source_type": imp.get("source_type"),
+   11:         "file_name": imp.get("file_name"),
+   11:         "file_type": imp.get("file_type"),
+   11:         "status": imp.get("status"),
+   11:         "record_count": record_count,
+   11:         "successful_records": successful,
+   11:         "data_quality": quality,
+   11:         "transaction_count": len(transactions),
+   67:         "total_quantity_kg": round(sum(t.get("quantity") or 0 for t in transactions), 3),
+   11:         "date_range": [timestamps[0], timestamps[-1]] if timestamps else None,
+   11:         "commodities": commodities,
+           }
+       
+       
+    1: def list_agent_datasets(db_path: str = DEFAULT_DB_PATH) -> list:
+           """List datasets that can be analyzed by the agents (real mode).
+       
+           Returns imports that actually contain transaction records, ordered by
+           most recent first. The synthetic demo dataset is NOT included here — it
+           is always available as ``dataset: "synthetic"`` in the API (and appears
+           in the DB only as the seed used to power the demo dataset view).
+           """
+    5:     conn = open_db(db_path)
+    5:     try:
+   10:         rows = conn.execute(
+    5:             "SELECT i.id, i.dataset_name, i.file_name, i.file_type, "
+                   "       i.record_count, i.successful_records, i.status, "
+                   "       i.completed_at, s.name AS source_name, s.type AS source_type, "
+                   "       (SELECT COUNT(*) FROM ration_transactions t "
+                   "         WHERE t.source_import_id = i.id) AS transaction_count "
+                   "FROM data_imports i "
+                   "JOIN data_sources s ON s.id = i.data_source_id "
+                   "WHERE i.status IN ('COMPLETED', 'PARTIAL') "
+                   "AND s.name != 'Synthetic Demo Dataset' "
+                   "AND (SELECT COUNT(*) FROM ration_transactions t "
+                   "     WHERE t.source_import_id = i.id) > 0 "
+                   "ORDER BY i.id DESC"
+               ).fetchall()
+           finally:
+    5:         conn.close()
+   13:     return [dict(r) for r in rows]
+       
+       
+    1: def get_import_metadata(import_id: int, db_path: str = DEFAULT_DB_PATH):
+           """Return data_import metadata joined with its data source, or None."""
+   49:     conn = open_db(db_path)
+   49:     try:
+   98:         row = conn.execute(
+   49:             "SELECT i.*, s.name AS source_name, s.type AS source_type "
+                   "FROM data_imports i "
+                   "JOIN data_sources s ON s.id = i.data_source_id "
+                   "WHERE i.id = :imp",
+   49:             {"imp": import_id},
+               ).fetchone()
+           finally:
+   49:         conn.close()
+   49:     return dict(row) if row else None
+       
+       
+    1: def get_filtered_transactions_for_agent(
+           conn,
+           import_id: int,
+           *,
+    1:     commodity: Optional[str] = None,
+    1:     fps_code: Optional[str] = None,
+    1:     district: Optional[str] = None,
+    1:     from_date: Optional[str] = None,
+    1:     to_date: Optional[str] = None,
+       ) -> list:
+           """Export one import's transactions in the agent contract shape, filtered
+           with validated, parameterized constraints (Phase 9 command center).
+       
+           Filters are whitelisted fields joined server-side (FPS/district come from
+           the fps_centers table); the agents always receive a compact selection,
+           never a raw table dump.
+           """
+    1:     where = ["t.source_import_id = :imp"]
+    1:     params = {"imp": import_id}
+    1:     if commodity:
+    1:         where.append("LOWER(t.commodity) = LOWER(:commodity)")
+    1:         params["commodity"] = commodity.strip()
+    1:     if fps_code:
+               where.append("f.fps_code = :fps")
+               params["fps"] = fps_code.strip()
+    1:     if district:
+               where.append("LOWER(f.district) = LOWER(:district)")
+               params["district"] = district.strip()
+    1:     if from_date:
+               where.append("t.transaction_date >= :from_date")
+               params["from_date"] = from_date.strip()
+    1:     if to_date:
+               where.append("t.transaction_date <= :to_date")
+               params["to_date"] = to_date.strip()
+    2:     rows = conn.execute(
+    3:         "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+               "FROM ration_transactions t "
+               "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+               "LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+    2:         "WHERE " + " AND ".join(where) + " ORDER BY t.id",
+    1:         params,
+           ).fetchall()
+   14:     return [as_agent_transaction(dict(row)) for row in rows]
+       
+       
+    1: def prepare_agent_context(
+           import_id: int,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     filters: Optional[dict] = None,
+       ) -> Optional[dict]:
+           """Select one real dataset and export its transactions for the agents.
+       
+           Returns None if the import does not exist. Otherwise a context dict:
+       
+               {
+                 "dataset": {...provenance + quality + sufficiency...},
+                 "transactions": [...7-field agent contract rows...],
+                 "sufficient": bool,
+                 "reason": str | None,       # when insufficient
+                 "required_data": [...]      # when insufficient
+               }
+       
+           Sufficiency is checked here, BEFORE any agent runs. An insufficient
+           dataset never reaches the agents. ``filters`` is an optional validated
+           dict (commodity/fps_code/district/from_date/to_date) applied to the
+           transaction selection (Phase 9).
+           """
+   16:     filters = filters or {}
+   16:     imp = get_import_metadata(import_id, db_path)
+   16:     if imp is None:
+    5:         return None
+   11:     conn = open_db(db_path)
+   11:     try:
+   72:         if any(filters.get(k) for k in ("commodity", "fps_code", "district", "from_date", "to_date")):
+    8:             transactions = get_filtered_transactions_for_agent(conn, import_id, **{
+    7:                 k: filters[k] for k in ("commodity", "fps_code", "district", "from_date", "to_date")
+    5:                 if filters.get(k)
+                   })
+               else:
+   10:             transactions = get_transactions_for_agent(conn, import_id=import_id)
+           finally:
+   11:         conn.close()
+       
+   11:     block = _dataset_block_for_import(imp, transactions)
+   11:     if len(transactions) < MIN_TRANSACTIONS_FOR_AGENTS:
+    2:         block["sufficient"] = False
+    2:         block["reason"] = (
+    4:             "Dataset has %d transaction record(s); at least %d are required "
+                   "to evaluate time/geographic patterns."
+    2:             % (len(transactions), MIN_TRANSACTIONS_FOR_AGENTS)
+               )
+    2:         block["required_data"] = list(REQUIRED_DATA_FOR_ANALYSIS)
+    2:         return {"dataset": block, "transactions": [], "sufficient": False}
+       
+    9:     block["sufficient"] = True
+    9:     return {"dataset": block, "transactions": transactions, "sufficient": True}
+       
+       
+    1: def synthetic_dataset_block(transactions: list) -> dict:
+           """Provenance block for the built-in synthetic demo dataset."""
+  258:     timestamps = sorted(t.get("timestamp") for t in transactions if t.get("timestamp"))
+  258:     commodities = sorted({t.get("ration_type") for t in transactions if t.get("ration_type")})
+   10:     return {
+   10:         "mode": "synthetic",
+   10:         "dataset_name": "Synthetic Demo Dataset",
+   10:         "source_name": "Synthetic Demo Dataset",
+   10:         "source_type": "JSON",
+   10:         "transaction_count": len(transactions),
+  258:         "total_quantity_kg": round(sum(t.get("quantity") or 0 for t in transactions), 3),
+   10:         "date_range": [timestamps[0], timestamps[-1]] if timestamps else None,
+   10:         "commodities": commodities,
+   10:         "data_quality": None,
+   10:         "sufficient": len(transactions) >= MIN_TRANSACTIONS_FOR_AGENTS,
+           }
+       
+       
+    1: def run_workflow_on_dataset(
+           import_id: int,
+           *,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     max_interval_minutes: Optional[int] = None,
+    1:     min_distance_km: Optional[float] = None,
+    1:     filters: Optional[dict] = None,
+       ) -> Optional[dict]:
+           """Run the real multi-agent workflow on one imported dataset.
+       
+           Returns None if the import does not exist. The workflow result carries a
+           ``dataset`` provenance block; insufficient datasets produce a structured
+           result without invoking any agent. ``filters`` optionally restricts the
+           transaction selection (commodity/fps_code/district/from_date/to_date).
+           """
+   11:     context = prepare_agent_context(import_id, db_path, filters=filters)
+   11:     if context is None:
+    4:         return None
+       
+    7:     if not context["sufficient"]:
+    1:         return {
+    1:             "workflow_status": "completed",
+    1:             "dataset": context["dataset"],
+    1:             "stages": {
+    1:                 "agent_1": "skipped",
+    1:                 "agent_2": "skipped",
+    1:                 "agent_3": "skipped",
+    1:                 "agent_4": "skipped",
+                   },
+    1:             "anomalies": [],
+    1:             "unverified_findings": [],
+    1:             "findings": [],
+    1:             "cases": [],
+    1:             "alerts": [],
+    1:             "errors": [],
+    1:             "skipped_reason": context["dataset"].get("reason"),
+               }
+       
+    6:     kwargs = {}
+    6:     if max_interval_minutes is not None:
+               kwargs["max_interval_minutes"] = max_interval_minutes
+    6:     if min_distance_km is not None:
+               kwargs["min_distance_km"] = min_distance_km
+    6:     result = run_workflow(context["transactions"], **kwargs)
+    6:     result["dataset"] = context["dataset"]
+    6:     if filters:
+    4:         result["dataset"]["filters_applied"] = {
+    2:             k: v for k, v in filters.items() if v
+               }
+   12:     logger.info(
+    6:         "[RationRight] Real-data analysis: import #%d (%s) — %d transaction(s)%s",
+    6:         import_id,
+    6:         context["dataset"].get("dataset_name"),
+    6:         len(context["transactions"]),
+    6:         (" with filters %r" % filters) if filters else "",
+           )
+    6:     return result

@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "dataset_name": "rationright-synthetic-transactions",
+    "version": "1.0.0",
+    "label": "Synthetic Demo Data",
+    "description": "Fictional ration-distribution transactions for the RationRight hackathon demo. Contains normal records, control cases, and one deliberately planted rapid-geographic-transaction pattern. This is not real government data, real PDS data, or real personal information.",
+    "time_window": "2026-07-01 to 2026-08-07",
+    "contract": "RationRight_complete_docs/data_contract.md"
+  },
+  "transactions": [
+    {"transaction_id": "TX001", "beneficiary_id": "BEN001", "timestamp": "2026-08-01T10:00:00", "latitude": 19.0760, "longitude": 72.8777, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX002", "beneficiary_id": "BEN001", "timestamp": "2026-08-01T10:12:00", "latitude": 28.6139, "longitude": 77.2090, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX003", "beneficiary_id": "BEN001", "timestamp": "2026-07-05T09:15:00", "latitude": 19.0760, "longitude": 72.8777, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX004", "beneficiary_id": "BEN001", "timestamp": "2026-07-20T11:40:00", "latitude": 19.0760, "longitude": 72.8777, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX005", "beneficiary_id": "BEN001", "timestamp": "2026-08-04T10:05:00", "latitude": 19.0760, "longitude": 72.8777, "ration_type": "sugar", "quantity": 2},
+    {"transaction_id": "TX006", "beneficiary_id": "BEN002", "timestamp": "2026-08-02T10:30:00", "latitude": 18.5204, "longitude": 73.8567, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX007", "beneficiary_id": "BEN002", "timestamp": "2026-08-02T10:42:00", "latitude": 18.5230, "longitude": 73.8600, "ration_type": "rice", "quantity": 5},
+    {"transaction_id": "TX008", "beneficiary_id": "BEN002", "timestamp": "2026-08-05T14:20:00", "latitude": 18.5204, "longitude": 73.8567, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX009", "beneficiary_id": "BEN002", "timestamp": "2026-07-15T08:50:00", "latitude": 18.5204, "longitude": 73.8567, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX010", "beneficiary_id": "BEN003", "timestamp": "2026-08-03T09:00:00", "latitude": 28.6139, "longitude": 77.2090, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX011", "beneficiary_id": "BEN003", "timestamp": "2026-08-06T16:30:00", "latitude": 19.0760, "longitude": 72.8777, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX012", "beneficiary_id": "BEN003", "timestamp": "2026-07-10T10:20:00", "latitude": 28.6139, "longitude": 77.2090, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX013", "beneficiary_id": "BEN004", "timestamp": "2026-08-04T10:00:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX014", "beneficiary_id": "BEN004", "timestamp": "2026-08-04T11:30:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX015", "beneficiary_id": "BEN004", "timestamp": "2026-07-25T09:45:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "sugar", "quantity": 2},
+    {"transaction_id": "TX016", "beneficiary_id": "BEN005", "timestamp": "2026-08-05T13:10:00", "latitude": 17.3850, "longitude": 78.4867, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX017", "beneficiary_id": "BEN005", "timestamp": "2026-08-05T13:20:00", "latitude": 17.3890, "longitude": 78.4910, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX018", "beneficiary_id": "BEN005", "timestamp": "2026-07-30T17:05:00", "latitude": 17.3850, "longitude": 78.4867, "ration_type": "kerosene", "quantity": 3},
+    {"transaction_id": "TX019", "beneficiary_id": "BEN002", "timestamp": "2026-07-22T08:30:00", "latitude": 18.5204, "longitude": 73.8567, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX020", "beneficiary_id": "BEN003", "timestamp": "2026-08-07T09:10:00", "latitude": 28.6139, "longitude": 77.2090, "ration_type": "sugar", "quantity": 2},
+    {"transaction_id": "TX021", "beneficiary_id": "BEN004", "timestamp": "2026-07-08T10:15:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX022", "beneficiary_id": "BEN004", "timestamp": "2026-08-06T12:00:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX023", "beneficiary_id": "BEN005", "timestamp": "2026-07-12T09:00:00", "latitude": 17.3850, "longitude": 78.4867, "ration_type": "rice", "quantity": 10},
+    {"transaction_id": "TX024", "beneficiary_id": "BEN005", "timestamp": "2026-08-01T08:40:00", "latitude": 17.3850, "longitude": 78.4867, "ration_type": "wheat", "quantity": 5},
+    {"transaction_id": "TX025", "beneficiary_id": "BEN001", "timestamp": "2026-07-28T15:00:00", "latitude": 12.9716, "longitude": 77.5946, "ration_type": "rice", "quantity": 10}
+  ]
+}

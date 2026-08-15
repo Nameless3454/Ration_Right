@@ -1,0 +1,558 @@
+    1: """RationAI — Decision Support & What-If Simulation backend (Phase 10).
+       
+       Turns RationAI into a decision-support system: an operator takes a real
+       problem (a district, an FPS, a commodity) and asks *what happens if this
+       changes* — demand +10%, a 7-day supply delay, an inventory change.
+       
+       Hard rules honoured here:
+       
+       - **Deterministic calculations only.** Every number in a scenario result is
+         computed from the real database baseline by this module's arithmetic
+         (projected demand, daily consumption, coverage days, stock after delay,
+         reorder requirement). The LLM is never asked to calculate.
+       - **Simulations never touch real data.** A scenario operates on derived
+         values; only the scenario metadata/result is persisted (``scenarios``
+         table). Inventory, beneficiaries, transactions, and imports are read-only.
+       - **No invented baselines.** If the selected entity/commodity has no data,
+         the result is a structured INSUFFICIENT_DATA — never an AI guess.
+       - **Validated inputs.** demand change in [-50, +100]%, supply delay in
+         [0, 365] days, inventory change in [-100, +100]% (documented constants).
+       - **Reuses the existing risk thresholds** (INVENTORY_CRITICAL_DAYS=15,
+         INVENTORY_WARNING_DAYS=30) — no second, incompatible risk system.
+       - **AI interpretation is optional and fail-open**: the deterministic
+         explanation is always present; the LLM (if enabled) only rephrases it from
+         the supplied values via ``agents.llm.maybe_generate``.
+       
+       Scenario IDs (SIM-YYYY-NNNN) and their results are persisted so history can
+       reproduce any simulation and trace it back to dataset -> import -> source.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime, timezone
+    1: from typing import Optional
+       
+    1: from agents.llm import maybe_generate
+    1: from analytics import INVENTORY_CRITICAL_DAYS, INVENTORY_WARNING_DAYS
+    1: from data_context import get_import_metadata
+    1: from database import (
+           DEFAULT_DB_PATH,
+           get_scenario,
+           get_scenario_by_id,
+           get_scenarios,
+           insert_scenario,
+           open_db,
+       )
+       
+    1: logger = logging.getLogger("rationright.simulation")
+       
+    1: DAYS_PER_MONTH = 30
+       
+       # --- validated input ranges (documented) -----------------------------------
+    1: DEMAND_CHANGE_MIN = -50
+    1: DEMAND_CHANGE_MAX = 100
+    1: SUPPLY_DELAY_MIN = 0
+    1: SUPPLY_DELAY_MAX = 365
+    1: INVENTORY_CHANGE_MIN = -100
+    1: INVENTORY_CHANGE_MAX = 100
+       
+    1: SIMULATION_TYPES = [
+    2:     {"key": "DEMAND_CHANGE", "label": "Demand change",
+    1:      "description": "Project demand, daily consumption, and coverage when "
+                           "monthly demand changes by a percentage."},
+    2:     {"key": "SUPPLY_DELAY", "label": "Supply delay",
+    1:      "description": "Estimate the stock position after a supply delay of N "
+                           "days at the projected consumption rate."},
+    2:     {"key": "INVENTORY_CHANGE", "label": "Inventory change",
+    1:      "description": "Project coverage when available inventory is increased "
+                           "or reduced by a percentage."},
+    2:     {"key": "COMBINED", "label": "Combined scenario",
+    1:      "description": "Demand change + supply delay + inventory change in one "
+                           "scenario."},
+       ]
+       
+       
+    1: def _now() -> datetime:
+   26:     return datetime.now(timezone.utc)
+       
+       
+    1: def simulation_type_registry() -> list:
+    2:     return list(SIMULATION_TYPES)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Entities (loaded from the database — never hardcoded)
+       # ---------------------------------------------------------------------------
+       
+    1: def _scope_clause(prefix: str, *, fps_code=None, district=None, commodity=None):
+           """Parameterized WHERE fragment + params for entity/commodity scoping.
+       
+           ``prefix`` is the table alias ("t" for transactions, "i" for inventory);
+           transactions are already filtered by import id by the caller.
+           """
+   54:     where = []
+   54:     params = {}
+   54:     if commodity:
+   54:         where.append("LOWER(%s.commodity) = LOWER(:commodity)" % prefix)
+   54:         params["commodity"] = commodity.strip()
+   54:     if fps_code:
+    4:         where.append("f.fps_code = :fps")
+    4:         params["fps"] = fps_code.strip()
+   54:     if district:
+    4:         where.append("LOWER(f.district) = LOWER(:district)")
+    4:         params["district"] = district.strip()
+   54:     return (" AND " + " AND ".join(where)) if where else "", params
+       
+       
+    1: def simulation_entities(import_id: int, db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Commodities / districts / FPS centers actually present in one import."""
+    2:     conn = open_db(db_path)
+    2:     try:
+    8:         commodities = [r["commodity"] for r in conn.execute(
+    2:             "SELECT DISTINCT commodity FROM ration_transactions "
+                   "WHERE source_import_id = :imp AND commodity IS NOT NULL "
+    2:             "ORDER BY commodity", {"imp": import_id})]
+   10:         districts = [r["district"] for r in conn.execute(
+    2:             "SELECT DISTINCT f.district FROM ration_transactions t "
+                   "JOIN fps_centers f ON f.id = t.fps_center_id "
+                   "WHERE t.source_import_id = :imp AND f.district IS NOT NULL "
+    2:             "ORDER BY f.district", {"imp": import_id})]
+   10:         fps = [r["fps_code"] for r in conn.execute(
+    2:             "SELECT DISTINCT f.fps_code FROM ration_transactions t "
+                   "JOIN fps_centers f ON f.id = t.fps_center_id "
+                   "WHERE t.source_import_id = :imp AND f.fps_code IS NOT NULL "
+    2:             "ORDER BY f.fps_code", {"imp": import_id})]
+    8:         inv_commodities = [r["commodity"] for r in conn.execute(
+    2:             "SELECT DISTINCT commodity FROM inventory "
+                   "WHERE source_import_id = :imp AND commodity IS NOT NULL "
+    2:             "ORDER BY commodity", {"imp": import_id})]
+           finally:
+    2:         conn.close()
+    4:     for c in inv_commodities:
+    2:         if c not in commodities:
+                   commodities.append(c)
+    2:     return {"commodities": sorted(commodities), "districts": districts, "fps": fps}
+       
+       
+       # ---------------------------------------------------------------------------
+       # Current situation (real baseline, scoped to one import)
+       # ---------------------------------------------------------------------------
+       
+    1: def current_situation(import_id: int, db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Real current metrics for one import — reused from the DB, not faked.
+       
+           Inventory coverage reuses the Phase 5 formula (stock x 30 / monthly
+           consumption) and thresholds (CRITICAL < 15 days, WARNING < 30 days).
+           """
+    2:     conn = open_db(db_path)
+    2:     try:
+    4:         inv = conn.execute(
+    2:             "SELECT COALESCE(SUM(current_stock), 0) AS stock, "
+                   " COALESCE(SUM(monthly_consumption), 0) AS monthly "
+                   "FROM inventory WHERE source_import_id = :imp",
+    2:             {"imp": import_id},
+               ).fetchone()
+    2:         stock, monthly = inv["stock"], inv["monthly"]
+    2:         if monthly and monthly > 0:
+    2:             coverage_days = round(stock * DAYS_PER_MONTH / monthly, 1)
+               else:
+                   coverage_days = None
+       
+    4:         risk_items = conn.execute(
+    2:             "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+                   " f.district, i.commodity, i.current_stock, i.monthly_consumption, "
+                   " i.reorder_threshold "
+                   "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+                   "WHERE i.source_import_id = :imp ORDER BY i.current_stock",
+    2:             {"imp": import_id},
+               ).fetchall()
+    2:         high_risk_fps = set()
+    2:         high_risk_districts = set()
+    2:         risk_levels = []
+    6:         for r in risk_items:
+    4:             days = None
+    4:             if r["monthly_consumption"] and r["monthly_consumption"] > 0:
+    4:                 days = r["current_stock"] * DAYS_PER_MONTH / r["monthly_consumption"]
+    8:             below_threshold = (r["reorder_threshold"] is not None
+    4:                                and r["current_stock"] < r["reorder_threshold"])
+    4:             if days is not None and days < INVENTORY_CRITICAL_DAYS or below_threshold:
+                       high_risk_fps.add(r["fps_code"])
+                       if r["district"]:
+                           high_risk_districts.add(r["district"])
+                       risk_levels.append({
+                           "fps_code": r["fps_code"], "district": r["district"],
+                           "commodity": r["commodity"], "current_stock": r["current_stock"],
+                           "days_remaining": round(days, 1) if days is not None else None,
+                           "reorder_threshold": r["reorder_threshold"],
+                       })
+       
+    4:         tx = conn.execute(
+    2:             "SELECT COUNT(*) AS n, COALESCE(SUM(quantity), 0) AS qty, "
+                   " MIN(transaction_date) AS d0, MAX(transaction_date) AS d1 "
+                   "FROM ration_transactions WHERE source_import_id = :imp",
+    2:             {"imp": import_id},
+               ).fetchone()
+           finally:
+    2:         conn.close()
+       
+    2:     daily = round(monthly / DAYS_PER_MONTH, 2) if monthly else 0.0
+    2:     return {
+    2:         "inventory_stock_kg": round(stock, 2),
+    2:         "monthly_consumption_kg": round(monthly, 2),
+    2:         "average_daily_consumption_kg": daily,
+    2:         "estimated_coverage_days": coverage_days,
+    2:         "high_risk_fps": sorted(high_risk_fps),
+    2:         "high_risk_districts": sorted(high_risk_districts),
+    2:         "risk_items": risk_levels,
+    2:         "transaction_count": tx["n"],
+    2:         "total_quantity_kg": round(tx["qty"], 2),
+    2:         "date_range": [tx["d0"], tx["d1"]] if tx["d0"] else None,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Scenario execution
+       # ---------------------------------------------------------------------------
+       
+    2: class SimulationError(ValueError):
+    1:     """Invalid scenario parameters (mapped to HTTP 400)."""
+       
+       
+    1: def _scenario_type(demand_pct, delay_days, inventory_pct) -> str:
+   26:     active = []
+   26:     if demand_pct:
+   17:         active.append("DEMAND_CHANGE")
+   26:     if delay_days:
+    7:         active.append("SUPPLY_DELAY")
+   26:     if inventory_pct:
+    6:         active.append("INVENTORY_CHANGE")
+   26:     if not active:
+    5:         return "COMBINED"
+   21:     return "COMBINED" if len(active) > 1 else active[0]
+       
+       
+    1: def _insufficient(reason: str) -> dict:
+    5:     return {"status": "INSUFFICIENT_DATA", "reason": reason, "scenario_id": None}
+       
+       
+    1: def run_scenario(
+           import_id: int,
+           *,
+    1:     commodity: Optional[str] = None,
+    1:     district: Optional[str] = None,
+    1:     fps_code: Optional[str] = None,
+    1:     demand_change_pct: int = 0,
+    1:     supply_delay_days: int = 0,
+    1:     inventory_change_pct: int = 0,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     generator=None,
+       ):
+           """Run one deterministic what-if simulation on a real import.
+       
+           Returns the scenario result (with ``status: \"completed\"``) or a
+           structured INSUFFICIENT_DATA result. Never writes to inventory,
+           transactions, or beneficiaries — only the scenario row is persisted.
+           ``generator`` is injected into the LLM call for tests.
+           """
+   39:     demand_change_pct = int(demand_change_pct or 0)
+   39:     supply_delay_days = int(supply_delay_days or 0)
+   39:     inventory_change_pct = int(inventory_change_pct or 0)
+   39:     if not (DEMAND_CHANGE_MIN <= demand_change_pct <= DEMAND_CHANGE_MAX):
+    8:         raise SimulationError(
+    8:             "Demand change must be between %d%% and +%d%%, got %d%%."
+    4:             % (DEMAND_CHANGE_MIN, DEMAND_CHANGE_MAX, demand_change_pct))
+   35:     if not (SUPPLY_DELAY_MIN <= supply_delay_days <= SUPPLY_DELAY_MAX):
+    4:         raise SimulationError(
+    4:             "Supply delay must be between %d and %d days, got %d."
+    2:             % (SUPPLY_DELAY_MIN, SUPPLY_DELAY_MAX, supply_delay_days))
+   33:     if not (INVENTORY_CHANGE_MIN <= inventory_change_pct <= INVENTORY_CHANGE_MAX):
+    2:         raise SimulationError(
+    2:             "Inventory change must be between %d%% and +%d%%, got %d%%."
+    1:             % (INVENTORY_CHANGE_MIN, INVENTORY_CHANGE_MAX, inventory_change_pct))
+   32:     if not commodity:
+    1:         raise SimulationError("A commodity is required for the simulation.")
+       
+   31:     imp = get_import_metadata(import_id, db_path)
+   31:     if imp is None:
+    3:         return _insufficient("The selected dataset import does not exist.")
+       
+   28:     conn = open_db(db_path)
+   28:     try:
+               # ---- baseline demand: average monthly quantity for the scope -------
+   56:         scope_where, scope_params = _scope_clause(
+   28:             "t", fps_code=fps_code, district=district, commodity=commodity)
+   56:         months = conn.execute(
+   84:             "SELECT substr(transaction_date, 1, 7) AS period, "
+                   " COALESCE(SUM(quantity), 0) AS qty "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+   56:             "WHERE t.source_import_id = :imp" + scope_where + " "
+                   "GROUP BY period ORDER BY period",
+   28:             dict(scope_params, imp=import_id),
+               ).fetchall()
+   28:         if not months:
+    6:             return _insufficient(
+    4:                 "No transactions found for %s%s%s in this dataset." % (
+    2:                     commodity or "",
+    2:                     " at FPS %s" % fps_code if fps_code else "",
+    2:                     " in %s" % district if district else ""))
+  145:         monthly_demand = sum(m["qty"] for m in months) / len(months)
+       
+               # ---- baseline stock / consumption / threshold ----------------------
+   52:         inv_where, inv_params = _scope_clause(
+   26:             "i", fps_code=fps_code, district=district, commodity=commodity)
+   52:         inv = conn.execute(
+   52:             "SELECT COALESCE(SUM(i.current_stock), 0) AS stock, "
+                   " COALESCE(SUM(i.monthly_consumption), 0) AS monthly, "
+                   " MIN(i.reorder_threshold) AS threshold "
+                   "FROM inventory i "
+                   "LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+   26:             "WHERE i.source_import_id = :imp" + inv_where,
+   26:             dict(inv_params, imp=import_id),
+               ).fetchone()
+   26:         stock = inv["stock"]
+   26:         monthly_consumption = inv["monthly"]
+   26:         reorder_threshold = inv["threshold"]
+           finally:
+   28:         conn.close()
+       
+           # ---- deterministic projections (all guarded) ---------------------------
+   76:     baseline_daily = (monthly_consumption / DAYS_PER_MONTH
+   52:                       if monthly_consumption and monthly_consumption > 0 else None)
+   26:     projected_demand = monthly_demand * (1 + demand_change_pct / 100.0)
+   52:     projected_daily = (baseline_daily * (1 + demand_change_pct / 100.0)
+   28:                        if baseline_daily is not None else None)
+   26:     stock_after_change = stock * (1 + inventory_change_pct / 100.0)
+       
+   76:     coverage_current = (round(stock / baseline_daily, 1)
+   52:                         if baseline_daily and baseline_daily > 0 else None)
+   76:     coverage_projected = (round(stock_after_change / projected_daily, 1)
+   52:                           if projected_daily and projected_daily > 0 else None)
+       
+   26:     consumption_rate_for_delay = projected_daily if projected_daily is not None else baseline_daily
+   26:     if consumption_rate_for_delay is None:
+    2:         consumption_during_delay = None
+    2:         stock_after_delay = None
+           else:
+   24:         consumption_during_delay = consumption_rate_for_delay * supply_delay_days
+   24:         stock_after_delay = max(0.0, stock_after_change - consumption_during_delay)
+       
+   26:     reorder_requirement = None
+   26:     if projected_demand is not None and stock_after_delay is not None:
+   24:         reorder_requirement = round(max(0.0, projected_demand - stock_after_delay), 2)
+       
+           # ---- risk classification (reuses the Phase 5 thresholds) ---------------
+   26:     def _classify_risk() -> str:
+   26:         if stock <= 0:
+    2:             return "CRITICAL"  # zero inventory cannot cover any demand
+   24:         if stock_after_delay is not None and stock_after_delay <= 0:
+    4:             return "CRITICAL"
+   39:         if reorder_threshold is not None and stock_after_delay is not None \
+   19:                 and stock_after_delay < reorder_threshold:
+    1:             return "CRITICAL"
+   19:         if coverage_projected is None:
+    1:             return "UNKNOWN"
+   18:         if coverage_projected < INVENTORY_CRITICAL_DAYS:
+                   return "CRITICAL"
+   18:         if coverage_projected < INVENTORY_WARNING_DAYS:
+   11:             return "WARNING"
+    7:         return "HEALTHY"
+       
+   26:     risk = _classify_risk()
+       
+   26:     coverage_label = (
+   26:         "NOT CALCULABLE" if coverage_projected is None
+   24:         else "%.1f days" % coverage_projected)
+   26:     results = {
+   26:         "status": "completed",
+   26:         "baseline": {
+   26:             "monthly_demand_kg": round(monthly_demand, 2),
+   26:             "current_stock_kg": round(stock, 2),
+   26:             "monthly_consumption_kg": round(monthly_consumption, 2),
+   26:             "daily_consumption_kg": round(baseline_daily, 2) if baseline_daily is not None else None,
+   26:             "coverage_days": coverage_current,
+   26:             "reorder_threshold": reorder_threshold,
+               },
+   26:         "scenario": {
+   26:             "demand_change_pct": demand_change_pct,
+   26:             "supply_delay_days": supply_delay_days,
+   26:             "inventory_change_pct": inventory_change_pct,
+   26:             "projected_monthly_demand_kg": round(projected_demand, 2),
+   26:             "projected_daily_consumption_kg": round(projected_daily, 2) if projected_daily is not None else None,
+   26:             "stock_after_inventory_change_kg": round(stock_after_change, 2),
+   26:             "consumption_during_delay_kg": round(consumption_during_delay, 2)
+   28:                 if consumption_during_delay is not None else None,
+   26:             "projected_stock_after_delay_kg": round(stock_after_delay, 2)
+   28:                 if stock_after_delay is not None else None,
+   26:             "projected_coverage_days": coverage_projected,
+   26:             "coverage_label": coverage_label,
+   26:             "simulated_reorder_requirement_kg": reorder_requirement,
+               },
+   26:         "risk": risk,
+           }
+       
+           # ---- deterministic explanation (always present; LLM may rephrase) ------
+   52:     why = _explain(commodity, district, fps_code, demand_change_pct,
+   26:                    supply_delay_days, inventory_change_pct, baseline_daily,
+   26:                    projected_daily, stock, stock_after_change,
+   26:                    stock_after_delay, coverage_projected, reorder_threshold, risk)
+   26:     context = {
+   26:         "commodity": commodity,
+   26:         "district": district or "all districts",
+   26:         "fps": fps_code or "all FPS centers",
+   26:         "baseline_monthly_demand_kg": round(monthly_demand, 2),
+   26:         "scenario_monthly_demand_kg": round(projected_demand, 2),
+   26:         "demand_change_pct": demand_change_pct,
+   26:         "supply_delay_days": supply_delay_days,
+   26:         "inventory_change_pct": inventory_change_pct,
+   26:         "current_stock_kg": round(stock, 2),
+   26:         "projected_stock_after_delay_kg": results["scenario"]["projected_stock_after_delay_kg"],
+   26:         "coverage_days_current": coverage_current,
+   26:         "coverage_days_projected": coverage_projected,
+   26:         "reorder_threshold": reorder_threshold,
+   26:         "risk": risk,
+           }
+   26:     ai_text = maybe_generate("scenario_interpretation", context, why, generator=generator)
+       
+           # ---- persist ONLY the scenario metadata/result -------------------------
+   26:     scenario_type = _scenario_type(demand_change_pct, supply_delay_days, inventory_change_pct)
+   26:     conn = open_db(db_path)
+   26:     try:
+   26:         seq = conn.execute("SELECT COUNT(*) AS n FROM scenarios").fetchone()["n"] + 1
+   26:         scenario_id = "SIM-%04d-%04d" % (_now().year, seq)
+   52:         insert_scenario(
+   26:             conn,
+   26:             scenario_id=scenario_id,
+   26:             data_import_id=import_id,
+   26:             entity_type="fps_center" if fps_code else ("district" if district else "dataset"),
+   26:             entity_id=fps_code or district or "whole_dataset",
+   26:             commodity=commodity,
+   26:             scenario_type=scenario_type,
+   26:             parameters={
+   26:                 "commodity": commodity, "district": district, "fps_code": fps_code,
+   26:                 "demand_change_pct": demand_change_pct,
+   26:                 "supply_delay_days": supply_delay_days,
+   26:                 "inventory_change_pct": inventory_change_pct,
+                   },
+   26:             results=results,
+   26:             ai_interpretation={"summary": ai_text, "generated_by": "llm" if ai_text != why else "deterministic_fallback"},
+   26:             risk=risk,
+               )
+   26:         conn.commit()
+           finally:
+   26:         conn.close()
+       
+   52:     results.update({
+   26:         "scenario_id": scenario_id,
+   26:         "commodity": commodity,
+   52:         "entity": {"type": "fps_center" if fps_code else ("district" if district else "dataset"),
+   26:                    "id": fps_code or district or "whole_dataset"},
+   52:         "interpretation": {"summary": ai_text,
+   26:                            "generated_by": "llm" if ai_text != why else "deterministic_fallback"},
+   26:         "lineage": {
+   26:             "dataset_name": imp.get("dataset_name"),
+   26:             "source_name": imp.get("source_name"),
+   26:             "data_import_id": import_id,
+               },
+           })
+   52:     logger.info(
+   26:         "[Simulation] %s %s %s demand=%d%% delay=%dd inv=%d%% -> risk=%s",
+   26:         scenario_id, commodity, fps_code or district or "all",
+   26:         demand_change_pct, supply_delay_days, inventory_change_pct, risk,
+           )
+   26:     return results
+       
+       
+    1: def _explain(commodity, district, fps_code, demand_pct, delay_days, inventory_pct,
+                    baseline_daily, projected_daily, stock, stock_after_change,
+                    stock_after_delay, coverage_projected, reorder_threshold, risk) -> str:
+           """Deterministic, evidence-based explanation (the LLM fallback)."""
+   26:     parts = []
+   26:     scope = "At %s" % (fps_code or district or "the whole dataset")
+   52:     parts.append("%s, a %d%% change in %s demand" % (
+   26:         scope, demand_pct, commodity))
+   26:     if baseline_daily is not None:
+   48:         parts.append("moves projected daily consumption from %.1f to %.1f kg/day"
+   24:                      % (baseline_daily, projected_daily))
+   26:     if delay_days:
+   14:         parts.append("and a %d-day supply delay consumes an additional "
+   14:                      "%.1f kg of stock" % (delay_days,
+    7:                                            (projected_daily or 0) * delay_days))
+   26:     if coverage_projected is not None:
+   24:         parts.append("projected inventory coverage is %.1f days" % coverage_projected)
+           else:
+    2:         parts.append("projected coverage cannot be calculated")
+   26:     if reorder_threshold is not None and stock_after_delay is not None:
+   24:         parts.append("(reorder threshold %.1f kg)" % reorder_threshold)
+   26:     text = " ".join(parts) + ". This is a scenario result, not a prediction — "
+   26:     if risk == "CRITICAL":
+    7:         text += "the projected position is critical and requires immediate review."
+   19:     elif risk == "WARNING":
+   11:         text += "the projected position is a warning that warrants review."
+           else:
+    8:         text += "the projected position remains healthy."
+   26:     return text
+       
+       
+       # ---------------------------------------------------------------------------
+       # History / detail (persisted scenarios only — real data is never changed)
+       # ---------------------------------------------------------------------------
+       
+    1: def scenario_history(db_path: str = DEFAULT_DB_PATH, *, page: int = 1, per_page: int = 10) -> dict:
+    2:     conn = open_db(db_path)
+    2:     try:
+    2:         total = conn.execute("SELECT COUNT(*) AS n FROM scenarios").fetchone()["n"]
+    4:         rows = conn.execute(
+    2:             "SELECT s.*, i.dataset_name, i.file_name, src.name AS source_name "
+                   "FROM scenarios s "
+                   "LEFT JOIN data_imports i ON i.id = s.data_import_id "
+                   "LEFT JOIN data_sources src ON src.id = i.data_source_id "
+                   "ORDER BY s.id DESC LIMIT :limit OFFSET :offset",
+    2:             {"limit": per_page, "offset": (page - 1) * per_page},
+               ).fetchall()
+           finally:
+    2:         conn.close()
+       
+    2:     entries = []
+    5:     for row in rows:
+    3:         r = dict(row)
+    6:         entries.append({
+    3:             "id": r["id"],
+    3:             "scenario_id": r["scenario_id"],
+    3:             "data_import_id": r["data_import_id"],
+    3:             "dataset_name": r.get("dataset_name"),
+    3:             "source_name": r.get("source_name"),
+    3:             "entity_type": r.get("entity_type"),
+    3:             "entity_id": r.get("entity_id"),
+    3:             "commodity": r.get("commodity"),
+    3:             "scenario_type": r.get("scenario_type"),
+    3:             "risk": r.get("risk"),
+    3:             "created_at": r["created_at"],
+               })
+    4:     return {"scenarios": entries, "total": total, "page": page, "per_page": per_page,
+    2:             "pages": max(1, -(-total // per_page))}
+       
+       
+    1: def scenario_detail(scenario_pk: int, db_path: str = DEFAULT_DB_PATH):
+    2:     import json as _json
+       
+    2:     conn = open_db(db_path)
+    2:     try:
+    2:         row = get_scenario_by_id(conn, scenario_pk)
+    2:         if row is None:
+                   return None
+    4:         imp = conn.execute(
+    2:             "SELECT i.dataset_name, s.name AS source_name FROM data_imports i "
+                   "JOIN data_sources s ON s.id = i.data_source_id WHERE i.id = :imp",
+    2:             {"imp": row["data_import_id"]},
+               ).fetchone()
+           finally:
+    2:         conn.close()
+    2:     detail = dict(row)
+    2:     detail["dataset_name"] = imp["dataset_name"] if imp else None
+    2:     detail["source_name"] = imp["source_name"] if imp else None
+    8:     for key in ("parameters", "results", "ai_interpretation"):
+    6:         raw = detail.get(key)
+    6:         detail[key] = _json.loads(raw) if raw else None
+    2:     return detail

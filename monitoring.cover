@@ -1,0 +1,940 @@
+    1: """RationAI — Early Warning, Alerts & Monitoring Center backend (Phase 11).
+       
+       Turns RationAI into a PROACTIVE monitoring system: deterministic rules run
+       over the real database, detect conditions, and persist alerts with an
+       OPEN -> ACKNOWLEDGED -> RESOLVED / DISMISSED lifecycle. The AI is only ever
+       asked to EXPLAIN a condition that deterministic code already detected — it
+       never decides thresholds and never invents evidence.
+       
+       Flow:
+       
+           REAL DATA
+             -> load rules (alert_rules, configurable)
+             -> run deterministic detectors (this module, no LLM)
+             -> deduplicate (one OPEN/ACKNOWLEDGED alert per condition key)
+             -> create / update / auto-resolve alerts
+             -> optional AI explanation (``agents.llm.maybe_generate``, fail-open)
+       
+       Detectors and their documented thresholds (the alert_rules table holds the
+       authoritative, operator-adjustable values; these are the built-in defaults):
+       
+           INVENTORY_RISK   coverage_critical    days_remaining < 15 days
+           INVENTORY_RISK   coverage_warning     days_remaining < 30 days
+           INVENTORY_RISK   below_reorder        current_stock < reorder_threshold
+           OPERATIONAL_RISK high_failure_rate    failed/(failed+completed) >= 10% (>=5 tx)
+           OPERATIONAL_RISK no_recent_distribution  no completed tx in last 30 days
+           DEMAND_SPIKE     demand_spike         latest month >= 20% above prior average
+           DEMAND_DROP      demand_drop          latest month <= 20% below prior average
+           DATA_FRESHNESS   stale                last successful sync older than 24 h
+           SOURCE_FAILURE   sync_failed          data source status = ERROR
+           DATA_QUALITY     low_quality          import quality score < 90%
+           DISTRIBUTION_ANOMALY analysis_insight converted from a persisted Phase 9
+                                   insight (severity >= MEDIUM)
+       
+       Rules:
+       - **Dedup** — one OPEN/ACKNOWLEDGED alert per (rule_type, condition, entity,
+         commodity) key. Re-detection updates ``last_detected_at``/evidence instead
+         of creating duplicates. A RESOLVED condition that becomes active again
+         creates a new alert; a DISMISSED alert is left alone while the same
+         condition persists (operator intentionally dismissed it) and only a new
+         occurrence after it clears produces a new alert.
+       - **Auto-resolve** — OPEN/ACKNOWLEDGED alerts whose condition is no longer
+         detected are marked RESOLVED with ``resolved_at``.
+       - **Safety** — monitoring NEVER writes to inventory, beneficiaries,
+         transactions, imports, or sources. Only the alerts/alert_rules tables are
+         touched. Failed monitoring leaves existing alerts untouched.
+       - **Honesty** — SUPPLY_DELAY is listed in the alert taxonomy but is a
+         what-if simulation input (Phase 10), not a condition observable in the
+         database; no detector exists for it and none is fabricated.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime, timedelta, timezone
+    1: from typing import Optional
+       
+    1: from agents.llm import maybe_generate
+    1: from analytics import (
+           FAILURE_MIN_TRANSACTIONS,
+           FAILURE_RATE_THRESHOLD,
+           INVENTORY_CRITICAL_DAYS,
+           INVENTORY_WARNING_DAYS,
+           NO_RECENT_DISTRIBUTION_DAYS,
+       )
+    1: from database import (
+           ALERT_SEVERITIES,
+           ALERT_TYPES,
+           DEFAULT_DB_PATH,
+           get_active_alert_for_condition,
+           get_alert_by_alert_id,
+           get_alert_rule,
+           get_alert_trend,
+           get_condition_history,
+           get_insights_since,
+           get_open_alert_counts,
+           insert_alert,
+           list_alerts,
+           list_alert_rules,
+           open_db,
+           seed_alert_rules,
+           update_alert_rule,
+           update_alert_status,
+       )
+       
+    1: logger = logging.getLogger("rationright.monitoring")
+       
+       # --- built-in default thresholds (the alert_rules table overrides these) -----
+    1: DEMAND_SPIKE_PCT = 20.0
+    1: DEMAND_DROP_PCT = 20.0
+    1: FRESHNESS_HOURS = 24.0
+    1: QUALITY_WARN_PCT = 90.0
+    1: DEMAND_MIN_TRANSACTIONS = 3
+       
+    1: DEFAULT_RULES = [
+    2:     {"name": "Inventory critical coverage", "rule_type": "INVENTORY_RISK",
+    1:      "condition": "coverage_critical", "severity": "CRITICAL",
+    1:      "threshold": float(INVENTORY_CRITICAL_DAYS), "threshold_unit": "days",
+    1:      "description": "Estimated stock coverage below the critical threshold (days)."},
+    2:     {"name": "Inventory warning coverage", "rule_type": "INVENTORY_RISK",
+    1:      "condition": "coverage_warning", "severity": "HIGH",
+    1:      "threshold": float(INVENTORY_WARNING_DAYS), "threshold_unit": "days",
+    1:      "description": "Estimated stock coverage below the warning threshold (days)."},
+    2:     {"name": "Stock below reorder threshold", "rule_type": "INVENTORY_RISK",
+    1:      "condition": "below_reorder", "severity": "HIGH", "threshold": None,
+    1:      "description": "Current stock below the record's reorder threshold."},
+    2:     {"name": "Elevated transaction failure rate", "rule_type": "OPERATIONAL_RISK",
+    1:      "condition": "high_failure_rate", "severity": "MEDIUM",
+    1:      "threshold": round(FAILURE_RATE_THRESHOLD * 100, 2), "threshold_unit": "percent",
+    2:      "description": "Failed / (failed + completed) >= threshold percent, with "
+    1:                     "at least %d transactions at a center." % FAILURE_MIN_TRANSACTIONS},
+    2:     {"name": "No recent distribution", "rule_type": "OPERATIONAL_RISK",
+    1:      "condition": "no_recent_distribution", "severity": "LOW",
+    1:      "threshold": float(NO_RECENT_DISTRIBUTION_DAYS), "threshold_unit": "days",
+    1:      "description": "No completed distribution at a center in the last N days."},
+    2:     {"name": "Demand spike", "rule_type": "DEMAND_SPIKE",
+    1:      "condition": "demand_spike", "severity": "MEDIUM",
+    1:      "threshold": DEMAND_SPIKE_PCT, "threshold_unit": "percent",
+    1:      "description": "Latest month's demand at least N percent above the average "
+                           "of the preceding months."},
+    2:     {"name": "Demand drop", "rule_type": "DEMAND_DROP",
+    1:      "condition": "demand_drop", "severity": "MEDIUM",
+    1:      "threshold": DEMAND_DROP_PCT, "threshold_unit": "percent",
+    1:      "description": "Latest month's demand at most N percent below the average "
+                           "of the preceding months."},
+    2:     {"name": "Data freshness", "rule_type": "DATA_FRESHNESS",
+    1:      "condition": "stale", "severity": "MEDIUM",
+    1:      "threshold": FRESHNESS_HOURS, "threshold_unit": "hours",
+    1:      "description": "A source whose last successful sync is older than N hours."},
+    2:     {"name": "Source sync failure", "rule_type": "SOURCE_FAILURE",
+    1:      "condition": "sync_failed", "severity": "CRITICAL", "threshold": None,
+    1:      "description": "A data source whose last sync attempt ended in ERROR."},
+    2:     {"name": "Dataset quality below threshold", "rule_type": "DATA_QUALITY",
+    1:      "condition": "low_quality", "severity": "MEDIUM",
+    1:      "threshold": QUALITY_WARN_PCT, "threshold_unit": "percent",
+    1:      "description": "An import whose Phase 4 quality score (successful / total "
+                           "records) is below N percent."},
+    2:     {"name": "Analysis anomaly insight", "rule_type": "DISTRIBUTION_ANOMALY",
+    1:      "condition": "analysis_insight", "severity": "MEDIUM", "threshold": None,
+    1:      "description": "A persisted Phase 9 distribution-anomaly insight "
+                           "(severity >= MEDIUM) surfaced as an alert."},
+       ]
+       
+    1: _SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+       
+       
+    1: def _now() -> datetime:
+  293:     return datetime.now(timezone.utc)
+       
+       
+    1: def _parse_ts(ts) -> Optional[datetime]:
+   29:     if not ts:
+               return None
+   29:     try:
+   29:         parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+           except ValueError:
+               return None
+   29:     if parsed.tzinfo is None:
+               parsed = parsed.replace(tzinfo=timezone.utc)
+   29:     return parsed
+       
+       
+    1: def _round(value, digits=2):
+  536:     if value is None:
+               return None
+  536:     return round(float(value), digits)
+       
+       
+    1: def _seed_rules(conn) -> None:
+   31:     seed_alert_rules(conn, DEFAULT_RULES)
+   31:     conn.commit()
+       
+       
+    1: def _rule_map(conn) -> dict:
+           """Rules keyed by (rule_type, condition) -> config dict."""
+   32:     rules = {}
+  329:     for rule in list_alert_rules(conn):
+  297:         rules[(rule["rule_type"], rule["condition"])] = rule
+   32:     return rules
+       
+       
+    1: def _threshold(rules, rule_type: str, condition: str, default: float) -> Optional[float]:
+  247:     rule = rules.get((rule_type, condition))
+  247:     if rule is None:
+   40:         return default
+  207:     if rule["threshold"] is not None:
+  207:         return float(rule["threshold"])
+           return default
+       
+       
+    1: def _enabled(rules, rule_type: str, condition: str) -> bool:
+  279:     rule = rules.get((rule_type, condition))
+  279:     return rule is None or bool(rule["enabled"])
+       
+       
+       # ---------------------------------------------------------------------------
+       # Detectors — deterministic, parameterized SQL, no LLM
+       # ---------------------------------------------------------------------------
+       
+    1: def _candidate(rule_type, condition, severity, title, description, *, evidence,
+    1:                recommendation=None, entity_type=None, entity_id=None,
+    1:                commodity=None, current_value=None, threshold=None,
+    1:                source_id=None, import_id=None, analysis_id=None) -> dict:
+  246:     return {
+  246:         "rule_type": rule_type, "condition": condition, "severity": severity,
+  246:         "title": title, "description": description, "evidence": evidence or {},
+  246:         "recommendation": recommendation, "entity_type": entity_type,
+  246:         "entity_id": entity_id, "commodity": commodity,
+  246:         "current_value": current_value, "threshold": threshold,
+  246:         "source_id": source_id, "import_id": import_id, "analysis_id": analysis_id,
+           }
+       
+       
+    1: def _inventory_candidates(conn, rules) -> list:
+   31:     out = []
+   31:     if not (_enabled(rules, "INVENTORY_RISK", "coverage_critical")
+                   or _enabled(rules, "INVENTORY_RISK", "coverage_warning")
+                   or _enabled(rules, "INVENTORY_RISK", "below_reorder")):
+               return out
+   62:     critical_days = _threshold(rules, "INVENTORY_RISK", "coverage_critical",
+   31:                                float(INVENTORY_CRITICAL_DAYS))
+   62:     warning_days = _threshold(rules, "INVENTORY_RISK", "coverage_warning",
+   31:                               float(INVENTORY_WARNING_DAYS))
+   62:     rows = conn.execute(
+   31:         "SELECT i.commodity, i.current_stock, i.monthly_consumption, "
+               " i.reorder_threshold, i.source_import_id, "
+               " COALESCE(f.fps_code, 'Unknown') AS fps_code, f.district, "
+               " di.data_source_id AS source_id "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "LEFT JOIN data_imports di ON di.id = i.source_import_id "
+               "ORDER BY i.commodity, fps_code"
+           ).fetchall()
+   89:     for r in rows:
+   58:         stock = r["current_stock"] or 0.0
+   58:         monthly = r["monthly_consumption"]
+  116:         entity = {"entity_type": "fps_center", "entity_id": r["fps_code"],
+   58:                   "commodity": r["commodity"], "import_id": r["source_import_id"],
+   58:                   "source_id": r["source_id"]}
+   58:         if monthly is not None and monthly > 0:
+   58:             days = stock / (monthly / 30.0)
+   58:             if days < critical_days:
+  120:                 out.append(_candidate(
+   30:                     "INVENTORY_RISK", "coverage_critical", "CRITICAL",
+   30:                     "Critical inventory coverage at %s" % r["fps_code"],
+   60:                     "Stock of %s at %s covers approximately %.1f days at the "
+                           "observed consumption rate (below the %.0f-day critical "
+   30:                     "threshold)." % (r["commodity"], r["fps_code"], days, critical_days),
+   60:                     evidence={"commodity": r["commodity"], "fps_code": r["fps_code"],
+   30:                               "district": r["district"],
+   30:                               "current_stock": _round(stock),
+   30:                               "monthly_consumption": _round(monthly),
+   30:                               "daily_consumption": _round(monthly / 30.0),
+   30:                               "days_remaining": _round(days, 1),
+   30:                               "threshold_days": critical_days},
+   60:                     recommendation="Initiate immediate replenishment review for %s at %s."
+   30:                                    % (r["commodity"], r["fps_code"]),
+   60:                     current_value=_round(days, 1), threshold=critical_days, **entity))
+   28:             elif days < warning_days:
+                       out.append(_candidate(
+                           "INVENTORY_RISK", "coverage_warning", "HIGH",
+                           "Inventory coverage approaching warning threshold at %s" % r["fps_code"],
+                           "Stock of %s at %s covers approximately %.1f days (below the "
+                           "%.0f-day warning threshold)." % (r["commodity"], r["fps_code"],
+                                                             days, warning_days),
+                           evidence={"commodity": r["commodity"], "fps_code": r["fps_code"],
+                                     "district": r["district"],
+                                     "current_stock": _round(stock),
+                                     "monthly_consumption": _round(monthly),
+                                     "daily_consumption": _round(monthly / 30.0),
+                                     "days_remaining": _round(days, 1),
+                                     "threshold_days": warning_days},
+                           recommendation="Review replenishment for %s at %s."
+                                          % (r["commodity"], r["fps_code"]),
+                           current_value=_round(days, 1), threshold=warning_days, **entity))
+   58:         if r["reorder_threshold"] is not None and stock < r["reorder_threshold"]:
+  120:             out.append(_candidate(
+   30:                 "INVENTORY_RISK", "below_reorder", "HIGH",
+   30:                 "Inventory below reorder threshold at %s" % r["fps_code"],
+   60:                 "Stock of %s at %s is %.2f kg, below the %.2f kg reorder "
+   60:                 "threshold." % (r["commodity"], r["fps_code"], stock,
+   30:                                 r["reorder_threshold"]),
+   60:                 evidence={"commodity": r["commodity"], "fps_code": r["fps_code"],
+   30:                           "current_stock": _round(stock),
+   30:                           "reorder_threshold": _round(r["reorder_threshold"])},
+   60:                 recommendation="Review replenishment for %s at %s."
+   30:                                % (r["commodity"], r["fps_code"]),
+   30:                 current_value=_round(stock), threshold=_round(r["reorder_threshold"]),
+   30:                 **entity))
+   31:     return out
+       
+       
+    1: def _operational_candidates(conn, rules) -> list:
+   31:     out = []
+           # Elevated failure rate per FPS.
+   31:     if _enabled(rules, "OPERATIONAL_RISK", "high_failure_rate"):
+   62:         pct = _threshold(rules, "OPERATIONAL_RISK", "high_failure_rate",
+   31:                          FAILURE_RATE_THRESHOLD * 100)
+   97:         for r in conn.execute(
+   31:             "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, f.district, "
+                   " COALESCE(SUM(CASE WHEN t.status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, "
+                   " COALESCE(SUM(CASE WHEN t.status IN ('COMPLETED','FAILED') THEN 1 ELSE 0 END), 0) AS total, "
+                   " MAX(t.source_import_id) AS import_id "
+                   "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+                   "GROUP BY fps_code"
+               ):
+   35:             total = r["total"]
+   35:             if total < FAILURE_MIN_TRANSACTIONS:
+    8:                 continue
+   27:             rate = r["failed"] / total
+   27:             if rate * 100 >= pct:
+   54:                 out.append(_candidate(
+   27:                     "OPERATIONAL_RISK", "high_failure_rate", "MEDIUM",
+   27:                     "Transaction failure rate elevated at %s" % r["fps_code"],
+   54:                     "%d of %d transactions at %s failed (%.0f%% >= %.0f%% "
+   27:                     "threshold). Requires human review." % (
+   27:                         r["failed"], total, r["fps_code"], rate * 100, pct),
+   54:                     evidence={"fps_code": r["fps_code"], "district": r["district"],
+   27:                               "failed_transactions": r["failed"],
+   27:                               "total_transactions": total,
+   27:                               "failure_rate_pct": _round(rate * 100),
+   27:                               "threshold_pct": pct},
+   54:                     recommendation="Review the failing transactions at %s."
+   27:                                    % r["fps_code"],
+   27:                     current_value=_round(rate * 100), threshold=pct,
+   27:                     entity_type="fps_center", entity_id=r["fps_code"],
+   27:                     import_id=r["import_id"]))
+           # No recent distribution per FPS.
+   31:     if _enabled(rules, "OPERATIONAL_RISK", "no_recent_distribution"):
+   62:         recent_days = int(_threshold(rules, "OPERATIONAL_RISK",
+   31:                                      "no_recent_distribution",
+   31:                                      float(NO_RECENT_DISTRIBUTION_DAYS)))
+   31:         cutoff = (_now() - timedelta(days=recent_days)).date().isoformat()
+   89:         for r in conn.execute(
+   31:             "SELECT f.fps_code, f.district, "
+                   " COALESCE(SUM(CASE WHEN t.status = 'COMPLETED' AND "
+                   "   substr(t.transaction_date, 1, 10) >= :cutoff THEN 1 ELSE 0 END), 0) AS completed "
+                   "FROM fps_centers f LEFT JOIN ration_transactions t ON t.fps_center_id = f.id "
+                   "GROUP BY f.fps_code HAVING completed = 0",
+   31:             {"cutoff": cutoff},
+               ):
+   54:             out.append(_candidate(
+   27:                 "OPERATIONAL_RISK", "no_recent_distribution", "LOW",
+   27:                 "No recent distribution activity at %s" % r["fps_code"],
+   54:                 "FPS %s (%s) has no completed transactions in the last %d days "
+   27:                 "(cutoff %s). Verify the center is operating." % (
+   27:                     r["fps_code"], r["district"] or "district unknown",
+   27:                     recent_days, cutoff),
+   54:                 evidence={"fps_code": r["fps_code"], "district": r["district"],
+   27:                           "recent_days": recent_days, "cutoff": cutoff},
+   54:                 recommendation="Verify %s is operating and record distributions."
+   27:                                % r["fps_code"],
+   27:                 current_value=0, threshold=float(recent_days),
+   27:                 entity_type="fps_center", entity_id=r["fps_code"]))
+   31:     return out
+       
+       
+    1: def _demand_candidates(conn, rules) -> list:
+   31:     out = []
+   31:     spike_on = _enabled(rules, "DEMAND_SPIKE", "demand_spike")
+   31:     drop_on = _enabled(rules, "DEMAND_DROP", "demand_drop")
+   31:     if not (spike_on or drop_on):
+               return out
+   31:     spike_pct = _threshold(rules, "DEMAND_SPIKE", "demand_spike", DEMAND_SPIKE_PCT)
+   31:     drop_pct = _threshold(rules, "DEMAND_DROP", "demand_drop", DEMAND_DROP_PCT)
+   62:     rows = conn.execute(
+   31:         "SELECT substr(transaction_date, 1, 7) AS period, commodity, "
+               " COUNT(*) AS n, SUM(quantity) AS qty "
+               "FROM ration_transactions WHERE transaction_date IS NOT NULL "
+               "GROUP BY period, commodity ORDER BY period, commodity"
+           ).fetchall()
+   31:     by_commodity = {}
+  155:     for r in rows:
+  248:         by_commodity.setdefault(r["commodity"], []).append(
+  124:             {"period": r["period"], "n": r["n"], "qty": r["qty"]})
+   66:     for commodity in sorted(by_commodity):
+  159:         series = sorted(by_commodity[commodity], key=lambda item: item["period"])
+   35:         if len(series) < 2:
+                   continue  # need a baseline month to compare against
+   35:         latest = series[-1]
+   35:         if latest["n"] < DEMAND_MIN_TRANSACTIONS:
+    8:             continue  # too little activity in the latest month to judge a change
+   27:         prior = series[:-1]
+  135:         baseline = sum(item["qty"] for item in prior) / len(prior)
+   27:         if baseline <= 0:
+                   continue
+   27:         deviation = (latest["qty"] - baseline) / baseline * 100.0
+   27:         if spike_on and deviation >= spike_pct:
+                   severity = "HIGH" if deviation >= 2 * spike_pct else "MEDIUM"
+                   out.append(_candidate(
+                       "DEMAND_SPIKE", "demand_spike", severity,
+                       "Demand spike detected for %s" % commodity,
+                       "Demand for %s in %s was %.0f kg, %.1f%% above the average of "
+                       "the %d preceding month(s) (%.0f kg)." % (
+                           commodity, latest["period"], latest["qty"], deviation,
+                           len(prior), baseline),
+                       evidence={"commodity": commodity, "latest_period": latest["period"],
+                                 "latest_quantity": _round(latest["qty"]),
+                                 "baseline_periods": [item["period"] for item in prior],
+                                 "baseline_average": _round(baseline),
+                                 "deviation_pct": _round(deviation),
+                                 "threshold_pct": spike_pct},
+                       recommendation="Investigate the demand increase for %s and confirm "
+                                      "supply keeps pace." % commodity,
+                       current_value=_round(deviation), threshold=spike_pct,
+                       entity_type="commodity", entity_id=commodity, commodity=commodity))
+   27:         elif drop_on and deviation <= -drop_pct:
+   27:             severity = "HIGH" if deviation <= -2 * drop_pct else "MEDIUM"
+   54:             out.append(_candidate(
+   27:                 "DEMAND_DROP", "demand_drop", severity,
+   27:                 "Demand drop detected for %s" % commodity,
+   54:                 "Demand for %s in %s was %.0f kg, %.1f%% below the average of "
+   27:                 "the %d preceding month(s) (%.0f kg)." % (
+   27:                     commodity, latest["period"], latest["qty"], abs(deviation),
+   27:                     len(prior), baseline),
+   54:                 evidence={"commodity": commodity, "latest_period": latest["period"],
+   27:                           "latest_quantity": _round(latest["qty"]),
+  135:                           "baseline_periods": [item["period"] for item in prior],
+   27:                           "baseline_average": _round(baseline),
+   27:                           "deviation_pct": _round(deviation),
+   27:                           "threshold_pct": drop_pct},
+   54:                 recommendation="Check whether the demand drop for %s reflects a "
+   27:                                "data gap or a real reduction in uptake." % commodity,
+   27:                 current_value=_round(deviation), threshold=drop_pct,
+   27:                 entity_type="commodity", entity_id=commodity, commodity=commodity))
+   31:     return out
+       
+       
+    1: def _freshness_candidates(conn, rules) -> list:
+   31:     out = []
+   31:     if not _enabled(rules, "DATA_FRESHNESS", "stale"):
+               return out
+   31:     hours = _threshold(rules, "DATA_FRESHNESS", "stale", FRESHNESS_HOURS)
+   31:     now = _now()
+   91:     for r in conn.execute(
+   31:         "SELECT id, name, last_successful_sync_at, last_sync_at "
+               "FROM data_sources WHERE last_successful_sync_at IS NOT NULL"
+           ):
+   29:         last = _parse_ts(r["last_successful_sync_at"])
+   29:         if last is None:
+                   continue
+   29:         age_hours = (now - last).total_seconds() / 3600.0
+   29:         if age_hours > hours:
+   52:             out.append(_candidate(
+   26:                 "DATA_FRESHNESS", "stale", "MEDIUM",
+   26:                 "Data source has not been updated recently",
+   52:                 "Source %r has not been updated for %.1f hours (threshold %.0f "
+   26:                 "hours). Last successful sync: %s." % (
+   26:                     r["name"], age_hours, hours, r["last_successful_sync_at"]),
+   52:                 evidence={"source": r["name"],
+   26:                           "last_successful_sync_at": r["last_successful_sync_at"],
+   26:                           "last_sync_attempt_at": r["last_sync_at"],
+   26:                           "age_hours": _round(age_hours),
+   26:                           "threshold_hours": hours},
+   26:                 recommendation="Trigger a sync for %r." % r["name"],
+   26:                 current_value=_round(age_hours), threshold=hours,
+   26:                 entity_type="data_source", entity_id=r["name"],
+   26:                 source_id=r["id"]))
+   31:     return out
+       
+       
+    1: def _source_failure_candidates(conn, rules) -> list:
+   31:     out = []
+   31:     if not _enabled(rules, "SOURCE_FAILURE", "sync_failed"):
+               return out
+   88:     for r in conn.execute(
+   31:         "SELECT id, name, last_error, last_successful_sync_at, last_sync_at "
+               "FROM data_sources WHERE status = 'ERROR' AND last_error IS NOT NULL"
+           ):
+   52:         out.append(_candidate(
+   26:             "SOURCE_FAILURE", "sync_failed", "CRITICAL",
+   26:             "Data source synchronization failed",
+   26:             "Source %r synchronization failed: %s" % (r["name"], r["last_error"]),
+   52:             evidence={"source": r["name"], "error": r["last_error"],
+   26:                       "last_sync_attempt_at": r["last_sync_at"],
+   26:                       "last_successful_sync_at": r["last_successful_sync_at"]},
+   52:             recommendation="Retry the sync for %r once the source is reachable "
+   26:                            "again." % r["name"],
+   26:             current_value=None, threshold=None,
+   26:             entity_type="data_source", entity_id=r["name"], source_id=r["id"]))
+   31:     return out
+       
+       
+    1: def _quality_candidates(conn, rules) -> list:
+   31:     out = []
+   31:     if not _enabled(rules, "DATA_QUALITY", "low_quality"):
+    1:         return out
+   30:     pct = _threshold(rules, "DATA_QUALITY", "low_quality", QUALITY_WARN_PCT)
+   90:     for r in conn.execute(
+   30:         "SELECT id, dataset_name, record_count, successful_records, "
+               " failed_records, duplicate_records, warnings_count, data_source_id, "
+               " status FROM data_imports "
+               "WHERE status IN ('COMPLETED','PARTIAL') AND record_count > 0"
+           ):
+   30:         quality = r["successful_records"] / r["record_count"] * 100.0
+   30:         if quality < pct:
+   52:             out.append(_candidate(
+   26:                 "DATA_QUALITY", "low_quality", "MEDIUM",
+   26:                 "Dataset quality below configured threshold",
+   52:                 "Dataset %r quality is %.1f%% (%.0f of %.0f records valid), below "
+   26:                 "the %.0f%% threshold." % (
+   26:                     r["dataset_name"], quality, r["successful_records"],
+   26:                     r["record_count"], pct),
+   52:                 evidence={"dataset_name": r["dataset_name"],
+   26:                           "record_count": r["record_count"],
+   26:                           "valid_records": r["successful_records"],
+   26:                           "failed_records": r["failed_records"],
+   26:                           "duplicate_records": r["duplicate_records"],
+   26:                           "warnings_count": r["warnings_count"],
+   26:                           "quality_pct": _round(quality),
+   26:                           "threshold_pct": pct},
+   52:                 recommendation="Review the invalid records in %r before relying "
+   26:                                "on it." % r["dataset_name"],
+   26:                 current_value=_round(quality), threshold=pct,
+   26:                 entity_type="data_import", entity_id=str(r["id"]),
+   26:                 import_id=r["id"], source_id=r["data_source_id"]))
+   30:     return out
+       
+       
+    1: def _insight_candidates(conn, rules) -> list:
+           """Convert persisted Phase 9 DISTRIBUTION_ANOMALY insights (severity >=
+           MEDIUM) into alerts, reusing the existing anomaly detection — no new
+           anomaly engine. One active alert per beneficiary; re-analysis updates it.
+           """
+   31:     out = []
+   31:     if not _enabled(rules, "DISTRIBUTION_ANOMALY", "analysis_insight"):
+               return out
+   89:     for insight in get_insights_since(
+   31:         conn, insight_type="DISTRIBUTION_ANOMALY", min_severity="MEDIUM", limit=200
+           ):
+   27:         entity_type = insight.get("entity_type") or "beneficiary"
+   27:         entity_id = insight.get("entity_id")
+   27:         if not entity_id:
+                   continue
+   27:         evidence = insight.get("evidence") or {}
+   54:         out.append(_candidate(
+   27:             "DISTRIBUTION_ANOMALY", "analysis_insight", insight["severity"],
+   27:             insight["title"],
+   27:             insight.get("description") or insight.get("title"),
+   27:             evidence=evidence,
+   27:             recommendation=insight.get("recommendation"),
+   27:             entity_type=entity_type, entity_id=entity_id,
+   27:             commodity=None, current_value=None, threshold=None,
+   27:             import_id=insight.get("source_import_id"),
+   27:             analysis_id=insight.get("analysis_id")))
+   31:     return out
+       
+       
+       # ---------------------------------------------------------------------------
+       # Explanation (deterministic fallback; optional LLM rephrase — never invents)
+       # ---------------------------------------------------------------------------
+       
+    1: def _explain_fallback(cand: dict) -> str:
+  126:     ev = cand["evidence"] or {}
+  126:     entity = "%s %s" % (cand["entity_type"] or "entity", cand["entity_id"] or "?")
+  126:     label = cand["rule_type"].replace("_", " ").title()
+  126:     if cand["condition"] in ("coverage_critical", "coverage_warning"):
+   34:         return ("The monitoring rule %r detected that %s has an estimated "
+                       "%.1f days of %s stock remaining, which is below the configured "
+                       "%.0f-day threshold. This means the center could face a stockout "
+   17:                 "within the current consumption pattern." % (
+   17:                     label, entity, cand["current_value"] or 0,
+   17:                     cand["commodity"] or "commodity", cand["threshold"] or 0))
+  109:     if cand["condition"] == "below_reorder":
+   34:         return ("The monitoring rule %r detected that %s stock for %s "
+                       "(%.1f kg) has fallen below its reorder threshold (%.1f kg). "
+   17:                 "Replenishment should be reviewed now to avoid a gap." % (
+   17:                     label, entity, cand["commodity"] or "commodity",
+   17:                     cand["current_value"] or 0, cand["threshold"] or 0))
+   92:     if cand["condition"] == "high_failure_rate":
+   26:         return ("The monitoring rule %r detected an elevated transaction "
+                       "failure rate at %s: %.0f%% of transactions failed against a "
+                       "%.0f%% threshold. A high failure rate can signal data or "
+   13:                 "distribution problems that need human review." % (
+   13:                     label, entity, cand["current_value"] or 0,
+   13:                     cand["threshold"] or 0))
+   79:     if cand["condition"] == "no_recent_distribution":
+   26:         return ("The monitoring rule %r found no completed distribution at %s "
+                       "within the configured %d-day window. The center may be "
+   13:                 "inactive or its transactions may not have been recorded." % (
+   13:                     label, entity, int(cand["threshold"] or 0)))
+   66:     if cand["condition"] in ("demand_spike", "demand_drop"):
+   13:         direction = "above" if cand["condition"] == "demand_spike" else "below"
+   26:         return ("The monitoring rule %r detected %s demand for %s deviating "
+                       "%.1f%% %s the historical monthly average (threshold %.0f%%). "
+                       "This may indicate a real change in demand or a data issue "
+   13:                 "worth investigating." % (
+   13:                     label, direction, cand["commodity"] or "commodity",
+   13:                     abs(cand["current_value"] or 0), direction,
+   13:                     cand["threshold"] or 0))
+   53:     if cand["condition"] == "stale":
+   26:         return ("The monitoring rule %r detected that %s has not been updated "
+                       "for %.1f hours, beyond the configured %.0f-hour freshness "
+                       "threshold. Dashboards and analysis may be running on stale "
+   13:                 "data; a sync should be triggered." % (
+   13:                     label, entity, cand["current_value"] or 0,
+   13:                     cand["threshold"] or 0))
+   40:     if cand["condition"] == "sync_failed":
+   26:         return ("The monitoring rule %r detected that %s failed its last "
+                       "synchronization attempt. The previous successful dataset is "
+   13:                 "retained, but the source should be retried once available." % (
+   13:                     label, entity))
+   27:     if cand["condition"] == "low_quality":
+   26:         return ("The monitoring rule %r detected that dataset %s scored "
+                       "%.1f%% quality, below the configured %.0f%% threshold. "
+                       "Invalid records should be reviewed in the source file before "
+   13:                 "relying on this dataset." % (
+   13:                     label, entity, cand["current_value"] or 0,
+   13:                     cand["threshold"] or 0))
+   14:     if cand["condition"] == "analysis_insight":
+   28:         return ("A Phase 9 AI analysis surfaced a distribution anomaly for %s "
+                       "that was verified against the underlying transaction data and "
+                       "crossed the alert threshold. The anomaly requires human "
+   14:                 "review; see the linked analysis for the full evidence." % entity)
+           return ("The monitoring rule %r detected a condition at %s. Review the "
+                   "evidence and take the recommended action." % (label, entity))
+       
+       
+    1: def _ai_explanation(cand: dict, generator=None) -> dict:
+  126:     ev = cand["evidence"] or {}
+  126:     context = {
+  126:         "alert_type": cand["rule_type"],
+  126:         "condition": cand["condition"],
+  126:         "entity_type": cand["entity_type"],
+  126:         "entity_id": cand["entity_id"],
+  126:         "commodity": cand["commodity"],
+  126:         "current_value": cand["current_value"],
+  126:         "threshold": cand["threshold"],
+  926:         "evidence": {k: str(v)[:120] for k, v in list(ev.items())[:12]},
+           }
+  126:     fallback = _explain_fallback(cand)
+  126:     text = maybe_generate("alert_explanation", context, fallback, generator=generator)
+  252:     return {"summary": text,
+  126:             "generated_by": "llm" if text != fallback else "deterministic_fallback"}
+       
+       
+    1: def _condition_key(cand: dict) -> tuple:
+  804:     return (cand["rule_type"], cand["condition"],
+  402:             cand.get("entity_type"), cand.get("entity_id"), cand.get("commodity"))
+       
+       
+       # ---------------------------------------------------------------------------
+       # The monitoring engine
+       # ---------------------------------------------------------------------------
+       
+    1: def run_monitoring(db_path: str = DEFAULT_DB_PATH, generator=None) -> dict:
+           """Run every enabled rule over the database; create/update/resolve alerts.
+       
+           Returns a run summary. NEVER modifies source data — only the alerts and
+           alert_rules tables are touched. ``generator`` lets tests inject (or fail)
+           the LLM narrative exactly like ``simulation.run_scenario``; the engine
+           still only EXPLAINS conditions it already detected deterministically.
+           """
+   27:     conn = open_db(db_path)
+   27:     try:
+   27:         _seed_rules(conn)
+   27:         rules = _rule_map(conn)
+   27:         candidates = []
+  209:         for detector in (
+   27:             _inventory_candidates, _operational_candidates, _demand_candidates,
+   27:             _freshness_candidates, _source_failure_candidates,
+   27:             _quality_candidates, _insight_candidates,
+               ):
+  183:             candidates.extend(detector(conn, rules))
+       
+  253:         by_key = {_condition_key(c): c for c in candidates}
+   26:         created = updated = 0
+  227:         for cand in candidates:
+  201:             key = _condition_key(cand)
+  402:             existing = get_active_alert_for_condition(
+  201:                 conn, cand["rule_type"], cand["condition"], cand.get("entity_type"),
+  201:                 cand.get("entity_id"), cand.get("commodity"))
+  201:             if existing is not None:
+                       # Condition persists -> refresh evidence, keep one alert open.
+  148:                 conn.execute(
+   74:                     "UPDATE alerts SET severity = :severity, title = :title, "
+                           " description = :desc, current_value = :cur, threshold = :thr, "
+                           " evidence = :evidence, recommendation = :rec, "
+                           " source_id = COALESCE(:sid, source_id), "
+                           " import_id = COALESCE(:iid, import_id), "
+                           " analysis_id = COALESCE(:aid, analysis_id), "
+                           " last_detected_at = :now WHERE id = :id",
+   74:                     {
+   74:                         "severity": cand["severity"], "title": cand["title"],
+   74:                         "desc": cand["description"], "cur": cand["current_value"],
+   74:                         "thr": cand["threshold"],
+   74:                         "evidence": _json_dumps(cand["evidence"]),
+   74:                         "rec": cand["recommendation"], "sid": cand["source_id"],
+   74:                         "iid": cand["import_id"], "aid": cand["analysis_id"],
+   74:                         "now": _now().isoformat(timespec="seconds"),
+   74:                         "id": existing["id"],
+                           })
+   74:                 updated += 1
+   74:                 continue
+  254:             history = get_condition_history(
+  127:                 conn, cand["rule_type"], cand["condition"], cand.get("entity_type"),
+  127:                 cand.get("entity_id"), cand.get("commodity"))
+  127:             if history and history[0]["status"] == "DISMISSED":
+                       # Operator intentionally dismissed this condition — do not
+                       # re-create it while the same condition persists.
+    1:                 continue
+  126:             seq = conn.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"] + 1
+  126:             alert_id = "ALT-%04d-%04d" % (_now().year, seq)
+  126:             explanation = _ai_explanation(cand, generator=generator)
+  252:             insert_alert(
+  126:                 conn,
+  126:                 alert_id=alert_id,
+  126:                 rule_type=cand["rule_type"],
+  126:                 condition=cand["condition"],
+  126:                 severity=cand["severity"],
+  126:                 title=cand["title"],
+  126:                 description=cand["description"],
+  126:                 entity_type=cand.get("entity_type"),
+  126:                 entity_id=cand.get("entity_id"),
+  126:                 commodity=cand.get("commodity"),
+  126:                 current_value=cand.get("current_value"),
+  126:                 threshold=cand.get("threshold"),
+  126:                 evidence=cand["evidence"],
+  126:                 ai_explanation=explanation,
+  126:                 recommendation=cand.get("recommendation"),
+  126:                 source_id=cand.get("source_id"),
+  126:                 import_id=cand.get("import_id"),
+  126:                 analysis_id=cand.get("analysis_id"),
+                   )
+  126:             created += 1
+  252:             logger.info(
+  126:                 "[Monitoring] created %s (%s/%s @ %s)", alert_id,
+  126:                 cand["rule_type"], cand["condition"],
+  126:                 cand.get("entity_id") or cand.get("commodity") or "?")
+       
+               # Auto-resolve conditions that are no longer detected.
+   26:         resolved = 0
+   52:         active = conn.execute(
+   26:             "SELECT * FROM alerts WHERE status IN ('OPEN','ACKNOWLEDGED')"
+               ).fetchall()
+  231:         for row in active:
+  205:             a = dict(row)
+  410:             key = (a["rule_type"], a["condition"], a["entity_type"],
+  205:                    a["entity_id"], a["commodity"])
+  205:             if key not in by_key:
+   10:                 conn.execute(
+    5:                     "UPDATE alerts SET status = 'RESOLVED', resolved_at = :now "
+                           "WHERE id = :id",
+    5:                     {"now": _now().isoformat(timespec="seconds"), "id": a["id"]})
+    5:                 resolved += 1
+   26:         conn.commit()
+   26:         counts = get_open_alert_counts(conn)
+   52:         return {
+   26:             "generated_at": _now().isoformat(timespec="seconds"),
+   26:             "created": created,
+   26:             "updated": updated,
+   26:             "resolved": resolved,
+  338:             "rules_enabled": sum(1 for rule in rules.values() if rule["enabled"]),
+   26:             "summary": counts,
+               }
+           finally:
+   27:         conn.close()
+       
+       
+    1: def _json_dumps(value) -> Optional[str]:
+   74:     import json as _json
+       
+   74:     return _json.dumps(value) if value else None
+       
+       
+       # ---------------------------------------------------------------------------
+       # Read / write views used by the API + UI
+       # ---------------------------------------------------------------------------
+       
+    1: def monitoring_status(db_path: str = DEFAULT_DB_PATH) -> dict:
+           """Alert center status: active counts + last run info + enabled rules."""
+           conn = open_db(db_path)
+           try:
+               _seed_rules(conn)
+               counts = get_open_alert_counts(conn)
+               by_type = {}
+               for r in conn.execute(
+                   "SELECT rule_type, COUNT(*) AS n FROM alerts "
+                   "WHERE status IN ('OPEN','ACKNOWLEDGED') GROUP BY rule_type"
+               ):
+                   by_type[r["rule_type"]] = r["n"]
+               last_created = conn.execute(
+                   "SELECT MAX(created_at) AS t FROM alerts"
+               ).fetchone()["t"]
+               rules = list_alert_rules(conn)
+           finally:
+               conn.close()
+           return {
+               "counts": counts,
+               "by_type": by_type,
+               "rules": rules,
+               "last_alert_created_at": last_created,
+           }
+       
+       
+    1: def alert_summary(db_path: str = DEFAULT_DB_PATH) -> dict:
+    1:     conn = open_db(db_path)
+    1:     try:
+    2:         return get_open_alert_counts(conn)
+           finally:
+    1:         conn.close()
+       
+       
+    1: def alert_trend(db_path: str = DEFAULT_DB_PATH, days: int = 7) -> dict:
+    2:     conn = open_db(db_path)
+    2:     try:
+    4:         return get_alert_trend(conn, days)
+           finally:
+    2:         conn.close()
+       
+       
+    1: def alert_rules_view(db_path: str = DEFAULT_DB_PATH) -> dict:
+    4:     conn = open_db(db_path)
+    4:     try:
+    4:         _seed_rules(conn)
+    8:         return {"rules": list_alert_rules(conn)}
+           finally:
+    4:         conn.close()
+       
+       
+    1: def update_rule_view(
+           rule_id: int,
+           *,
+    1:     enabled: Optional[bool] = None,
+    1:     threshold: Optional[float] = None,
+    1:     db_path: str = DEFAULT_DB_PATH,
+       ) -> Optional[dict]:
+    3:     conn = open_db(db_path)
+    3:     try:
+    3:         rule = get_alert_rule(conn, rule_id)
+    3:         if rule is None:
+                   return None
+    6:         if threshold is not None and (
+    2:             isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+    1:             or threshold < 0
+               ):
+                   raise ValueError("threshold must be a non-negative number")
+    3:         update_alert_rule(conn, rule_id, enabled=enabled, threshold=threshold)
+    3:         conn.commit()
+    6:         return get_alert_rule(conn, rule_id)
+           finally:
+    3:         conn.close()
+       
+       
+    2: def list_alerts_view(
+    1:     db_path: str = DEFAULT_DB_PATH,
+           *,
+    1:     q: Optional[str] = None,
+    1:     severity: Optional[str] = None,
+    1:     rule_type: Optional[str] = None,
+    1:     status: Optional[str] = None,
+    1:     days: Optional[int] = None,
+    1:     page: int = 1,
+    1:     per_page: int = 20,
+       ) -> dict:
+   31:     conn = open_db(db_path)
+   31:     try:
+   93:         return list_alerts(
+   31:             conn, q=q, severity=severity, rule_type=rule_type, status=status,
+   31:             days=days, page=page, per_page=per_page,
+               )
+           finally:
+   31:         conn.close()
+       
+       
+    1: def alert_detail_view(alert_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+           """One alert decoded, plus lineage (source/dataset/analysis) for the UI."""
+    8:     conn = open_db(db_path)
+    8:     try:
+    8:         row = get_alert_by_alert_id(conn, alert_id)
+    8:         if row is None:
+    2:             return None
+    7:         alert = _decode(row)
+    7:         lineage = {}
+    7:         if alert.get("import_id"):
+   14:             imp = conn.execute(
+    7:                 "SELECT i.dataset_name, i.file_name, i.file_type, i.record_count, "
+                       " i.successful_records, i.failed_records, i.duplicate_records, "
+                       " i.status AS import_status, s.name AS source_name "
+                       "FROM data_imports i LEFT JOIN data_sources s ON s.id = i.data_source_id "
+    7:                 "WHERE i.id = :iid", {"iid": alert["import_id"]},
+                   ).fetchone()
+    7:             if imp is not None:
+    7:                 lineage["import"] = dict(imp)
+               elif alert.get("source_id"):
+                   src = conn.execute(
+                       "SELECT name, type, status, last_sync_at, last_successful_sync_at, "
+                       " last_error FROM data_sources WHERE id = :sid",
+                       {"sid": alert["source_id"]},
+                   ).fetchone()
+                   if src is not None:
+                       lineage["source"] = dict(src)
+    7:         if alert.get("analysis_id"):
+   10:             run = conn.execute(
+    5:                 "SELECT analysis_id, dataset_mode, status, insight_count, "
+                       " summary, created_at FROM analysis_runs "
+    5:                 "WHERE analysis_id = :aid", {"aid": alert["analysis_id"]},
+                   ).fetchone()
+    5:             if run is not None:
+    5:                 lineage["analysis"] = dict(run)
+    7:         alert["lineage"] = lineage
+   14:         return alert
+           finally:
+    8:         conn.close()
+       
+       
+    1: def _decode(row: dict) -> dict:
+    7:     import json as _json
+       
+    7:     out = dict(row)
+   21:     for field in ("evidence", "ai_explanation"):
+   14:         raw = out.get(field)
+   14:         if isinstance(raw, str):
+   14:             try:
+   14:                 out[field] = _json.loads(raw)
+                   except ValueError:
+                       out[field] = None
+    7:     return out
+       
+       
+    1: def set_alert_status_view(
+           alert_id: str,
+           status: str,
+           *,
+    1:     dismissed_reason: Optional[str] = None,
+    1:     db_path: str = DEFAULT_DB_PATH,
+       ) -> bool:
+    7:     if status not in ("ACKNOWLEDGED", "RESOLVED", "DISMISSED"):
+               raise ValueError("status must be ACKNOWLEDGED, RESOLVED, or DISMISSED")
+    7:     conn = open_db(db_path)
+    7:     try:
+   14:         changed = update_alert_status(
+    7:             conn, alert_id, status, dismissed_reason=dismissed_reason)
+    7:         conn.commit()
+   14:         return changed
+           finally:
+    7:         conn.close()
+       
+       
+       # Keep the alert type taxonomy importable from this module too.
+    1: ALERT_TYPE_TAXONOMY = list(ALERT_TYPES)
+    1: SEVERITY_ORDER = list(ALERT_SEVERITIES)

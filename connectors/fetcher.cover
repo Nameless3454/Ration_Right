@@ -1,0 +1,127 @@
+    1: """RationAI — HTTP fetcher for external data sources (Phase 7).
+       
+       stdlib-only ``urllib`` wrapper with the operational behavior the sync
+       service needs:
+       
+       - request timeout (no hanging syncs)
+       - controlled retries with exponential backoff (5xx and network errors)
+       - NO retry on permanent client errors (404, 401, 403, 400)
+       - 429 honoured: sleeps ``Retry-After`` when provided
+       - a hard attempt cap so a broken source cannot loop forever
+       
+       The fetcher is deliberately tiny and side-effect free (no logging of the
+       body, no credentials in exceptions) so the sync service and tests can
+       inject a fake fetcher for the full failure matrix.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import time
+    1: import urllib.error
+    1: import urllib.request
+    1: from typing import Callable, Optional
+       
+    1: from connectors.errors import (
+           AuthError,
+           HttpStatusError,
+           RateLimitError,
+           TimeoutError,
+           UnreachableError,
+       )
+       
+    1: DEFAULT_TIMEOUT_SECONDS = 15
+    1: DEFAULT_MAX_ATTEMPTS = 3
+    1: DEFAULT_BACKOFF_BASE_SECONDS = 0.5
+    1: DEFAULT_MAX_BACKOFF_SECONDS = 8.0
+       
+       #: Hard cap on how many pages a paginated connector may fetch in one sync.
+    1: MAX_PAGES = 20
+       
+       
+    1: def _backoff_delay(attempt: int, base: float, cap: float) -> float:
+           """Exponential backoff with jitter-free deterministic growth:
+           0.5s, 1s, 2s, ... capped at ``cap``. Small for a demo, documented."""
+    5:     return min(base * (2 ** max(attempt - 1, 0)), cap)
+       
+       
+    1: def http_get_bytes(
+           url: str,
+           *,
+    1:     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    1:     headers: Optional[dict] = None,
+    1:     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    1:     backoff_base: float = DEFAULT_BACKOFF_BASE_SECONDS,
+    1:     backoff_cap: float = DEFAULT_MAX_BACKOFF_SECONDS,
+    1:     sleep: Callable[[float], None] = time.sleep,
+       ) -> bytes:
+           """Fetch ``url`` and return the raw response body.
+       
+           Raises the classified ``ConnectorError`` subclasses on failure. Never
+           retries permanent errors; respects 429 ``Retry-After``; caps attempts.
+           """
+    8:     request = urllib.request.Request(url, headers=headers or {})
+    8:     attempt = 0
+           while True:
+   14:         attempt += 1
+   14:         try:
+   14:             with urllib.request.urlopen(request, timeout=timeout) as resp:
+    5:                 status = resp.getcode()
+    5:                 if status is not None and status >= 400:
+                           raise HttpStatusError(
+                               status, "Source returned an error status"
+                           )
+    5:                 return resp.read()
+    9:         except urllib.error.HTTPError as exc:
+    7:             status = exc.code
+    7:             if status in (401, 403):
+                       raise AuthError(
+                           "The source rejected the request credentials (HTTP %d)" % status
+                       )
+    7:             if status == 404:
+    2:                 raise HttpStatusError(
+    1:                     status, "The source URL was not found", retryable=False
+                       )
+    6:             if status == 429:
+    1:                 retry_after = None
+    1:                 raw = exc.headers.get("Retry-After") if exc.headers else None
+    1:                 if raw:
+    1:                     try:
+    1:                         retry_after = max(0.0, float(raw))
+                           except (TypeError, ValueError):
+                               retry_after = None
+    1:                 if attempt < max_attempts:
+    2:                     sleep(retry_after if retry_after is not None
+                                 else _backoff_delay(attempt, backoff_base, backoff_cap))
+    1:                     continue
+                       raise RateLimitError(
+                           "The source rate-limited the request (HTTP 429)",
+                           retry_after=retry_after,
+                       )
+    5:             if status in (500, 502, 503, 504):
+    5:                 if attempt < max_attempts:
+    4:                     sleep(_backoff_delay(attempt, backoff_base, backoff_cap))
+    4:                     continue
+    2:                 raise HttpStatusError(
+    1:                     status, "The source is unavailable", retryable=True
+                       )
+    2:             raise HttpStatusError(status, "The source rejected the request")
+    2:         except urllib.error.URLError as exc:
+    2:             reason = getattr(exc, "reason", None)
+    2:             if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+    2:                 if attempt < max_attempts:
+    1:                     sleep(_backoff_delay(attempt, backoff_base, backoff_cap))
+    1:                     continue
+    2:                 raise TimeoutError(
+    1:                     "The source did not respond within %gs" % timeout
+                       )
+                   if attempt < max_attempts:
+                       sleep(_backoff_delay(attempt, backoff_base, backoff_cap))
+                       continue
+    1:             raise UnreachableError(
+                       "Could not reach the source: %s" % (reason or exc)
+                   )
+               except TimeoutError:
+                   if attempt < max_attempts:
+                       sleep(_backoff_delay(attempt, backoff_base, backoff_cap))
+                       continue
+                   raise

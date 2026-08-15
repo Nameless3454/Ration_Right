@@ -1,0 +1,233 @@
+    1: """RationRight — Phase 4: Agent 3 (Evidence Case Builder) tests.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import re
+    1: import unittest
+       
+    1: from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+       
+    1: CASE_FIELDS = {
+           "case_id",
+           "severity",
+           "status",
+           "finding_ids",
+           "summary",
+           "evidence",
+           "confidence",
+           "recommended_action",
+       }
+       
+       
+    1: def make_tx(transaction_id, beneficiary_id, timestamp, latitude, longitude,
+                   ration_type="rice", quantity=10):
+    5:     return {
+    5:         "transaction_id": transaction_id,
+    5:         "beneficiary_id": beneficiary_id,
+    5:         "timestamp": timestamp,
+    5:         "latitude": latitude,
+    5:         "longitude": longitude,
+    5:         "ration_type": ration_type,
+    5:         "quantity": quantity,
+           }
+       
+       
+    1: def make_finding(finding_id="FIND001", anomaly_id="ANOM001", status="verified",
+                        transaction_ids=("TX001", "TX002"), evidence=None, evidence_sources=None,
+                        explanation="test explanation"):
+    7:     return {
+    7:         "finding_id": finding_id,
+    7:         "anomaly_id": anomaly_id,
+    7:         "status": status,
+    7:         "transaction_ids": list(transaction_ids),
+    7:         "evidence": evidence if evidence is not None
+    2:                     else {"time_difference_minutes": 12.0, "distance_km": 1148.09},
+    7:         "evidence_sources": list(evidence_sources)
+   12:                             if evidence_sources is not None else list(transaction_ids),
+    7:         "explanation": explanation,
+           }
+       
+       
+    1: def real_finding():
+           """Run the real Agent 1 + Agent 2 chain to produce a genuine finding."""
+    5:     dataset = load_dataset(DEFAULT_DATASET_PATH)
+    5:     transactions = dataset["transactions"]
+    5:     anomalies = Agent1TransactionAnalyst().run(transactions)["anomalies"]
+   10:     finding = Agent2AnomalyInvestigator().run(
+    5:         {"anomaly": anomalies[0], "transactions": transactions}
+           )
+    5:     return finding, transactions
+       
+       
+    2: class TestAgent3VerifiedFinding(unittest.TestCase):
+    1:     """TEST 1 — a real verified finding produces a structured case."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.finding, cls.transactions = real_finding()
+    2:         cls.case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [cls.finding], "transactions": cls.transactions}
+               )
+       
+    1:     def test_case_is_created(self):
+    1:         self.assertEqual(set(self.case.keys()), CASE_FIELDS)
+    1:         self.assertEqual(self.case["case_id"], "CASE001")
+    1:         self.assertEqual(self.case["status"], "requires_human_review")
+    1:         self.assertEqual(self.case["finding_ids"], ["FIND001"])
+       
+    1:     def test_evidence_entries(self):
+    4:         entries = {e["type"]: e for e in self.case["evidence"]}
+    1:         self.assertEqual(entries["time_difference"]["value"], 12.0)
+    1:         self.assertEqual(entries["time_difference"]["unit"], "minutes")
+    1:         self.assertEqual(entries["distance"]["value"], 1148.09)
+    1:         self.assertEqual(entries["distance"]["unit"], "km")
+       
+    1:     def test_severity_confidence_recommendation(self):
+    1:         self.assertEqual(self.case["severity"], "high")
+    1:         self.assertEqual(self.case["confidence"], 0.9)
+    1:         self.assertEqual(self.case["recommended_action"], "Human verification")
+       
+    1:     def test_summary_is_factual_and_traceable(self):
+    1:         summary = self.case["summary"]
+    1:         self.assertIn("TX001", summary)
+    1:         self.assertIn("TX002", summary)
+    1:         self.assertIn("BEN001", summary)
+    1:         lowered = summary.lower()
+    1:         self.assertNotIn("guilty", lowered)
+    1:         self.assertNotIn("fraud", lowered)
+    1:         self.assertIn("human review", lowered)
+       
+       
+    2: class TestAgent3Unverified(unittest.TestCase):
+    1:     """TEST 2 — an unverified finding is never presented as a verified case."""
+       
+    1:     def test_unverified_finding_is_not_ready(self):
+    1:         finding = make_finding(status="unverified", evidence={}, evidence_sources=[])
+    1:         case = Agent3EvidenceCaseBuilder().run({"findings": [finding], "transactions": []})
+    1:         self.assertEqual(case["status"], "not_ready")
+    1:         self.assertEqual(case["evidence"], [])
+    1:         self.assertEqual(case["confidence"], 0.0)
+    1:         self.assertIn("unverified", case["summary"].lower())
+       
+       
+    2: class TestAgent3MissingTransaction(unittest.TestCase):
+    1:     """TEST 3 — a missing referenced transaction is reported, not invented."""
+       
+    1:     def test_missing_referenced_transaction(self):
+    1:         finding = make_finding(transaction_ids=("TX001", "TX999"))
+    1:         transactions = [make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)]
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [finding], "transactions": transactions}
+               )
+    1:         self.assertEqual(case["status"], "not_ready")
+    1:         self.assertIn("TX999", case["summary"])
+       
+       
+    2: class TestAgent3MissingEvidence(unittest.TestCase):
+    1:     """TEST 4 — a verified finding without evidence is marked not ready."""
+       
+    1:     def test_missing_evidence_not_ready(self):
+    1:         finding = make_finding(evidence={}, evidence_sources=[])
+    1:         case = Agent3EvidenceCaseBuilder().run({"findings": [finding], "transactions": []})
+    1:         self.assertEqual(case["status"], "not_ready")
+    1:         self.assertIn("evidence", case["summary"].lower())
+       
+       
+    2: class TestAgent3EvidenceConsistency(unittest.TestCase):
+    1:     """TEST 5 — Agent 2's numerical evidence is preserved unchanged."""
+       
+    1:     def test_case_preserves_agent_2_values_exactly(self):
+    1:         finding, transactions = real_finding()
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [finding], "transactions": transactions}
+               )
+    4:         values = {e["type"]: e["value"] for e in case["evidence"]}
+    1:         self.assertEqual(values["time_difference"], finding["evidence"]["time_difference_minutes"])
+    1:         self.assertEqual(values["distance"], finding["evidence"]["distance_km"])
+       
+       
+    2: class TestAgent3NoFabrication(unittest.TestCase):
+    1:     """TEST 6 — every fact in the case exists in the supplied input."""
+       
+    1:     def test_summary_facts_come_from_input(self):
+    1:         finding, transactions = real_finding()
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [finding], "transactions": transactions}
+               )
+    1:         summary_ids = set(re.findall(r"TX\d{3}", case["summary"]))
+    1:         self.assertTrue(summary_ids.issubset(set(finding["transaction_ids"])))
+    1:         summary_beneficiaries = set(re.findall(r"BEN\d{3}", case["summary"]))
+   27:         real_beneficiaries = {t["beneficiary_id"] for t in transactions}
+    1:         self.assertTrue(summary_beneficiaries.issubset(real_beneficiaries))
+       
+       
+    2: class TestAgent3MultipleFindings(unittest.TestCase):
+    1:     """TEST 7 — multiple findings are aggregated without mixing evidence."""
+       
+    1:     def test_evidence_from_multiple_findings_stays_separate(self):
+    2:         finding_a = make_finding("FIND001", "ANOM001", transaction_ids=("TX001", "TX002"),
+    1:                                  evidence={"time_difference_minutes": 12.0, "distance_km": 1148.09})
+    2:         finding_b = make_finding("FIND002", "ANOM002", transaction_ids=("TX010", "TX011"),
+    1:                                  evidence={"time_difference_minutes": 25.0, "distance_km": 500.5})
+    1:         transactions = [
+    1:             make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX002", "BEN001", "2026-08-01T10:12:00", 28.6139, 77.2090),
+    1:             make_tx("TX010", "BEN003", "2026-08-03T09:00:00", 28.6139, 77.2090),
+    1:             make_tx("TX011", "BEN003", "2026-08-03T09:25:00", 19.0760, 72.8777),
+               ]
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [finding_a, finding_b], "transactions": transactions}
+               )
+    1:         self.assertEqual(case["status"], "requires_human_review")
+    1:         self.assertEqual(case["finding_ids"], ["FIND001", "FIND002"])
+    6:         values = [e["value"] for e in case["evidence"]]
+    1:         self.assertEqual(values, [12.0, 1148.09, 25.0, 500.5])
+       
+       
+    2: class TestAgent3Agent2Compatibility(unittest.TestCase):
+    1:     """TEST 8 — Agent 3 consumes actual Agent 2 output without rewriting."""
+       
+    1:     def test_consumes_actual_agent_2_output(self):
+    1:         finding, transactions = real_finding()
+    1:         self.assertEqual(finding["status"], "verified")
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"findings": [finding], "transactions": transactions}
+               )
+    1:         self.assertEqual(case["status"], "requires_human_review")
+    1:         self.assertEqual(case["finding_ids"], [finding["finding_id"]])
+       
+    1:     def test_single_finding_input_shape(self):
+    1:         finding, transactions = real_finding()
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    1:             {"finding": finding, "transactions": transactions}
+               )
+    1:         self.assertEqual(case["status"], "requires_human_review")
+       
+       
+    2: class TestAgent3InvalidInput(unittest.TestCase):
+    1:     """Malformed input produces clear validation errors."""
+       
+    1:     def test_invalid_input_raises(self):
+    1:         builder = Agent3EvidenceCaseBuilder()
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run("not-a-payload")
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run({})
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run({"findings": []})
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run({"findings": ["not-a-dict"]})
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run({"findings": [make_finding(status="bogus")]})
+    1:         with self.assertRaises(ValueError):
+    2:             builder.run({"findings": [make_finding(evidence={"time_difference_minutes": "abc", "distance_km": 1})]})
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

@@ -1,0 +1,216 @@
+    1: """RationRight — Phase 7/8: backend API tests.
+       
+       Starts the real server on an ephemeral port and exercises the endpoints,
+       including the Phase 8 health check and startup validation.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+    1: from server import build_health, make_server, validate_startup
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+    1: def request(method, url, body=None):
+   12:     data = json.dumps(body).encode("utf-8") if body is not None else None
+   12:     headers = {"Content-Type": "application/json"} if data else {}
+   12:     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+   12:     try:
+   12:         with urllib.request.urlopen(req, timeout=15) as response:
+    9:             return response.status, response.read().decode("utf-8"), dict(response.headers)
+    3:     except urllib.error.HTTPError as exc:
+    3:         return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+       
+       
+    2: class TestRationRightAPI(unittest.TestCase):
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.server = make_server("127.0.0.1", 0)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = f"{BASE}:{cls.port}"
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+       
+    1:     def test_dashboard_loads(self):
+               """TEST 1 — the dashboard HTML is served.
+       
+               The shell is branded RationAI; interactive views (including the Run
+               Analysis button) are rendered client-side from the real API.
+               """
+    1:         status, body, _ = request("GET", self.base + "/")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("RationAI", body)
+    1:         self.assertIn("Overview", body)
+    1:         self.assertIn("/static/app.js", body)
+       
+    1:     def test_dataset_endpoint(self):
+               """The real Phase 1 dataset is exposed for the UI."""
+    1:         status, body, _ = request("GET", self.base + "/api/dataset")
+    1:         self.assertEqual(status, 200)
+    1:         dataset = json.loads(body)
+    1:         self.assertEqual(dataset["metadata"]["label"], "Synthetic Demo Data")
+    1:         self.assertEqual(len(dataset["transactions"]), 25)
+       
+    1:     def test_analyze_runs_real_workflow(self):
+               """POST /api/analyze executes the real agents end to end."""
+    1:         status, body, _ = request("POST", self.base + "/api/analyze", {"dataset": "synthetic"})
+    1:         self.assertEqual(status, 200)
+    1:         result = json.loads(body)
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    2:         self.assertEqual(
+    1:             result["stages"],
+    2:             {"agent_1": "completed", "agent_2": "completed",
+    1:              "agent_3": "completed", "agent_4": "completed"},
+               )
+    1:         self.assertEqual(len(result["anomalies"]), 1)
+    1:         self.assertEqual(len(result["findings"]), 1)
+    1:         self.assertEqual(len(result["cases"]), 1)
+    1:         self.assertEqual(len(result["alerts"]), 1)
+    1:         self.assertEqual(result["errors"], [])
+       
+    1:     def test_analyze_result_is_traceable_to_real_data(self):
+               """The final alert traces back to actual Phase 1 transactions."""
+    1:         _, body, _ = request("POST", self.base + "/api/analyze", {})
+    1:         result = json.loads(body)
+    1:         _, dataset_body, _ = request("GET", self.base + "/api/dataset")
+   27:         real_ids = {t["transaction_id"] for t in json.loads(dataset_body)["transactions"]}
+       
+    1:         alert = result["alerts"][0]
+    1:         case = result["cases"][0]
+    1:         finding = result["findings"][0]
+    1:         anomaly = result["anomalies"][0]
+    1:         self.assertEqual(alert["case_id"], case["case_id"])
+    1:         self.assertEqual(case["finding_ids"], [finding["finding_id"]])
+    1:         self.assertEqual(finding["anomaly_id"], anomaly["anomaly_id"])
+    1:         self.assertTrue(set(anomaly["transaction_ids"]).issubset(real_ids))
+    1:         self.assertEqual(anomaly["transaction_ids"], ["TX001", "TX002"])
+       
+    1:     def test_analyze_evidence_matches_calculation(self):
+               """The alert carries the exact calculated evidence (no mocks)."""
+    1:         _, body, _ = request("POST", self.base + "/api/analyze", {"dataset": "synthetic"})
+    1:         result = json.loads(body)
+    1:         finding = result["findings"][0]
+    1:         self.assertEqual(finding["status"], "verified")
+    1:         self.assertEqual(finding["evidence"]["time_difference_minutes"], 12.0)
+    1:         self.assertAlmostEqual(finding["evidence"]["distance_km"], 1148.09, places=2)
+    1:         alert = result["alerts"][0]
+    1:         self.assertIn("12.0", alert["message"])
+    1:         self.assertIn("1148.09", alert["message"])
+       
+    1:     def test_unknown_dataset_rejected(self):
+               # Phase 6: "real" is now a valid mode but requires data_import_id;
+               # a bogus mode name is still rejected.
+    1:         status, body, _ = request("POST", self.base + "/api/analyze", {"dataset": "bogus"})
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("Unknown dataset mode", body)
+    1:         status, body, _ = request("POST", self.base + "/api/analyze", {"dataset": "real"})
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("data_import_id", body)
+       
+    1:     def test_invalid_json_rejected(self):
+    2:         req = urllib.request.Request(
+    1:             self.base + "/api/analyze",
+    1:             data=b"{not json",
+    1:             method="POST",
+    1:             headers={"Content-Type": "application/json"},
+               )
+    1:         with self.assertRaises(urllib.error.HTTPError) as ctx:
+    2:             urllib.request.urlopen(req, timeout=15)
+    1:         self.assertEqual(ctx.exception.code, 400)
+       
+    1:     def test_unknown_path_404(self):
+    1:         status, _, _ = request("GET", self.base + "/api/nope")
+    1:         self.assertEqual(status, 404)
+       
+    1:     def test_cors_preflight(self):
+               """Phase 14: same-origin by default — no wildcard CORS header; the
+               preflight still answers with allowed methods. Configured origins are
+               covered in test_security.py."""
+    1:         status, _, headers = request("OPTIONS", self.base + "/api/analyze")
+    1:         self.assertEqual(status, 204)
+    1:         self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+    1:         self.assertIn("POST", headers.get("Access-Control-Allow-Methods", ""))
+       
+           # ---------- Phase 8: health check / startup validation ----------
+       
+    1:     def test_health_endpoint(self):
+               """GET /api/health reports every component as ok on the real system."""
+    1:         status, body, _ = request("GET", self.base + "/api/health")
+    1:         self.assertEqual(status, 200)
+    1:         health = json.loads(body)
+    1:         self.assertEqual(health["status"], "ok")
+    1:         self.assertEqual(health["service"], "rationright")
+    7:         for name in ("dataset", "agent_1", "agent_2", "agent_3", "agent_4", "config"):
+    6:             self.assertIn(name, health["checks"], "missing check: %s" % name)
+    6:             self.assertEqual(health["checks"][name]["status"], "ok", name)
+    1:         self.assertIn("25 transaction(s)", health["checks"]["dataset"]["detail"])
+       
+    1:     def test_health_build_detects_bad_dataset(self):
+               """build_health reports a degraded/error dataset instead of crashing."""
+    1:         health = build_health(dataset_path=Path("/nonexistent/transactions.json"))
+    1:         self.assertEqual(health["status"], "error")
+    1:         self.assertEqual(health["checks"]["dataset"]["status"], "error")
+       
+    1:     def test_startup_validation_rejects_missing_dataset(self):
+    1:         with self.assertRaises(ValueError) as ctx:
+    2:             validate_startup(Path("/nonexistent/transactions.json"))
+    1:         self.assertIn("not found", str(ctx.exception).lower())
+       
+    1:     def test_startup_validation_rejects_invalid_dataset(self):
+    1:         with tempfile.TemporaryDirectory() as tmp:
+    1:             bad = Path(tmp) / "bad.json"
+    1:             bad.write_text(json.dumps({"transactions": [{"transaction_id": "TX1"}]}), encoding="utf-8")
+    1:             with self.assertRaises(ValueError) as ctx:
+    2:                 validate_startup(bad)
+    1:             self.assertIn("validation", str(ctx.exception).lower())
+       
+    1:     def test_clean_dataset_analyze_returns_zero_alerts(self):
+               """A dataset without the planted anomaly completes cleanly with 0 alerts."""
+    1:         with tempfile.TemporaryDirectory() as tmp:
+    1:             clean_path = Path(tmp) / "clean.json"
+    1:             dataset = load_dataset(DEFAULT_DATASET_PATH)
+   28:             dataset["transactions"] = [
+   49:                 t for t in dataset["transactions"]
+   25:                 if t["transaction_id"] not in ("TX001", "TX002")
+                   ]
+    1:             clean_path.write_text(json.dumps(dataset), encoding="utf-8")
+       
+    1:             server = make_server("127.0.0.1", 0, dataset_path=clean_path)
+    1:             port = server.server_address[1]
+    1:             thread = threading.Thread(target=server.serve_forever, daemon=True)
+    1:             thread.start()
+    1:             try:
+    1:                 status, body, _ = request("POST", f"{BASE}:{port}/api/analyze", {"dataset": "synthetic"})
+    1:                 self.assertEqual(status, 200)
+    1:                 result = json.loads(body)
+    1:                 self.assertEqual(result["workflow_status"], "completed")
+    1:                 self.assertEqual(result["anomalies"], [])
+    1:                 self.assertEqual(result["findings"], [])
+    1:                 self.assertEqual(result["cases"], [])
+    1:                 self.assertEqual(result["alerts"], [])
+    1:                 self.assertEqual(result["errors"], [])
+    1:                 self.assertEqual(result["stages"]["agent_1"], "completed")
+    1:                 self.assertEqual(result["stages"]["agent_2"], "skipped")
+                   finally:
+    1:                 server.shutdown()
+    1:                 server.server_close()
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

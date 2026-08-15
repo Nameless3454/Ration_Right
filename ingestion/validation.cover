@@ -1,0 +1,628 @@
+    1: """RationRight — record validation and normalization (Phase 3 + Phase 4).
+       
+       The normalization layer between uploaded datasets and the database:
+       
+           Raw Record -> Column Mapping -> Type Conversion -> Value Normalization
+                       -> Business Validation -> Normalized Record
+       
+       Principles
+       ----------
+       - External datasets differ; RationAI stores ONE consistent internal format.
+       - String fields are trimmed and whitespace-collapsed; geographic text fields
+         (state/district/block/name/location) are title-cased for consistency.
+       - Commodities map through a configurable alias table to a canonical key
+         (lowercase, matching the Phase 1 demo dataset's internal format). Unknown
+         commodities are reported as warnings, never silently guessed.
+       - Units normalize ``kg``-family values to ``kg``; other units are kept with a
+         warning.
+       - Dates support ISO-8601, ``YYYY/MM/DD``, ``DD-MM-YYYY``, ``DD/MM/YYYY``,
+         month-name formats, and Excel serial numbers. Ambiguous ``DD/MM`` dates are
+         flagged (interpreted as DD/MM) instead of being silently assumed; impossible
+         dates are rejected.
+       - Numbers handle ``1,200`` and ``1200 kg``; invalid text is an error, never
+         silently converted to zero.
+       - Warnings do not block import; errors do.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import re
+    1: from datetime import datetime, timedelta
+       
+    1: from ingestion import mapping
+       
+       # Excel serial-date epoch for the 1900 date system.
+    1: EXCEL_EPOCH = datetime(1899, 12, 30)
+    1: _EXCEL_MAX_SERIAL = 2958465  # 9999-12-31
+       
+    1: _NUMBER_CLEAN = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
+       
+       # ---------------------------------------------------------------------------
+       # Commodity normalization (configurable alias table).
+       # Canonical values are lowercase keys that match the Phase 1 dataset's
+       # internal format ("rice", "wheat", "sugar", "kerosene", ...) plus the
+       # Phase 4 additions "pulses" and "oil".
+       # ---------------------------------------------------------------------------
+       
+    1: COMMODITY_CANONICAL = ("rice", "wheat", "pulses", "sugar", "oil", "kerosene")
+       
+    1: COMMODITY_LABELS = {
+    1:     "rice": "Rice", "wheat": "Wheat", "pulses": "Pulses",
+    1:     "sugar": "Sugar", "oil": "Oil", "kerosene": "Kerosene",
+       }
+       
+    1: COMMODITY_ALIASES = {
+    1:     "rice": {"rice", "ricegrain", "rawrice", "parboiledrice", "basmati",
+                    "basmaticommon", "ricegrain", "grains"},
+    1:     "wheat": {"wheat", "wholewheat", "wheataata", "atta", "gehu"},
+    1:     "pulses": {"pulses", "pulse", "dal", "dals", "lentils", "lentil", "grams",
+                      "pulsesgrain", "toor", "moong", "chana", "arhar", "tur"},
+    1:     "sugar": {"sugar", "sugargrain", "gur", "shakkar", "sakkhar"},
+    1:     "oil": {"oil", "cookingoil", "edibleoil", "mustardoil", "groundnutoil",
+                   "palmoil", "vanaspati", "refinedoil"},
+    1:     "kerosene": {"kerosene", "kerosine", "kero", "skooil"},
+       }
+       
+    1: UNIT_KG_ALIASES = {"kg", "kgs", "kilogram", "kilograms", "kilogramme",
+                          "kilogrammes", "kilo", "kilos", "kilogrammes"}
+       
+       
+    1: def commodity_label(key) -> str:
+   14:     if not key:
+               return ""
+   14:     return COMMODITY_LABELS.get(key, str(key))
+       
+       
+    1: def normalize_commodity(value):
+           """Map a commodity spelling to its canonical key.
+       
+           Returns ``(canonical_key, changed, warning)`` where ``warning`` is None
+           for known commodities. Unknown commodities keep the trimmed original with
+           a warning — never silently guessed.
+           """
+90591:     text = _collapse(to_text(value))
+90591:     if not text:
+               return None, False, None
+90591:     normalized = re.sub(r"[^a-z0-9]", "", text.lower())
+150852:     for canonical, aliases in COMMODITY_ALIASES.items():
+150850:         if normalized in aliases:
+90589:             changed = canonical != text.lower()
+90589:             warning = None
+90589:             if changed:
+    3:                 warning = (
+    6:                     "Commodity %r normalized to %r."
+    3:                     % (text, commodity_label(canonical))
+                       )
+90589:             return canonical, changed, warning
+    4:     return text, False, (
+    2:         "Unrecognized commodity %r; kept as-is." % text
+           )
+       
+       
+    1: def normalize_unit(value):
+           """Normalize kg-family units to ``kg``. Returns (unit, changed, warning)."""
+60401:     text = _collapse(to_text(value)).lower()
+60401:     if not text:
+               return None, False, None
+60401:     if text in UNIT_KG_ALIASES:
+60400:         return "kg", text != "kg", None
+    1:     return text, False, "Unrecognized unit %r; kept as-is." % to_text(value)
+       
+       
+       # ---------------------------------------------------------------------------
+       # String normalization
+       # ---------------------------------------------------------------------------
+       
+    1: _SMALL_WORDS = {"of", "and", "the", "at", "in", "for", "on", "a"}
+       
+       
+    1: def _collapse(text: str) -> str:
+483398:     return re.sub(r"\s+", " ", text).strip()
+       
+       
+    1: def _title_case(text: str) -> str:
+  156:     words = []
+  324:     for word in text.split(" "):
+  168:         if word and word.lower() not in _SMALL_WORDS:
+  168:             words.append(word[:1].upper() + word[1:].lower())
+               else:
+                   words.append(word.lower())
+  156:     return " ".join(words)
+       
+       
+    1: def normalize_string(value, title: bool = False):
+           """Trim/collapse whitespace; optionally title-case geographic text.
+       
+           Returns ``(normalized, changed, warning)``. Case is NOT altered where it
+           may carry meaning (IDs, codes, categories) unless ``title=True``.
+           All-caps short values (len <= 3, e.g. state codes like ``UP``) are
+           treated as abbreviations and left untouched — title-casing them would
+           destroy their meaning (``UP`` -> ``Up``).
+           """
+241818:     text = _collapse(to_text(value))
+241818:     if not text:
+    2:         return None, bool(text), None
+241816:     if title and text != _title_case(text) and not _is_abbreviation(text):
+    4:         return _title_case(text), True, (
+    2:             "Value %r normalized to %r." % (to_text(value), _title_case(text))
+               )
+241814:     changed = text != to_text(value)
+241814:     return text, changed, None
+       
+       
+    1: def _is_abbreviation(text: str) -> bool:
+   16:     return len(text) <= 3 and text.isupper()
+       
+       
+       # ---------------------------------------------------------------------------
+       # Value coercion
+       # ---------------------------------------------------------------------------
+       
+       
+    2: class ValidationError(Exception):
+    1:     """Raised when a row cannot be coerced at all (malformed record)."""
+       
+       
+    1: def to_text(value) -> str:
+2114839:     if value is None:
+90579:         return ""
+2024260:     return str(value).strip()
+       
+       
+    1: def parse_number(value):
+           """Parse a numeric cell: ints/floats, thousands separators, trailing
+           units (``1200 kg``). Returns float or None — never guesses."""
+90811:     if value is None:
+               return None
+90811:     if isinstance(value, bool):
+               return None
+90811:     if isinstance(value, (int, float)):
+   20:         return float(value)
+90791:     text = to_text(value).lower().rstrip("s")
+998671:     for suffix in (" kg", "kg", " gm", "gm", " g", "g", " ltr", "ltr", " litre", "litre"):
+907883:         if text.endswith(suffix):
+    3:             text = text[: -len(suffix)].strip()
+    3:             break
+90791:     text = text.replace(",", "").strip()
+90791:     if not _NUMBER_CLEAN.match(text):
+   39:         return None
+90752:     try:
+90752:         return float(text)
+           except ValueError:
+               return None
+       
+       
+    1: _DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
+                        "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y")
+       
+       
+    1: def parse_date_detailed(value):
+           """Parse a date; returns ``(iso_value, warnings)``.
+       
+           Supports ISO-8601, YYYY/MM/DD, DD-MM-YYYY, DD/MM/YYYY, month-name
+           formats, and Excel serial numbers. Slash/dash dates where both parts are
+           <= 12 are flagged as ambiguous (interpreted as DD/MM) so the ambiguity is
+           visible instead of silently assumed. Impossible dates return (None, [])."""
+90590:     if value is None or value == "":
+               return None, []
+90590:     if isinstance(value, bool):
+               return None, []
+90590:     if isinstance(value, (int, float)):
+    2:         serial = float(value)
+    2:         if not (1 <= serial <= _EXCEL_MAX_SERIAL):
+    1:             return None, ["Date serial %s is out of range." % value]
+    1:         day = EXCEL_EPOCH + timedelta(days=int(serial))
+    1:         return day.date().isoformat(), []
+       
+90588:     text = _collapse(to_text(value))
+90588:     if not text:
+               return None, []
+90588:     try:
+90588:         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+90542:         if dt.tzinfo is not None:
+                   dt = dt.replace(tzinfo=None)
+90542:         iso = dt.isoformat(sep="T", timespec="seconds") if "T" in text else dt.date().isoformat()
+90542:         return iso, []
+   46:     except ValueError:
+   46:         pass
+       
+  350:     for fmt in _DATE_FORMATS:
+  316:         try:
+  316:             parsed = datetime.strptime(text, fmt)
+  304:         except ValueError:
+  304:             continue
+   12:         warnings = []
+   12:         if fmt in ("%d/%m/%Y", "%d-%m-%Y") and parsed.month <= 12 and parsed.day <= 12:
+   12:             warnings.append(
+   12:                 "Date %r is ambiguous; interpreted as DD/MM/YYYY (%s)."
+    6:                 % (text, parsed.date().isoformat())
+                   )
+   12:         return parsed.date().isoformat(), warnings
+   34:     return None, ["Date %r is not a valid date." % to_text(value)]
+       
+       
+    1: def parse_date(value):
+           """Backward-compatible wrapper returning just the ISO value or None."""
+   21:     iso, _ = parse_date_detailed(value)
+   21:     return iso
+       
+       
+    1: def parse_int(value):
+           """Parse a positive integer (for family_size). Returns int or None."""
+    9:     number = parse_number(value)
+    9:     if number is None or number != int(number) or number <= 0:
+    1:         return None
+    8:     return int(number)
+       
+       
+    1: def normalize_status(value, dataset_type):
+           """Uppercase and validate a status against the type's allowed set."""
+90584:     text = to_text(value).upper()
+90584:     if not text:
+90576:         return None, None
+    8:     allowed = mapping.STATUS_ALLOWED.get(dataset_type, ())
+    8:     if allowed and text not in allowed:
+    1:         return None, "status %r is not valid (allowed: %s)" % (to_text(value), ", ".join(allowed))
+    7:     return text, None
+       
+       
+       # ---------------------------------------------------------------------------
+       # Record validation
+       # ---------------------------------------------------------------------------
+       
+       # Text fields passed through (trimmed/collapsed). Geographic names are
+       # title-cased; IDs/codes/categories keep their case.
+    1: _TITLE_TEXT_FIELDS = ("state", "district", "block", "name", "location")
+    1: _PLAIN_TEXT_FIELDS = (
+           "external_reference", "fps_code", "external_transaction_id",
+           "beneficiary_id", "fps_center_id", "ration_category",
+       )
+       
+       
+    1: def validate_record(record: dict, dataset_type: str):
+           """Validate one mapped record.
+       
+           ``record`` maps internal field -> raw cell value. Returns
+           ``(normalized_record, errors, warnings)``. ``normalized_record`` is None
+           when there are errors (the record must not be imported). Warnings carry
+           explicit normalization notes (e.g. ``District ' LUCKNOW ' -> 'Lucknow'``).
+           """
+90592:     errors = []
+90592:     warnings = []
+90592:     normalized = {}
+       
+452938:     for field in mapping.required_fields(dataset_type):
+362346:         if not to_text(record.get(field)):
+    3:             errors.append("missing required field %s" % mapping.field_label(field))
+       
+           # --- string fields ---
+543552:     for field in _TITLE_TEXT_FIELDS:
+452960:         raw = record.get(field)
+452960:         if raw is None or to_text(raw) == "":
+                   continue
+  150:         value, _, warning = normalize_string(raw, title=True)
+  150:         if value is not None:
+  150:             normalized[field] = value
+  150:         if warning:
+    2:             warnings.append(
+    1:                 "%s %s" % (mapping.field_label(field), warning[0].lower() + warning[1:])
+                   )
+634144:     for field in _PLAIN_TEXT_FIELDS:
+543552:         raw = record.get(field)
+543552:         if raw is None or to_text(raw) == "":
+                   continue
+241662:         value, changed, warning = normalize_string(raw, title=False)
+241662:         if value is not None:
+241662:             normalized[field] = value
+241662:         if warning:
+                   warnings.append(
+                       "%s %s" % (mapping.field_label(field), warning[0].lower() + warning[1:])
+                   )
+       
+           # --- status ---
+90592:     if dataset_type in ("beneficiaries", "fps_centers", "ration_transactions", "combined"):
+90584:         status, status_error = normalize_status(record.get("status"), dataset_type)
+90584:         if status_error:
+    1:             errors.append(status_error)
+90583:         elif status is not None:
+    7:             normalized["status"] = status
+       
+           # --- commodity ---
+90592:     if dataset_type in ("ration_transactions", "inventory", "combined"):
+90576:         raw = record.get("commodity")
+90576:         if to_text(raw) == "":
+                   errors.append("missing required field Commodity")
+               else:
+90576:             canonical, _, warning = normalize_commodity(raw)
+90576:             if canonical is None:
+                       errors.append("missing required field Commodity")
+                   else:
+90576:                 normalized["commodity"] = canonical
+90576:                 if warning:
+                           warnings.append(warning)
+       
+           # --- unit ---
+90592:     raw_unit = record.get("unit")
+90592:     if raw_unit is not None and to_text(raw_unit) != "":
+60395:         unit, _, warning = normalize_unit(raw_unit)
+60395:         if unit is not None:
+60395:             normalized["unit"] = unit
+60395:         if warning:
+                   warnings.append(warning)
+       
+           # --- dates ---
+271776:     for field in ("transaction_date", "last_updated"):
+181184:         raw = record.get(field)
+181184:         if raw is None or to_text(raw) == "":
+                   continue
+90568:         parsed, date_warnings = parse_date_detailed(raw)
+90568:         if parsed is None:
+   30:             errors.append("%s %r is not a valid date" % (mapping.field_label(field), to_text(raw)))
+               else:
+90538:             normalized[field] = parsed
+90538:             for warning in date_warnings:
+                       warnings.append(warning)
+90538:             if to_text(raw) != parsed and not any("ambiguous" in w for w in date_warnings):
+                       warnings.append("%s %r normalized to %r." % (
+                           mapping.field_label(field), to_text(raw), parsed))
+       
+           # --- numbers ---
+543552:     for field, minimum in (
+               ("quantity", 0.0), ("capacity", 0.0), ("current_stock", 0.0),
+               ("monthly_consumption", 0.0), ("reorder_threshold", 0.0),
+           ):
+452960:         raw = record.get(field)
+452960:         if raw is None or to_text(raw) == "":
+                   continue
+90593:         number = parse_number(raw)
+90593:         if number is None:
+   35:             errors.append("%s %r is not numeric" % (mapping.field_label(field), to_text(raw)))
+90558:         elif minimum == 0.0 and number <= 0:
+    6:             errors.append("%s must be a positive number, got %r" % (
+    3:                 mapping.field_label(field), to_text(raw)))
+               else:
+90555:             normalized[field] = number
+90555:             if to_text(raw).replace(" ", "").lower().endswith("kg") or "," in to_text(raw):
+                       warnings.append("%s %r normalized to %g." % (
+                           mapping.field_label(field), to_text(raw), number))
+       
+90592:     if dataset_type in ("ration_transactions", "combined"):
+90568:         if "quantity" in normalized and normalized["quantity"] <= 0:
+                   errors.append("quantity must be a positive number")
+       
+           # --- coordinates ---
+90592:     lat_raw = record.get("latitude")
+90592:     if lat_raw is not None and to_text(lat_raw) != "":
+   99:         lat = parse_number(lat_raw)
+   99:         if lat is None or not (-90 <= lat <= 90):
+    1:             errors.append("latitude %r is invalid (must be a number in [-90, 90])" % to_text(lat_raw))
+               else:
+   98:             normalized["latitude"] = lat
+90592:     lon_raw = record.get("longitude")
+90592:     if lon_raw is not None and to_text(lon_raw) != "":
+   98:         lon = parse_number(lon_raw)
+   98:         if lon is None or not (-180 <= lon <= 180):
+                   errors.append("longitude %r is invalid (must be a number in [-180, 180])" % to_text(lon_raw))
+               else:
+   98:             normalized["longitude"] = lon
+       
+           # --- family size ---
+90592:     fs_raw = record.get("family_size")
+90592:     if fs_raw is not None and to_text(fs_raw) != "":
+    9:         fs = parse_int(fs_raw)
+    9:         if fs is None:
+    1:             errors.append("family_size %r must be a positive integer" % to_text(fs_raw))
+               else:
+    8:             normalized["family_size"] = fs
+       
+90592:     if errors:
+   74:         return None, errors, warnings
+90518:     return normalized, [], warnings
+       
+       
+    1: def record_result(record: dict, dataset_type: str) -> dict:
+           """Structured per-record validation result (Phase 4):
+       
+           ``{"status": "VALID"|"INVALID", "warnings": [...], "errors": [...],
+              "normalized": {...}}`` — the errors/warnings are structured lists, not
+           one text blob."""
+    2:     normalized, errors, warnings = validate_record(record, dataset_type)
+    2:     if errors:
+    1:         return {"status": "INVALID", "warnings": warnings, "errors": errors, "normalized": None}
+    1:     return {"status": "VALID", "warnings": warnings, "errors": [], "normalized": normalized}
+       
+       
+    1: def summarize(rows: list, dataset_type: str, headers: list, mapping_dict: dict):
+           """Validate every row and aggregate counts.
+       
+           Returns totals, counts, example errors, example warnings, and a normalized
+           preview (first valid records) so the UI can show original vs normalized
+           data side by side."""
+   39:     total = len(rows)
+   39:     valid = 0
+   39:     invalid = 0
+   39:     warning_count = 0
+   39:     errors_examples = []
+   39:     warning_examples = []
+   39:     preview_normalized = []
+30197:     for row_number, row in enumerate(rows, start=2):  # 1 is the header
+30158:         record = _record_from_row(row, headers, mapping_dict)
+30158:         normalized, errors, warnings = validate_record(record, dataset_type)
+30158:         warning_count += len(warnings)
+30158:         if errors:
+   21:             invalid += 1
+   21:             if len(errors_examples) < 10:
+   42:                 errors_examples.append({
+   21:                     "row": row_number,
+   21:                     "errors": errors[:3],
+  183:                     "values": {k: v for k, v in record.items() if v not in (None, "")},
+                       })
+               else:
+30137:             valid += 1
+30137:             if len(preview_normalized) < 10:
+  314:                 preview_normalized.append({
+  157:                     "row": row_number,
+  157:                     "status": "VALID",
+  157:                     "warnings": warnings,
+ 1516:                     "original": {
+ 1202:                         k: v for k, v in record.items() if v not in (None, "")
+                           },
+  157:                     "normalized": normalized,
+                       })
+30158:         if warnings and len(warning_examples) < 10:
+                   warning_examples.append({"row": row_number, "warnings": warnings[:3]})
+   39:     return {
+   39:         "total_records": total,
+   39:         "valid_records": valid,
+   39:         "invalid_records": invalid,
+   39:         "warning_count": warning_count,
+   39:         "errors": errors_examples,
+   39:         "warnings": warning_examples,
+   39:         "preview_normalized": preview_normalized,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Duplicate classification (Phase 4)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def classify_duplicates(rows: list, dataset_type: str, headers: list, mapping_dict: dict) -> dict:
+           """Classify each record as UNIQUE / EXACT_DUPLICATE / POSSIBLE_DUPLICATE.
+       
+           - transactions with an ID: EXACT when the same external id recurs;
+             POSSIBLE when a different id shares the same composite content
+             (fps, date, commodity, quantity) — the same transaction recorded twice;
+           - transactions without an ID: identical composite -> EXACT;
+           - other types: identical natural key -> EXACT.
+       
+           Returns counts plus the first few samples for the error report."""
+   40:     exact_keys = set()
+   40:     composite_keys = set()
+   40:     counts = {"unique": 0, "exact": 0, "possible": 0}
+   40:     samples = []
+       
+30202:     for row_number, row in enumerate(rows, start=2):
+30162:         record = _record_from_row(row, headers, mapping_dict)
+30162:         normalized, errors, _ = validate_record(record, dataset_type)
+30162:         if errors:
+   21:             continue
+30141:         if dataset_type in ("ration_transactions", "combined"):
+30135:             external_id = (normalized.get("external_transaction_id") or "").strip()
+30135:             composite = _composite_key(normalized)
+30135:             if external_id:
+30132:                 exact_key = ("ext", external_id)
+30132:                 if exact_key in exact_keys:
+    2:                     counts["exact"] += 1
+    4:                     _sample(samples, row_number, "EXACT_DUPLICATE",
+    2:                             "Transaction ID %r was already seen." % external_id)
+30130:                 elif composite in composite_keys:
+   10:                     counts["possible"] += 1
+   20:                     _sample(samples, row_number, "POSSIBLE_DUPLICATE",
+   10:                             "Same content (%s) with a different transaction ID." % _composite_label(normalized))
+                       else:
+30120:                     counts["unique"] += 1
+30120:                     exact_keys.add(exact_key)
+30120:                     composite_keys.add(composite)
+                   else:
+    3:                 if composite in composite_keys:
+    1:                     counts["exact"] += 1
+    2:                     _sample(samples, row_number, "EXACT_DUPLICATE",
+    1:                             "Identical record content (%s)." % _composite_label(normalized))
+                       else:
+    2:                     counts["unique"] += 1
+    2:                     composite_keys.add(composite)
+               else:
+    6:             key = _natural_key(dataset_type, normalized)
+    6:             if key in exact_keys:
+                       counts["exact"] += 1
+                       _sample(samples, row_number, "EXACT_DUPLICATE",
+                               "Duplicate of a record already seen in this dataset.")
+                   else:
+    6:                 counts["unique"] += 1
+    6:                 exact_keys.add(key)
+   40:     return {**counts, "samples": samples}
+       
+       
+    1: def _sample(samples: list, row: int, kind: str, reason: str) -> None:
+   13:     if len(samples) < 10:
+   13:         samples.append({"row": row, "kind": kind, "reason": reason})
+       
+       
+    1: def _composite_key(normalized: dict):
+30135:     return (
+30135:         (normalized.get("fps_center_id") or "").strip().lower(),
+30135:         (normalized.get("transaction_date") or "").strip(),
+30135:         (normalized.get("commodity") or "").strip().lower(),
+30135:         normalized.get("quantity"),
+           )
+       
+       
+    1: def _composite_label(normalized: dict) -> str:
+   22:     return "fps=%s date=%s commodity=%s qty=%s" % (
+   11:         normalized.get("fps_center_id") or "-",
+   11:         normalized.get("transaction_date") or "-",
+   11:         commodity_label(normalized.get("commodity")) or "-",
+   11:         normalized.get("quantity") or "-",
+           )
+       
+       
+    1: def _natural_key(dataset_type: str, normalized: dict):
+    6:     if dataset_type in ("beneficiaries", "fps_centers"):
+    4:         return (normalized.get("external_reference") or normalized.get("fps_code") or "").strip().lower()
+    2:     if dataset_type == "inventory":
+    2:         return (
+    2:             (normalized.get("fps_center_id") or "").strip().lower(),
+    2:             (normalized.get("commodity") or "").strip().lower(),
+               )
+           return _composite_key(normalized)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Data quality score (Phase 4)
+       # ---------------------------------------------------------------------------
+       
+       # Transparent, deterministic formula (no AI): start at 100 and subtract
+       # penalties for invalid records (3x), duplicates (2x), and warnings (0.5x),
+       # each measured as a percentage of total records. Clamped to [0, 100].
+    1: QUALITY_WEIGHTS = {"invalid": 3.0, "duplicates": 2.0, "warnings": 0.5}
+       
+       
+    1: def quality_score(total: int, invalid: int, duplicates: int, warnings: int) -> float:
+           """Deterministic 0-100 quality score. Formula documented in the module
+           docstring and QUALITY_WEIGHTS."""
+  145:     if total <= 0:
+               return 0.0
+  145:     invalid_pct = invalid / total * 100
+  145:     duplicate_pct = duplicates / total * 100
+  145:     warning_pct = warnings / total * 100
+  290:     score = 100.0 - (
+  435:         QUALITY_WEIGHTS["invalid"] * invalid_pct
+  145:         + QUALITY_WEIGHTS["duplicates"] * duplicate_pct
+  145:         + QUALITY_WEIGHTS["warnings"] * warning_pct
+           )
+  145:     return round(max(0.0, min(100.0, score)), 1)
+       
+       
+    1: def quality_report(total: int, invalid: int, duplicates: int, warnings: int) -> dict:
+           """Structured quality report with the breakdown lines shown in the UI."""
+  138:     if total <= 0:
+               return {"score": 0.0, "valid_pct": 0.0, "duplicate_pct": 0.0, "warning_pct": 0.0}
+  138:     valid = total - invalid - duplicates
+  138:     return {
+  138:         "score": quality_score(total, invalid, duplicates, warnings),
+  138:         "valid_pct": round((valid / total) * 100, 1),
+  138:         "duplicate_pct": round(duplicates / total * 100, 1),
+  138:         "warning_pct": round(warnings / total * 100, 1),
+  138:         "invalid_pct": round(invalid / total * 100, 1),
+           }
+       
+       
+    1: def _record_from_row(row, headers, mapping_dict: dict) -> dict:
+           """Build an internal-field record from a raw row using the mapping."""
+60320:     record = {}
+442472:     for index, header in enumerate(headers):
+382152:         field = mapping_dict.get(header)
+382152:         if field:
+382152:             record[field] = row[index] if index < len(row) else ""
+60320:     return record

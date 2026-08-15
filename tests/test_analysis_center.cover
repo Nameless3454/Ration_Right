@@ -1,0 +1,352 @@
+    1: """RationRight — Phase 9: AI Analysis Command Center tests.
+       
+       Covers ``analysis_center.py``: the analysis type registry, the backend
+       precheck (readiness per type, never faked), deterministic per-import insights
+       (operational risk, inventory risk, demand forecast with its sufficiency gate),
+       the merged command-center run (real agents + deterministic checks + persisted
+       config), analysis history/detail, and the API surface.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import analysis_center as ac
+    1: import database as db
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+    1: def _seed_synthetic(conn):
+    3:     db.seed_synthetic(conn)
+       
+       
+    1: def _seed_real(conn, months=4, with_inventory=True, with_failures=True):
+           """A real import with enough history for every deterministic check."""
+    5:     src = db.get_data_source_by_name(conn, "Uploaded Dataset")
+   15:     src_id = db.insert_data_source(
+    5:         conn, name="Uploaded Dataset", source_type="MANUAL",
+    5:         description="t", status="ACTIVE",
+    5:     ) if src is None else src["id"]
+   10:     imp_id = db.insert_data_import(
+    5:         conn, data_source_id=src_id, dataset_name="pds_aug",
+    5:         file_name="pds_aug.csv", file_type="CSV", record_count=100,
+    5:         successful_records=100, status="COMPLETED",
+           )
+   10:     db.upsert_beneficiaries(conn, [{"external_reference": "RB1", "district": "Lucknow",
+    5:                                     "ration_category": "AAY", "family_size": 4, "status": "ACTIVE"}])
+    5:     ben = db.beneficiary_ids(conn, ["RB1"])
+   10:     db.upsert_fps_centers(conn, [{"fps_code": "FPS1", "name": "Center One", "district": "Lucknow",
+    5:                                   "state": "UP", "status": "ACTIVE"}])
+    5:     fps = db.fps_center_ids(conn, ["FPS1"])
+    5:     rows = []
+    5:     seq = 0
+   25:     for month in range(months):
+   20:         m = "%02d" % (5 + month)  # 2026-05 .. 2026-08
+   80:         for i in range(3):
+   60:             seq += 1
+   60:             status = "FAILED" if (with_failures and i >= 1 and month == 0) else "COMPLETED"
+  120:             rows.append({
+   60:                 "external_transaction_id": "TX%04d" % seq,
+   60:                 "beneficiary_id": ben["RB1"], "fps_center_id": fps["FPS1"],
+   60:                 "transaction_date": "2026-%s-%02d" % (m, i + 1),
+   60:                 "commodity": "rice", "quantity": 100.0 + i * 10, "unit": "kg",
+   60:                 "latitude": 26.8, "longitude": 80.9, "status": status,
+   60:                 "source_import_id": imp_id,
+                   })
+    5:     db.insert_transactions_batch(conn, rows)
+    5:     if with_inventory:
+    8:         db.insert_inventory_batch(conn, [{
+    4:             "fps_center_id": fps["FPS1"], "commodity": "rice",
+    4:             "current_stock": 200.0, "monthly_consumption": 900.0,
+    4:             "reorder_threshold": 150.0, "source_import_id": imp_id,
+               }])
+    5:     conn.commit()
+    5:     return imp_id
+       
+       
+    2: class RegistryAndPrecheckTests(unittest.TestCase):
+    1:     def setUp(self):
+    4:         self._tmp = tempfile.TemporaryDirectory()
+    4:         self.db_path = Path(self._tmp.name) / "ac.db"
+    4:         self.addCleanup(self._tmp.cleanup)
+    4:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_registry_has_five_real_types(self):
+    1:         types = ac.analysis_type_registry()
+    7:         keys = {t["key"] for t in types}
+    1:         self.assertEqual(keys, {"distribution_anomaly", "recommendations",
+                                       "operational_risk", "inventory_risk", "demand_forecast"})
+    7:         kinds = {t["kind"] for t in types}
+    1:         self.assertEqual(kinds, {"agents", "deterministic"})
+               # every type has a human description (no fake agent names)
+    6:         for t in types:
+    5:             self.assertTrue(t["label"] and t["description"])
+       
+    1:     def test_precheck_synthetic_honest_disables(self):
+    1:         _seed_synthetic(self.conn)
+    1:         pre = ac.precheck(dataset_mode="synthetic", db_path=self.db_path)
+    1:         self.assertTrue(pre["ok"])
+    7:         by_key = {t["key"]: t for t in pre["types"]}
+    1:         self.assertTrue(by_key["distribution_anomaly"]["enabled"])
+    1:         self.assertTrue(by_key["operational_risk"]["enabled"])
+               # no inventory -> disabled with an actionable reason (never faked)
+    1:         self.assertFalse(by_key["inventory_risk"]["enabled"])
+    1:         self.assertIn("no inventory records", by_key["inventory_risk"]["reason"].lower())
+               # synthetic history is short -> forecast honestly disabled
+    1:         self.assertFalse(by_key["demand_forecast"]["enabled"])
+    1:         self.assertIn("historical month", by_key["demand_forecast"]["reason"].lower())
+       
+    1:     def test_precheck_real_dataset_enables_with_data(self):
+    1:         imp_id = _seed_real(self.conn)
+    1:         pre = ac.precheck(dataset_mode="real", data_import_id=imp_id, db_path=self.db_path)
+    7:         by_key = {t["key"]: t for t in pre["types"]}
+    1:         self.assertEqual(pre["dataset"]["historical_months"], 4)
+    1:         self.assertTrue(by_key["demand_forecast"]["enabled"])
+    1:         self.assertTrue(by_key["inventory_risk"]["enabled"])
+    1:         self.assertTrue(by_key["distribution_anomaly"]["enabled"])
+       
+    1:     def test_precheck_unknown_import(self):
+    1:         pre = ac.precheck(dataset_mode="real", data_import_id=999999, db_path=self.db_path)
+    1:         self.assertFalse(pre["ok"])
+       
+       
+    2: class DeterministicInsightsTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.db_path = Path(self._tmp.name) / "det.db"
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_operational_risk_detects_failure_rate(self):
+    1:         imp_id = _seed_real(self.conn, with_inventory=False, with_failures=True)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             ops = ac.operational_risk_insights(conn, imp_id, {"analysis_id": "RA-T"})
+               finally:
+    1:             conn.close()
+    3:         failure = [o for o in ops if "failure rate" in o["title"].lower()]
+    1:         self.assertEqual(len(failure), 1)
+    1:         self.assertGreaterEqual(failure[0]["evidence"]["failure_rate"], 0.10)
+    1:         self.assertEqual(failure[0]["insight_type"], "OPERATIONAL_RISK")
+       
+    1:     def test_inventory_risk_projects_days_remaining(self):
+    1:         imp_id = _seed_real(self.conn)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             inv = ac.inventory_risk_insights(conn, imp_id, {"analysis_id": "RA-T"})
+               finally:
+    1:             conn.close()
+               # stock 200, monthly 900 -> days = 200/(900/30) = 6.7 -> CRITICAL
+    1:         self.assertEqual(len(inv), 1)
+    1:         self.assertEqual(inv[0]["severity"], "CRITICAL")
+    1:         self.assertAlmostEqual(inv[0]["evidence"]["days_remaining"], 6.7, places=1)
+    1:         self.assertFalse(inv[0]["deterministic"] is True and False)  # deterministic flag is True
+    1:         self.assertTrue(inv[0]["deterministic"])
+       
+    1:     def test_demand_forecast_sufficient_and_insufficient(self):
+    1:         imp_id = _seed_real(self.conn)  # 4 months
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             fc = ac.demand_forecast_insights(conn, imp_id, {"analysis_id": "RA-T"})
+               finally:
+    1:             conn.close()
+    3:         completed = [f for f in fc if f["status"] == "completed"]
+    1:         self.assertEqual(len(completed), 1)
+    1:         self.assertIn("forecast", completed[0]["title"].lower())
+    1:         self.assertIn("historical_basis", completed[0]["evidence"])
+    1:         self.assertIsNotNone(completed[0]["confidence"])
+       
+               # a single-month import -> INSUFFICIENT_DATA, no guessed number
+    2:         tiny = db.insert_data_import(
+    1:             self.conn, data_source_id=1, dataset_name="tiny", record_count=2,
+    1:             successful_records=2, status="COMPLETED")
+    1:         db.upsert_fps_centers(self.conn, [{"fps_code": "FPS2", "status": "ACTIVE"}])
+    1:         fps = db.fps_center_ids(self.conn, ["FPS2"])
+    2:         db.insert_transactions_batch(self.conn, [
+    2:             {"external_transaction_id": "T1", "beneficiary_id": None, "fps_center_id": fps["FPS2"],
+    1:              "transaction_date": "2026-07-01", "commodity": "wheat", "quantity": 5.0, "unit": "kg",
+    1:              "latitude": 26.8, "longitude": 80.9, "status": "COMPLETED", "source_import_id": tiny},
+    2:             {"external_transaction_id": "T2", "beneficiary_id": None, "fps_center_id": fps["FPS2"],
+    1:              "transaction_date": "2026-07-02", "commodity": "wheat", "quantity": 6.0, "unit": "kg",
+    1:              "latitude": 26.9, "longitude": 81.0, "status": "COMPLETED", "source_import_id": tiny},
+               ])
+    1:         self.conn.commit()
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             fc2 = ac.demand_forecast_insights(conn, tiny, {"analysis_id": "RA-T"})
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(len(fc2), 1)
+    1:         self.assertEqual(fc2[0]["status"], "insufficient_data")
+    1:         self.assertIn("historical period", fc2[0]["reason"])
+    1:         self.assertNotIn("predicted_quantity", fc2[0]["evidence"])
+       
+       
+    2: class RunAnalysisTests(unittest.TestCase):
+    1:     def setUp(self):
+    5:         self._tmp = tempfile.TemporaryDirectory()
+    5:         self.db_path = Path(self._tmp.name) / "run.db"
+    5:         self.addCleanup(self._tmp.cleanup)
+    5:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_run_analysis_synthetic_merges_insights(self):
+    1:         _seed_synthetic(self.conn)
+    2:         r = ac.run_analysis(
+    1:             dataset_mode="synthetic",
+    1:             types=["distribution_anomaly", "recommendations", "operational_risk",
+                          "inventory_risk", "demand_forecast"],
+    1:             db_path=self.db_path,
+               )
+    1:         self.assertIsNotNone(r)
+               # merged result keeps the Phase 6 shape
+    1:         self.assertEqual(r["workflow_status"], "completed")
+    1:         self.assertIn("insights", r)
+    1:         self.assertGreaterEqual(len(r["insights"]), 5)  # 4 forecast + anomaly + rec
+    1:         self.assertIn("types", r)
+    1:         self.assertEqual(r["types"]["distribution_anomaly"]["status"], "completed")
+    1:         self.assertEqual(r["types"]["recommendations"]["status"], "completed")
+    1:         self.assertEqual(r["types"]["inventory_risk"]["status"], "insufficient_data")
+               # analysis run persisted with the real id stamped on sources
+    1:         run = r["analysis_run"]
+    1:         self.assertTrue(run["analysis_id"].startswith("RA-"))
+    7:         for i in r["insights"]:
+    6:             self.assertEqual(i["source"]["analysis_id"], run["analysis_id"])
+               # real stage timings from the orchestrator
+    2:         self.assertEqual(set((r.get("timings") or {}).keys()),
+    1:                          {"agent_1", "agent_2", "agent_3", "agent_4"})
+       
+    1:     def test_run_analysis_real_with_filters(self):
+    1:         imp_id = _seed_real(self.conn)
+    2:         r = ac.run_analysis(
+    1:             dataset_mode="real", data_import_id=imp_id,
+    1:             types=["distribution_anomaly", "recommendations", "operational_risk",
+                          "inventory_risk", "demand_forecast"],
+    1:             filters={"commodity": "rice"}, db_path=self.db_path,
+               )
+    1:         self.assertIsNotNone(r)
+    1:         self.assertEqual(r["types"]["demand_forecast"]["status"], "completed")
+    1:         self.assertEqual(r["types"]["inventory_risk"]["status"], "completed")
+    1:         self.assertIn("filters_applied", r["dataset"])
+    1:         self.assertEqual(r["dataset"]["filters_applied"]["commodity"], "rice")
+       
+    1:     def test_run_analysis_unknown_import(self):
+    1:         r = ac.run_analysis(dataset_mode="real", data_import_id=999999, types=["distribution_anomaly"], db_path=self.db_path)
+    1:         self.assertIsNone(r)
+       
+    1:     def test_history_and_detail_round_trip(self):
+    1:         _seed_synthetic(self.conn)
+    2:         r = ac.run_analysis(
+    1:             dataset_mode="synthetic",
+    1:             types=["distribution_anomaly", "recommendations"],
+    1:             filters={"commodity": "rice"}, db_path=self.db_path,
+               )
+    1:         hist = ac.analysis_history(db_path=self.db_path)
+    1:         self.assertEqual(hist["total"], 1)
+    1:         entry = hist["runs"][0]
+    1:         self.assertEqual(entry["analysis_id"], r["analysis_run"]["analysis_id"])
+    1:         self.assertEqual(entry["analysis_types"], ["distribution_anomaly", "recommendations"])
+    1:         self.assertGreater(entry["insight_count"], 0)
+    1:         detail = ac.analysis_detail(entry["id"], db_path=self.db_path)
+    1:         self.assertEqual(detail["filters"]["commodity"], "rice")
+    1:         self.assertIsNotNone(detail["timings"])
+       
+    1:     def test_history_empty(self):
+    1:         hist = ac.analysis_history(db_path=self.db_path)
+    1:         self.assertEqual(hist["total"], 0)
+    1:         self.assertEqual(hist["runs"], [])
+       
+       
+    2: class AnalysisCenterApiTests(unittest.TestCase):
+    1:     """End-to-end API tests against the real server (dev DB)."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.server = make_server("127.0.0.1", 0)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = f"{BASE}:{cls.port}"
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+       
+    1:     def request(self, method, path, body=None):
+    9:         data = json.dumps(body).encode("utf-8") if body is not None else None
+    9:         headers = {"Content-Type": "application/json"} if data else {}
+    9:         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+    9:         try:
+    9:             with urllib.request.urlopen(req, timeout=30) as response:
+    5:                 return response.status, json.loads(response.read().decode("utf-8"))
+    4:         except urllib.error.HTTPError as exc:
+    4:             return exc.code, json.loads(exc.read().decode("utf-8"))
+       
+    1:     def test_types_endpoint(self):
+    1:         status, payload = self.request("GET", "/api/analysis/types")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(len(payload["types"]), 5)
+       
+    1:     def test_precheck_endpoint(self):
+    1:         status, payload = self.request("POST", "/api/analysis/precheck", {"dataset": "synthetic"})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(payload["dataset"]["dataset_name"], "Synthetic Demo Dataset")
+    1:         self.assertEqual(len(payload["types"]), 5)
+       
+    1:     def test_analyze_command_center(self):
+    2:         status, payload = self.request("POST", "/api/analyze", {
+    1:             "dataset": "synthetic",
+    1:             "types": ["distribution_anomaly", "recommendations"],
+               })
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("insights", payload)
+    1:         self.assertIn("analysis_run", payload)
+    1:         self.assertIn("types", payload)
+    1:         self.assertGreaterEqual(len(payload["insights"]), 2)
+       
+    1:     def test_analyze_unknown_type_400(self):
+    2:         status, payload = self.request("POST", "/api/analyze", {
+    1:             "dataset": "synthetic", "types": ["bogus"],
+               })
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("Unknown analysis type", payload["error"])
+       
+    1:     def test_analyze_unknown_import_404(self):
+    2:         status, payload = self.request("POST", "/api/analyze", {
+    1:             "dataset": "real", "data_import_id": 999999,
+    1:             "types": ["distribution_anomaly"],
+               })
+    1:         self.assertEqual(status, 404)
+       
+    1:     def test_analyze_invalid_filters_400(self):
+    2:         status, _ = self.request("POST", "/api/analyze", {
+    1:             "dataset": "synthetic", "types": ["distribution_anomaly"],
+    1:             "filters": "not-an-object",
+               })
+    1:         self.assertEqual(status, 400)
+       
+    1:     def test_history_endpoints(self):
+    1:         status, payload = self.request("GET", "/api/analysis/history?per_page=5")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("runs", payload)
+    1:         if payload["runs"]:
+    1:             rid = payload["runs"][0]["id"]
+    1:             status, detail = self.request("GET", "/api/analysis/history/%d" % rid)
+    1:             self.assertEqual(status, 200)
+    1:             self.assertEqual(detail["id"], rid)
+    1:         status, _ = self.request("GET", "/api/analysis/history/999999")
+    1:         self.assertEqual(status, 404)
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

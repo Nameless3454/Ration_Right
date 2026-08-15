@@ -1,0 +1,2099 @@
+    1: """RationRight — real-data database foundation (Phase 2).
+       
+       Prepares RationAI's data layer so real PDS/ration datasets can be imported in
+       later phases. This phase deliberately does NOT add CSV upload, government API
+       adapters, or UI changes — it only establishes the normalized schema, its
+       relationships, and a seed path for the existing synthetic dataset.
+       
+       Technology decision
+       -------------------
+       The project is strictly standard-library Python with no third-party
+       dependencies and no PostgreSQL server configured anywhere. The documented
+       architecture rule is "use the simplest framework that supports tools,
+       structured outputs, testing, independent execution, and integration", so the
+       database is the Python stdlib ``sqlite3`` module. A single SQLite file
+       (``data/rationright.db`` by default) needs no service, no ORM dependency, and
+       no credentials, matching every other component of this codebase. PostgreSQL
+       was not chosen because nothing is configured for it and introducing a service
+       would violate the MVP's zero-dependency rule. The repository functions below
+       are the only place SQL lives, so swapping to PostgreSQL later (if ever
+       required) is a contained change.
+       
+       Normalized internal schema
+       --------------------------
+       External datasets may use different column names (``fps_id`` vs ``fps_code``,
+       ``district_name`` vs ``district``). We never create a table per dataset: the
+       database stores ONE normalized schema and the future ingestion layer maps
+       external columns into it (``database.py`` functions are the target).
+       
+       Models (all created here because no database existed before this phase):
+           data_sources         — where data came from (API/CSV/XLSX/JSON/...)
+           data_imports         — one row per import operation (dataset provenance)
+           beneficiaries        — non-sensitive beneficiary records (IDs only)
+           fps_centers          — Fair Price Shops / distribution centers
+           ration_transactions  — distribution transactions, traceable to an import
+           inventory            — stock levels per center/commodity
+           ai_insights          — structured AI analysis results, traceable to an import
+       
+       Relationships (foreign keys):
+           data_sources 1─N data_imports 1─N ration_transactions
+           data_imports 1─N ai_insights
+           data_imports 1─N inventory
+           beneficiaries 1─N ration_transactions
+           fps_centers  1─N ration_transactions
+           fps_centers  1─N inventory
+       
+       Agent-contract compatibility
+       ----------------------------
+       ``ration_transactions`` stores ``latitude``/``longitude`` (nullable) even
+       though the Phase 2 spec did not list them: the existing Agent 1 / Agent 2
+       contracts compute time difference and haversine distance from transaction
+       records, so the normalized table must be able to reproduce the exact
+       transaction objects the agents consume. ``as_agent_transaction()`` /
+       ``get_transactions_for_agent()`` return rows in the documented 7-field
+       transaction shape (plus coordinates), which is the reuse point where the
+       agents plug in during the real-data phases.
+       
+       Privacy
+       -------
+       No Aadhaar numbers, biometrics, phone numbers, passwords, or names are stored.
+       Beneficiaries are external references (e.g. ``BEN001``) only.
+       
+       Usage::
+       
+           from database import open_db, seed_synthetic
+           conn = open_db()                 # creates data/rationright.db + schema
+           seed_synthetic(conn)             # import the Phase 1 synthetic dataset
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import sqlite3
+    1: from datetime import datetime, timedelta, timezone
+    1: from pathlib import Path
+    1: from typing import Optional
+       
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+       
+    1: PROJECT_ROOT = Path(__file__).resolve().parent
+    1: DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "rationright.db"
+       
+       # ---------------------------------------------------------------------------
+       # Enumerations — single source of truth, plain string constants (the project
+       # convention used by agents/pattern_config.py). Never hard-code these values
+       # elsewhere; import them.
+       # ---------------------------------------------------------------------------
+       
+    1: DATA_SOURCE_TYPES = ("API", "CSV", "XLSX", "JSON", "GOVERNMENT_DATASET", "MANUAL")
+    1: DATA_SOURCE_STATUSES = ("ACTIVE", "INACTIVE", "ERROR", "SYNCING")
+    1: DATA_IMPORT_STATUSES = ("PENDING", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED")
+    1: TRANSACTION_STATUSES = ("COMPLETED", "PENDING", "FAILED", "CANCELLED")
+    1: AI_INSIGHT_TYPES = (
+           "DISTRIBUTION_ANOMALY",
+           "INVENTORY_RISK",
+           "DEMAND_FORECAST",
+           "BENEFICIARY_ANOMALY",
+           "OPERATIONAL_RISK",
+           "RECOMMENDATION",
+       )
+    1: SEVERITY_LEVELS = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+    1: BENEFICIARY_STATUSES = ("ACTIVE", "INACTIVE")
+    1: FPS_CENTER_STATUSES = ("ACTIVE", "INACTIVE")
+    1: DEFAULT_TRANSACTION_UNIT = "kg"
+       
+       # ---------------------------------------------------------------------------
+       # Schema
+       # ---------------------------------------------------------------------------
+       
+    1: SCHEMA_SQL = """
+       CREATE TABLE IF NOT EXISTS data_sources (
+           id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+           name                    TEXT NOT NULL UNIQUE,
+           type                    TEXT NOT NULL CHECK (type IN ('API','CSV','XLSX','JSON','GOVERNMENT_DATASET','MANUAL')),
+           description             TEXT,
+           status                  TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','INACTIVE','ERROR','SYNCING')),
+           base_url                TEXT,
+           last_sync_at            TEXT,
+           last_successful_sync_at TEXT,
+           last_error              TEXT,
+           created_at              TEXT NOT NULL,
+           updated_at              TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS data_imports (
+           id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+           data_source_id     INTEGER NOT NULL REFERENCES data_sources(id) ON DELETE CASCADE,
+           dataset_name       TEXT NOT NULL,
+           file_name          TEXT,
+           file_type          TEXT,
+           file_hash          TEXT,
+           record_count       INTEGER NOT NULL DEFAULT 0,
+           successful_records INTEGER NOT NULL DEFAULT 0,
+           failed_records     INTEGER NOT NULL DEFAULT 0,
+           duplicate_records  INTEGER NOT NULL DEFAULT 0,
+           warnings_count     INTEGER NOT NULL DEFAULT 0,
+           status             TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','PROCESSING','COMPLETED','PARTIAL','FAILED')),
+           error_summary      TEXT,
+           started_at         TEXT,
+           completed_at       TEXT,
+           created_at         TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS beneficiaries (
+           id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+           external_reference TEXT NOT NULL UNIQUE,
+           state              TEXT,
+           district           TEXT,
+           block              TEXT,
+           ration_category    TEXT,
+           family_size        INTEGER,
+           status             TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','INACTIVE')),
+           created_at         TEXT NOT NULL,
+           updated_at         TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS fps_centers (
+           id          INTEGER PRIMARY KEY AUTOINCREMENT,
+           fps_code    TEXT NOT NULL UNIQUE,
+           name        TEXT,
+           state       TEXT,
+           district    TEXT,
+           block       TEXT,
+           location    TEXT,
+           latitude    REAL,
+           longitude   REAL,
+           capacity    REAL,
+           status      TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','INACTIVE')),
+           created_at  TEXT NOT NULL,
+           updated_at  TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS ration_transactions (
+           id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+           external_transaction_id TEXT NOT NULL UNIQUE,
+           beneficiary_id         INTEGER REFERENCES beneficiaries(id) ON DELETE SET NULL,
+           fps_center_id          INTEGER REFERENCES fps_centers(id) ON DELETE SET NULL,
+           transaction_date       TEXT NOT NULL,
+           commodity              TEXT NOT NULL,
+           quantity               REAL NOT NULL CHECK (quantity > 0),
+           unit                   TEXT NOT NULL DEFAULT 'kg',
+           latitude               REAL,
+           longitude              REAL,
+           status                 TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED','PENDING','FAILED','CANCELLED')),
+           source_import_id       INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           created_at             TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS inventory (
+           id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+           fps_center_id      INTEGER REFERENCES fps_centers(id) ON DELETE SET NULL,
+           commodity          TEXT NOT NULL,
+           current_stock      REAL NOT NULL,
+           monthly_consumption REAL,
+           reorder_threshold  REAL,
+           last_updated       TEXT,
+           source_import_id   INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           created_at         TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS ai_insights (
+           id               INTEGER PRIMARY KEY AUTOINCREMENT,
+           insight_type     TEXT NOT NULL CHECK (insight_type IN ('DISTRIBUTION_ANOMALY','INVENTORY_RISK','DEMAND_FORECAST','BENEFICIARY_ANOMALY','OPERATIONAL_RISK','RECOMMENDATION')),
+           severity         TEXT NOT NULL CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+           title            TEXT NOT NULL,
+           description      TEXT,
+           entity_type      TEXT,
+           entity_id        TEXT,
+           confidence       REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+           recommendation   TEXT,
+           evidence         TEXT,
+           analysis_id      TEXT,
+           source_import_id INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           created_at       TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS analysis_runs (
+           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+           analysis_id    TEXT NOT NULL UNIQUE,
+           data_import_id INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           dataset_mode   TEXT NOT NULL DEFAULT 'synthetic' CHECK (dataset_mode IN ('synthetic','real')),
+           status         TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED','FAILED','INSUFFICIENT_DATA')),
+           anomaly_count  INTEGER NOT NULL DEFAULT 0,
+           finding_count  INTEGER NOT NULL DEFAULT 0,
+           case_count     INTEGER NOT NULL DEFAULT 0,
+           alert_count    INTEGER NOT NULL DEFAULT 0,
+           insight_count  INTEGER NOT NULL DEFAULT 0,
+           analysis_types TEXT,
+           filters        TEXT,
+           timings        TEXT,
+           duration_ms    INTEGER,
+           summary        TEXT,
+           error          TEXT,
+           created_at     TEXT NOT NULL
+       );
+       
+       CREATE INDEX IF NOT EXISTS idx_imports_source      ON data_imports(data_source_id);
+       CREATE INDEX IF NOT EXISTS idx_tx_beneficiary      ON ration_transactions(beneficiary_id);
+       CREATE INDEX IF NOT EXISTS idx_tx_center           ON ration_transactions(fps_center_id);
+       CREATE INDEX IF NOT EXISTS idx_tx_import           ON ration_transactions(source_import_id);
+       CREATE INDEX IF NOT EXISTS idx_tx_date             ON ration_transactions(transaction_date);
+       CREATE INDEX IF NOT EXISTS idx_tx_commodity        ON ration_transactions(commodity);
+       CREATE INDEX IF NOT EXISTS idx_inventory_center    ON inventory(fps_center_id);
+       CREATE INDEX IF NOT EXISTS idx_inventory_import    ON inventory(source_import_id);
+       CREATE INDEX IF NOT EXISTS idx_insight_import      ON ai_insights(source_import_id);
+       CREATE INDEX IF NOT EXISTS idx_insight_entity      ON ai_insights(entity_type, entity_id);
+       CREATE INDEX IF NOT EXISTS idx_analysis_import     ON analysis_runs(data_import_id);
+       
+       CREATE TABLE IF NOT EXISTS scenarios (
+           id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+           scenario_id        TEXT NOT NULL UNIQUE,
+           data_import_id     INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           entity_type        TEXT,
+           entity_id          TEXT,
+           commodity          TEXT,
+           scenario_type      TEXT NOT NULL,
+           parameters         TEXT,
+           results            TEXT,
+           ai_interpretation  TEXT,
+           risk               TEXT,
+           created_at         TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS alert_rules (
+           id            INTEGER PRIMARY KEY AUTOINCREMENT,
+           name          TEXT NOT NULL UNIQUE,
+           rule_type     TEXT NOT NULL,
+           condition     TEXT NOT NULL,
+           description   TEXT,
+           severity      TEXT NOT NULL CHECK (severity IN ('INFO','LOW','MEDIUM','HIGH','CRITICAL')),
+           enabled       INTEGER NOT NULL DEFAULT 1,
+           threshold     REAL,
+           threshold_unit TEXT,
+           scope         TEXT NOT NULL DEFAULT 'GLOBAL',
+           created_at    TEXT NOT NULL,
+           updated_at    TEXT NOT NULL
+       );
+       
+       CREATE TABLE IF NOT EXISTS alerts (
+           id                INTEGER PRIMARY KEY AUTOINCREMENT,
+           alert_id          TEXT NOT NULL UNIQUE,
+           rule_type         TEXT NOT NULL,
+           condition         TEXT NOT NULL,
+           severity          TEXT NOT NULL CHECK (severity IN ('INFO','LOW','MEDIUM','HIGH','CRITICAL')),
+           title             TEXT NOT NULL,
+           description       TEXT,
+           status            TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','ACKNOWLEDGED','RESOLVED','DISMISSED')),
+           entity_type       TEXT,
+           entity_id         TEXT,
+           commodity         TEXT,
+           current_value     REAL,
+           threshold         REAL,
+           evidence          TEXT,
+           ai_explanation    TEXT,
+           recommendation    TEXT,
+           source_id         INTEGER REFERENCES data_sources(id) ON DELETE SET NULL,
+           import_id         INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+           analysis_id       TEXT,
+           created_at        TEXT NOT NULL,
+           last_detected_at  TEXT NOT NULL,
+           acknowledged_at   TEXT,
+           resolved_at       TEXT,
+           dismissed_at      TEXT,
+           dismissed_reason  TEXT
+       );
+       
+       CREATE INDEX IF NOT EXISTS idx_alerts_status   ON alerts(status);
+       CREATE INDEX IF NOT EXISTS idx_alerts_type     ON alerts(rule_type);
+       CREATE INDEX IF NOT EXISTS idx_alerts_entity   ON alerts(entity_type, entity_id);
+       CREATE INDEX IF NOT EXISTS idx_alerts_created  ON alerts(created_at);
+       CREATE INDEX IF NOT EXISTS idx_rules_type      ON alert_rules(rule_type, condition);
+       
+       CREATE TABLE IF NOT EXISTS audit_log (
+           id            INTEGER PRIMARY KEY AUTOINCREMENT,
+           actor         TEXT NOT NULL DEFAULT 'admin',
+           action        TEXT NOT NULL,
+           entity_type   TEXT,
+           entity_id     TEXT,
+           detail        TEXT,
+           request_id    TEXT,
+           created_at    TEXT NOT NULL
+       );
+       
+       CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+       CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+       
+       CREATE TABLE IF NOT EXISTS reports (
+           id            INTEGER PRIMARY KEY AUTOINCREMENT,
+           report_id     TEXT NOT NULL UNIQUE,
+           period_label  TEXT,
+           source_label  TEXT,
+           filters       TEXT,
+           payload       TEXT,
+           status        TEXT NOT NULL DEFAULT 'READY',
+           created_at    TEXT NOT NULL
+       );
+       """
+       
+       # ---------------------------------------------------------------------------
+       # Connection helpers
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def _now_iso() -> str:
+           """Current UTC time as an ISO-8601 string (naive, seconds precision)."""
+ 3815:     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+       
+       
+    1: def connect(db_path=DEFAULT_DB_PATH) -> sqlite3.Connection:
+           """Open a connection with row access and foreign keys enabled."""
+  954:     conn = sqlite3.connect(str(db_path))
+  954:     conn.row_factory = sqlite3.Row
+  954:     conn.execute("PRAGMA foreign_keys = ON")
+  954:     return conn
+       
+       
+    1: def init_db(conn: sqlite3.Connection) -> None:
+           """Create all tables and indexes if they do not already exist.
+       
+           Runs lightweight migrations for databases created before a schema change
+           (e.g. the Phase 4 ``file_hash`` column on data_imports) so an existing
+           ``data/rationright.db`` upgrades in place instead of being rebuilt.
+           """
+  955:     conn.executescript(SCHEMA_SQL)
+18145:     run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(analysis_runs)")}
+ 5730:     for column, ddl in (
+               ("insight_count", "ALTER TABLE analysis_runs ADD COLUMN insight_count INTEGER NOT NULL DEFAULT 0"),
+               ("analysis_types", "ALTER TABLE analysis_runs ADD COLUMN analysis_types TEXT"),
+               ("filters", "ALTER TABLE analysis_runs ADD COLUMN filters TEXT"),
+               ("timings", "ALTER TABLE analysis_runs ADD COLUMN timings TEXT"),
+               ("duration_ms", "ALTER TABLE analysis_runs ADD COLUMN duration_ms INTEGER"),
+           ):
+ 4775:         if column not in run_columns:
+                   conn.execute(ddl)
+14325:     insight_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_insights)")}
+  955:     if "evidence" not in insight_columns:
+               conn.execute("ALTER TABLE ai_insights ADD COLUMN evidence TEXT")
+  955:     if "analysis_id" not in insight_columns:
+               conn.execute("ALTER TABLE ai_insights ADD COLUMN analysis_id TEXT")
+17190:     columns = {row["name"] for row in conn.execute("PRAGMA table_info(data_imports)")}
+  955:     if "file_hash" not in columns:
+               conn.execute("ALTER TABLE data_imports ADD COLUMN file_hash TEXT")
+  955:     if "warnings_count" not in columns:
+               conn.execute(
+                   "ALTER TABLE data_imports ADD COLUMN warnings_count INTEGER NOT NULL DEFAULT 0"
+               )
+12415:     source_columns = {row["name"] for row in conn.execute("PRAGMA table_info(data_sources)")}
+  955:     if "base_url" not in source_columns:
+               conn.execute("ALTER TABLE data_sources ADD COLUMN base_url TEXT")
+  955:     if "last_successful_sync_at" not in source_columns:
+               conn.execute("ALTER TABLE data_sources ADD COLUMN last_successful_sync_at TEXT")
+  955:     if "last_error" not in source_columns:
+               conn.execute("ALTER TABLE data_sources ADD COLUMN last_error TEXT")
+ 1910:     conn.execute(
+  955:         "CREATE INDEX IF NOT EXISTS idx_imports_hash ON data_imports(file_hash)"
+           )
+  955:     _migrate_data(conn)
+  955:     conn.commit()
+       
+       
+    1: def _migrate_data(conn: sqlite3.Connection) -> None:
+           """Idempotent data migrations for databases seeded before a later phase.
+       
+           Phase 5: legacy imports created before the Phase 4 commodity
+           normalization stored mixed-case commodities (e.g. ``Rice`` vs ``rice``),
+           which would fragment analytics. Normalize existing rows to the canonical
+           lowercase form. Synthetic rows are already lowercase; uploads from
+           Phase 4+ are normalized at import time — this only touches legacy rows.
+           """
+ 1910:     conn.execute(
+  955:         "UPDATE ration_transactions SET commodity = lower(commodity) "
+               "WHERE commodity != lower(commodity) AND commodity IS NOT NULL"
+           )
+       
+       
+    1: def open_db(db_path=DEFAULT_DB_PATH) -> sqlite3.Connection:
+           """Connect to ``db_path`` and ensure the schema exists (creates file/dirs)."""
+  953:     path = Path(db_path)
+  953:     path.parent.mkdir(parents=True, exist_ok=True)
+  953:     conn = connect(path)
+  953:     init_db(conn)
+  953:     return conn
+       
+       
+       # ---------------------------------------------------------------------------
+       # Validation helper
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def _require(value, allowed, field: str) -> None:
+ 3350:     if value not in allowed:
+   16:         raise ValueError(
+    8:             "%s must be one of %s, got %r" % (field, tuple(allowed), value)
+               )
+       
+       
+    1: def _optional_number(value, field: str, low=None, high=None):
+           """Validate an optional numeric field; returns the value (or None)."""
+ 2871:     if value is None:
+   11:         return None
+ 2860:     if isinstance(value, bool) or not isinstance(value, (int, float)):
+               raise ValueError("%s must be a number, got %r" % (field, value))
+ 2860:     if low is not None and value < low:
+               raise ValueError("%s must be >= %s, got %r" % (field, low, value))
+ 2860:     if high is not None and value > high:
+    1:         raise ValueError("%s must be <= %s, got %r" % (field, high, value))
+ 2859:     return value
+       
+       
+       # ---------------------------------------------------------------------------
+       # DataSource
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_data_source(
+           conn: sqlite3.Connection,
+           *,
+           name: str,
+           source_type: str,
+    1:     description: Optional[str] = None,
+    1:     status: str = "ACTIVE",
+    1:     last_sync_at: Optional[str] = None,
+    1:     base_url: Optional[str] = None,
+       ) -> int:
+           """Insert a data source; returns its id. ``name`` must be unique."""
+  366:     if not isinstance(name, str) or not name.strip():
+               raise ValueError("data source name must be a non-empty string")
+  366:     _require(source_type, DATA_SOURCE_TYPES, "data source type")
+  365:     _require(status, DATA_SOURCE_STATUSES, "data source status")
+  364:     now = _now_iso()
+  728:     cur = conn.execute(
+  364:         "INSERT INTO data_sources "
+               "(name, type, description, status, base_url, last_sync_at, created_at, updated_at) "
+               "VALUES (:name, :type, :description, :status, :base_url, :last_sync_at, :created_at, :updated_at)",
+  364:         {
+  364:             "name": name.strip(),
+  364:             "type": source_type,
+  364:             "description": description,
+  364:             "status": status,
+  364:             "base_url": base_url,
+  364:             "last_sync_at": last_sync_at,
+  364:             "created_at": now,
+  364:             "updated_at": now,
+               },
+           )
+  363:     return cur.lastrowid
+       
+       
+    1: def get_data_source_by_name(conn: sqlite3.Connection, name: str) -> Optional[dict]:
+  678:     row = conn.execute(
+  339:         "SELECT * FROM data_sources WHERE name = :name", {"name": name}
+           ).fetchone()
+  339:     return dict(row) if row is not None else None
+       
+       
+    1: def get_data_source(conn: sqlite3.Connection, data_source_id: int) -> Optional[dict]:
+   74:     row = conn.execute(
+   37:         "SELECT * FROM data_sources WHERE id = :id", {"id": data_source_id}
+           ).fetchone()
+   37:     return dict(row) if row is not None else None
+       
+       
+    1: def list_data_sources(conn: sqlite3.Connection) -> list:
+    1:     rows = conn.execute("SELECT * FROM data_sources ORDER BY id").fetchall()
+    4:     return [dict(row) for row in rows]
+       
+       
+    1: def set_data_source_status(
+           conn: sqlite3.Connection, data_source_id: int, status: str
+       ) -> None:
+    2:     _require(status, DATA_SOURCE_STATUSES, "data source status")
+    2:     conn.execute(
+    1:         "UPDATE data_sources SET status = :status, updated_at = :now WHERE id = :id",
+    1:         {"status": status, "now": _now_iso(), "id": data_source_id},
+           )
+       
+       
+    1: def update_data_source_sync(
+           conn: sqlite3.Connection,
+           data_source_id: int,
+           *,
+           status: str,
+    1:     last_sync_at: Optional[str] = None,
+    1:     last_successful_sync_at: Optional[str] = None,
+    1:     last_error: Optional[str] = None,
+       ) -> None:
+           """Record the outcome of a sync attempt on a data source (Phase 7).
+       
+           ``status`` uses the existing conventions (ACTIVE = healthy/connected,
+           ERROR = last sync failed, SYNCING = in progress, INACTIVE = not
+           configured). ``last_sync_at`` records every attempt; the successful
+           timestamp and last error are tracked separately so the UI can show
+           "last successful update" even after a failure.
+           """
+   83:     _require(status, DATA_SOURCE_STATUSES, "data source status")
+  166:     conn.execute(
+   83:         "UPDATE data_sources SET status = :status, "
+               " last_sync_at = COALESCE(:last_sync_at, last_sync_at), "
+               " last_successful_sync_at = COALESCE(:last_successful_sync_at, last_successful_sync_at), "
+               " last_error = :last_error, updated_at = :now "
+               "WHERE id = :id",
+   83:         {
+   83:             "status": status,
+   83:             "last_sync_at": last_sync_at,
+   83:             "last_successful_sync_at": last_successful_sync_at,
+   83:             "last_error": last_error,
+   83:             "now": _now_iso(),
+   83:             "id": data_source_id,
+               },
+           )
+       
+       
+       # ---------------------------------------------------------------------------
+       # DataImport
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_data_import(
+           conn: sqlite3.Connection,
+           *,
+           data_source_id: int,
+           dataset_name: str,
+    1:     file_name: Optional[str] = None,
+    1:     file_type: Optional[str] = None,
+    1:     file_hash: Optional[str] = None,
+    1:     record_count: int = 0,
+    1:     successful_records: int = 0,
+    1:     failed_records: int = 0,
+    1:     duplicate_records: int = 0,
+    1:     warnings_count: int = 0,
+    1:     status: str = "PENDING",
+    1:     error_summary: Optional[str] = None,
+    1:     started_at: Optional[str] = None,
+    1:     completed_at: Optional[str] = None,
+       ) -> int:
+           """Insert one import operation; returns its id. Records provenance for
+           every row imported and every AI insight later derived from this data.
+           ``file_hash`` (SHA-256 of the uploaded bytes) makes repeated imports of
+           the exact same dataset detectable (Phase 4 idempotency)."""
+  239:     if not isinstance(dataset_name, str) or not dataset_name.strip():
+               raise ValueError("dataset_name must be a non-empty string")
+  239:     _require(status, DATA_IMPORT_STATUSES, "data import status")
+ 1186:     for field, value in (
+  238:         ("record_count", record_count),
+  238:         ("successful_records", successful_records),
+  238:         ("failed_records", failed_records),
+  238:         ("duplicate_records", duplicate_records),
+           ):
+  949:         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    1:             raise ValueError("%s must be a non-negative integer" % field)
+  474:     cur = conn.execute(
+  237:         "INSERT INTO data_imports "
+               "(data_source_id, dataset_name, file_name, file_type, file_hash, record_count, "
+               " successful_records, failed_records, duplicate_records, warnings_count, status, "
+               " error_summary, started_at, completed_at, created_at) "
+               "VALUES (:data_source_id, :dataset_name, :file_name, :file_type, :file_hash, :record_count, "
+               " :successful_records, :failed_records, :duplicate_records, :warnings_count, :status, "
+               " :error_summary, :started_at, :completed_at, :created_at)",
+  237:         {
+  237:             "data_source_id": data_source_id,
+  237:             "dataset_name": dataset_name.strip(),
+  237:             "file_name": file_name,
+  237:             "file_type": file_type,
+  237:             "file_hash": file_hash,
+  237:             "record_count": record_count,
+  237:             "successful_records": successful_records,
+  237:             "failed_records": failed_records,
+  237:             "duplicate_records": duplicate_records,
+  237:             "warnings_count": warnings_count,
+  237:             "status": status,
+  237:             "error_summary": error_summary,
+  237:             "started_at": started_at,
+  237:             "completed_at": completed_at,
+  237:             "created_at": _now_iso(),
+               },
+           )
+  237:     return cur.lastrowid
+       
+       
+    1: def get_import_by_hash(conn: sqlite3.Connection, file_hash: str) -> Optional[dict]:
+           """Return the most recent completed/partial import for a file hash, or
+           None. Used to detect repeated uploads of the exact same dataset."""
+  156:     row = conn.execute(
+   78:         "SELECT i.*, s.name AS source_name "
+               "FROM data_imports i JOIN data_sources s ON s.id = i.data_source_id "
+               "WHERE i.file_hash = :hash AND i.status IN ('COMPLETED','PARTIAL') "
+               "ORDER BY i.id DESC LIMIT 1",
+   78:         {"hash": file_hash},
+           ).fetchone()
+   78:     return dict(row) if row is not None else None
+       
+       
+    1: def get_data_import(conn: sqlite3.Connection, import_id: int) -> Optional[dict]:
+   96:     row = conn.execute(
+   48:         "SELECT * FROM data_imports WHERE id = :id", {"id": import_id}
+           ).fetchone()
+   48:     return dict(row) if row is not None else None
+       
+       
+    1: def get_imports_for_source(
+           conn: sqlite3.Connection, data_source_id: int
+       ) -> list:
+    2:     rows = conn.execute(
+    1:         "SELECT * FROM data_imports WHERE data_source_id = :sid ORDER BY id",
+    1:         {"sid": data_source_id},
+           ).fetchall()
+    4:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Beneficiary
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def upsert_beneficiary(
+           conn: sqlite3.Connection,
+           *,
+           external_reference: str,
+    1:     state: Optional[str] = None,
+    1:     district: Optional[str] = None,
+    1:     block: Optional[str] = None,
+    1:     ration_category: Optional[str] = None,
+    1:     family_size: Optional[int] = None,
+    1:     status: str = "ACTIVE",
+       ) -> int:
+           """Insert a beneficiary or update an existing one (same external
+           reference). Returns the internal id. Non-sensitive fields only — never
+           store Aadhaar, biometrics, phones, or passwords."""
+  295:     if not isinstance(external_reference, str) or not external_reference.strip():
+    1:         raise ValueError("external_reference must be a non-empty string")
+  294:     _require(status, BENEFICIARY_STATUSES, "beneficiary status")
+  302:     if family_size is not None and (
+    9:         isinstance(family_size, bool) or not isinstance(family_size, int) or family_size <= 0
+           ):
+    1:         raise ValueError("family_size must be a positive integer or None")
+  292:     now = _now_iso()
+  584:     conn.execute(
+  292:         "INSERT INTO beneficiaries "
+               "(external_reference, state, district, block, ration_category, family_size, status, created_at, updated_at) "
+               "VALUES (:er, :state, :district, :block, :cat, :fs, :status, :now, :now) "
+               "ON CONFLICT(external_reference) DO UPDATE SET "
+               "  state = excluded.state, district = excluded.district, block = excluded.block, "
+               "  ration_category = excluded.ration_category, family_size = excluded.family_size, "
+               "  status = excluded.status, updated_at = excluded.updated_at",
+  292:         {
+  292:             "er": external_reference.strip(),
+  292:             "state": state,
+  292:             "district": district,
+  292:             "block": block,
+  292:             "cat": ration_category,
+  292:             "fs": family_size,
+  292:             "status": status,
+  292:             "now": now,
+               },
+           )
+  584:     row = conn.execute(
+  292:         "SELECT id FROM beneficiaries WHERE external_reference = :er",
+  292:         {"er": external_reference.strip()},
+           ).fetchone()
+  292:     return row["id"]
+       
+       
+    1: def get_beneficiary_by_external_ref(
+           conn: sqlite3.Connection, external_reference: str
+       ) -> Optional[dict]:
+   12:     row = conn.execute(
+    6:         "SELECT * FROM beneficiaries WHERE external_reference = :er",
+    6:         {"er": external_reference},
+           ).fetchone()
+    6:     return dict(row) if row is not None else None
+       
+       
+    1: def list_beneficiaries(conn: sqlite3.Connection) -> list:
+    3:     rows = conn.execute("SELECT * FROM beneficiaries ORDER BY external_reference").fetchall()
+   15:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # FPSCenter
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_fps_center(
+           conn: sqlite3.Connection,
+           *,
+           fps_code: str,
+    1:     name: Optional[str] = None,
+    1:     state: Optional[str] = None,
+    1:     district: Optional[str] = None,
+    1:     block: Optional[str] = None,
+    1:     location: Optional[str] = None,
+    1:     latitude: Optional[float] = None,
+    1:     longitude: Optional[float] = None,
+    1:     capacity: Optional[float] = None,
+    1:     status: str = "ACTIVE",
+       ) -> int:
+           """Insert a Fair Price Shop / distribution center; returns its id."""
+    6:     if not isinstance(fps_code, str) or not fps_code.strip():
+    1:         raise ValueError("fps_code must be a non-empty string")
+    5:     _require(status, FPS_CENTER_STATUSES, "fps center status")
+    5:     _optional_number(latitude, "latitude", low=-90.0, high=90.0)
+    4:     _optional_number(longitude, "longitude", low=-180.0, high=180.0)
+    4:     _optional_number(capacity, "capacity", low=0.0)
+    4:     now = _now_iso()
+    8:     cur = conn.execute(
+    4:         "INSERT INTO fps_centers "
+               "(fps_code, name, state, district, block, location, latitude, longitude, capacity, status, created_at, updated_at) "
+               "VALUES (:code, :name, :state, :district, :block, :location, :lat, :lon, :cap, :status, :now, :now)",
+    4:         {
+    4:             "code": fps_code.strip(),
+    4:             "name": name,
+    4:             "state": state,
+    4:             "district": district,
+    4:             "block": block,
+    4:             "location": location,
+    4:             "lat": latitude,
+    4:             "lon": longitude,
+    4:             "cap": capacity,
+    4:             "status": status,
+    4:             "now": now,
+               },
+           )
+    3:     return cur.lastrowid
+       
+       
+    1: def get_fps_center_by_code(conn: sqlite3.Connection, fps_code: str) -> Optional[dict]:
+    6:     row = conn.execute(
+    3:         "SELECT * FROM fps_centers WHERE fps_code = :code", {"code": fps_code}
+           ).fetchone()
+    3:     return dict(row) if row is not None else None
+       
+       
+    1: def list_fps_centers(conn: sqlite3.Connection) -> list:
+    1:     rows = conn.execute("SELECT * FROM fps_centers ORDER BY fps_code").fetchall()
+    4:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # RationTransaction
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_transaction(
+           conn: sqlite3.Connection,
+           *,
+           external_transaction_id: str,
+    1:     beneficiary_id: Optional[int] = None,
+    1:     fps_center_id: Optional[int] = None,
+           transaction_date: str,
+           commodity: str,
+           quantity: float,
+    1:     unit: str = DEFAULT_TRANSACTION_UNIT,
+    1:     latitude: Optional[float] = None,
+    1:     longitude: Optional[float] = None,
+    1:     status: str = "COMPLETED",
+    1:     source_import_id: Optional[int] = None,
+       ) -> int:
+           """Insert one normalized ration transaction; returns its id.
+       
+           ``external_transaction_id`` must be unique (duplicates raise
+           ``sqlite3.IntegrityError`` — the ingestion layer reports those as
+           duplicate records rather than silently overwriting). ``latitude`` /
+           ``longitude`` are stored so Agent 1/Agent 2 can reproduce their exact
+           input records (``as_agent_transaction``).
+           """
+ 1432:     if not isinstance(external_transaction_id, str) or not external_transaction_id.strip():
+               raise ValueError("external_transaction_id must be a non-empty string")
+ 1432:     if not isinstance(transaction_date, str) or not transaction_date.strip():
+               raise ValueError("transaction_date must be a non-empty string")
+ 1432:     if not isinstance(commodity, str) or not commodity.strip():
+    1:         raise ValueError("commodity must be a non-empty string")
+ 1431:     if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or quantity <= 0:
+    1:         raise ValueError("quantity must be a positive number")
+ 1430:     _require(status, TRANSACTION_STATUSES, "transaction status")
+ 1429:     _optional_number(latitude, "latitude", low=-90.0, high=90.0)
+ 1429:     _optional_number(longitude, "longitude", low=-180.0, high=180.0)
+ 2858:     cur = conn.execute(
+ 1429:         "INSERT INTO ration_transactions "
+               "(external_transaction_id, beneficiary_id, fps_center_id, transaction_date, "
+               " commodity, quantity, unit, latitude, longitude, status, source_import_id, created_at) "
+               "VALUES (:ext, :ben, :fps, :date, :commodity, :qty, :unit, :lat, :lon, :status, :imp, :now)",
+ 1429:         {
+ 1429:             "ext": external_transaction_id.strip(),
+ 1429:             "ben": beneficiary_id,
+ 1429:             "fps": fps_center_id,
+ 1429:             "date": transaction_date,
+ 1429:             "commodity": commodity.strip(),
+ 1429:             "qty": quantity,
+ 1429:             "unit": unit,
+ 1429:             "lat": latitude,
+ 1429:             "lon": longitude,
+ 1429:             "status": status,
+ 1429:             "imp": source_import_id,
+ 1429:             "now": _now_iso(),
+               },
+           )
+ 1428:     return cur.lastrowid
+       
+       
+    1: def as_agent_transaction(row: dict) -> dict:
+           """Convert a normalized transaction row into the documented agent-contract
+           shape (exactly the 7 transaction fields Agent 1/Agent 2 consume, plus the
+           coordinates their calculations need). This is the seam where the existing
+           agents plug into real data."""
+10126:     return {
+10126:         "transaction_id": row["external_transaction_id"],
+10126:         "beneficiary_id": row["beneficiary_external_reference"],
+10126:         "timestamp": row["transaction_date"],
+10126:         "latitude": row["latitude"],
+10126:         "longitude": row["longitude"],
+10126:         "ration_type": row["commodity"],
+10126:         "quantity": row["quantity"],
+           }
+       
+       
+       def get_transactions_for_agent(
+    1:     conn: sqlite3.Connection, import_id: Optional[int] = None
+       ) -> list:
+           """Return all transactions (optionally for one import) in the agent
+           contract shape, joined with beneficiary external references."""
+   19:     if import_id is not None:
+   20:         rows = conn.execute(
+   10:             "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+                   "WHERE t.source_import_id = :imp ORDER BY t.id",
+   10:             {"imp": import_id},
+               ).fetchall()
+           else:
+   18:         rows = conn.execute(
+    9:             "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+                   "FROM ration_transactions t "
+                   "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+                   "ORDER BY t.id"
+               ).fetchall()
+10132:     return [as_agent_transaction(dict(row)) for row in rows]
+       
+       
+    1: def get_transactions_for_import(
+           conn: sqlite3.Connection, import_id: int
+       ) -> list:
+           rows = conn.execute(
+               "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+               "FROM ration_transactions t "
+               "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+               "WHERE t.source_import_id = :imp ORDER BY t.id",
+               {"imp": import_id},
+           ).fetchall()
+           return [dict(row) for row in rows]
+       
+       
+    1: def get_transactions_for_beneficiary(
+           conn: sqlite3.Connection, external_reference: str
+       ) -> list:
+    2:     rows = conn.execute(
+    1:         "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+               "FROM ration_transactions t "
+               "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+               "WHERE b.external_reference = :er ORDER BY t.id",
+    1:         {"er": external_reference},
+           ).fetchall()
+    8:     return [dict(row) for row in rows]
+       
+       
+    1: def get_transaction_by_external_id(
+           conn: sqlite3.Connection, external_transaction_id: str
+       ) -> Optional[dict]:
+    8:     row = conn.execute(
+    4:         "SELECT t.*, b.external_reference AS beneficiary_external_reference "
+               "FROM ration_transactions t "
+               "LEFT JOIN beneficiaries b ON b.id = t.beneficiary_id "
+               "WHERE t.external_transaction_id = :ext",
+    4:         {"ext": external_transaction_id},
+           ).fetchone()
+    4:     return dict(row) if row is not None else None
+       
+       
+       # ---------------------------------------------------------------------------
+       # Inventory
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_inventory(
+           conn: sqlite3.Connection,
+           *,
+    1:     fps_center_id: Optional[int] = None,
+           commodity: str,
+           current_stock: float,
+    1:     monthly_consumption: Optional[float] = None,
+    1:     reorder_threshold: Optional[float] = None,
+    1:     last_updated: Optional[str] = None,
+    1:     source_import_id: Optional[int] = None,
+       ) -> int:
+           """Insert one inventory record; returns its id."""
+    3:     if not isinstance(commodity, str) or not commodity.strip():
+    1:         raise ValueError("commodity must be a non-empty string")
+    2:     if isinstance(current_stock, bool) or not isinstance(current_stock, (int, float)) or current_stock < 0:
+    1:         raise ValueError("current_stock must be a non-negative number")
+    3:     for field, value in (
+    1:         ("monthly_consumption", monthly_consumption),
+    1:         ("reorder_threshold", reorder_threshold),
+           ):
+    2:         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+                   raise ValueError("%s must be a non-negative number or None" % field)
+    2:     cur = conn.execute(
+    1:         "INSERT INTO inventory "
+               "(fps_center_id, commodity, current_stock, monthly_consumption, reorder_threshold, "
+               " last_updated, source_import_id, created_at) "
+               "VALUES (:fps, :commodity, :stock, :monthly, :threshold, :updated, :imp, :now)",
+    1:         {
+    1:             "fps": fps_center_id,
+    1:             "commodity": commodity.strip(),
+    1:             "stock": current_stock,
+    1:             "monthly": monthly_consumption,
+    1:             "threshold": reorder_threshold,
+    1:             "updated": last_updated,
+    1:             "imp": source_import_id,
+    1:             "now": _now_iso(),
+               },
+           )
+    1:     return cur.lastrowid
+       
+       
+    1: def get_inventory_for_center(
+           conn: sqlite3.Connection, fps_center_id: int
+       ) -> list:
+    4:     rows = conn.execute(
+    2:         "SELECT * FROM inventory WHERE fps_center_id = :fps ORDER BY commodity",
+    2:         {"fps": fps_center_id},
+           ).fetchall()
+    7:     return [dict(row) for row in rows]
+       
+       
+    1: def get_inventory_for_import(
+           conn: sqlite3.Connection, import_id: int
+       ) -> list:
+    2:     rows = conn.execute(
+    1:         "SELECT * FROM inventory WHERE source_import_id = :imp ORDER BY id",
+    1:         {"imp": import_id},
+           ).fetchall()
+    2:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # AIInsight
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_ai_insight(
+           conn: sqlite3.Connection,
+           *,
+           insight_type: str,
+           severity: str,
+           title: str,
+    1:     description: Optional[str] = None,
+    1:     entity_type: Optional[str] = None,
+    1:     entity_id: Optional[str] = None,
+    1:     confidence: Optional[float] = None,
+    1:     recommendation: Optional[str] = None,
+    1:     evidence: Optional[dict] = None,
+    1:     analysis_id: Optional[str] = None,
+    1:     source_import_id: Optional[int] = None,
+       ) -> int:
+           """Insert one structured AI insight; returns its id.
+       
+           Every insight is traceable to the import (dataset) that produced it via
+           ``source_import_id``, plus the analysis run that produced it via
+           ``analysis_id`` (Phase 11 adds these so monitoring can convert an insight
+           into an alert with full lineage: alert <- insight <- analysis <- import).
+           """
+   29:     import json as _json
+       
+   29:     _require(insight_type, AI_INSIGHT_TYPES, "insight type")
+   28:     _require(severity, SEVERITY_LEVELS, "severity")
+   27:     if not isinstance(title, str) or not title.strip():
+               raise ValueError("title must be a non-empty string")
+  111:     if confidence is not None and (
+   21:         isinstance(confidence, bool)
+   21:         or not isinstance(confidence, (int, float))
+   42:         or not (0.0 <= confidence <= 1.0)
+           ):
+    1:         raise ValueError("confidence must be a number in [0, 1] or None")
+   52:     cur = conn.execute(
+   26:         "INSERT INTO ai_insights "
+               "(insight_type, severity, title, description, entity_type, entity_id, "
+               " confidence, recommendation, evidence, analysis_id, source_import_id, created_at) "
+               "VALUES (:type, :severity, :title, :desc, :entity_type, :entity_id, "
+               " :confidence, :recommendation, :evidence, :aid, :imp, :now)",
+   26:         {
+   26:             "type": insight_type,
+   26:             "severity": severity,
+   26:             "title": title,
+   26:             "desc": description,
+   26:             "entity_type": entity_type,
+   26:             "entity_id": entity_id,
+   26:             "confidence": confidence,
+   26:             "recommendation": recommendation,
+   26:             "evidence": _json.dumps(evidence) if evidence else None,
+   26:             "aid": analysis_id,
+   26:             "imp": source_import_id,
+   26:             "now": _now_iso(),
+               },
+           )
+   26:     return cur.lastrowid
+       
+       
+    1: def get_insights_for_import(conn: sqlite3.Connection, import_id: int) -> list:
+    4:     rows = conn.execute(
+    2:         "SELECT * FROM ai_insights WHERE source_import_id = :imp ORDER BY id",
+    2:         {"imp": import_id},
+           ).fetchall()
+    5:     return [dict(row) for row in rows]
+       
+       
+    1: def get_insights_since(
+           conn: sqlite3.Connection,
+           *,
+    1:     insight_type: Optional[str] = None,
+    1:     min_severity: Optional[str] = None,
+    1:     limit: int = 200,
+       ) -> list:
+           """Recent persisted insights, optionally filtered by type/severity
+           (severity order: LOW < MEDIUM < HIGH < CRITICAL). Used by the monitoring
+           engine to convert analysis insights into alerts."""
+   31:     import json as _json
+       
+   31:     where, params = [], {}
+   31:     if insight_type:
+   31:         where.append("insight_type = :itype")
+   31:         params["itype"] = insight_type
+   31:     if min_severity:
+   31:         rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+   31:         cutoff = rank.get(min_severity)
+   31:         if cutoff is not None:
+   31:             where.append("CASE severity WHEN 'LOW' THEN 0 WHEN 'MEDIUM' THEN 1 "
+                                "WHEN 'HIGH' THEN 2 WHEN 'CRITICAL' THEN 3 END >= :rank")
+   31:             params["rank"] = cutoff
+   31:     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+   62:     rows = conn.execute(
+   62:         "SELECT * FROM ai_insights" + where_sql +
+   31:         " ORDER BY id DESC LIMIT :limit",
+   31:         {**params, "limit": limit},
+           ).fetchall()
+   31:     out = []
+   58:     for row in rows:
+   27:         d = dict(row)
+   27:         raw = d.get("evidence")
+   27:         if isinstance(raw, str):
+   27:             try:
+   27:                 d["evidence"] = _json.loads(raw)
+                   except ValueError:
+                       d["evidence"] = None
+   27:         out.append(d)
+   31:     return out
+       
+       
+    1: def get_insights_for_entity(
+           conn: sqlite3.Connection, entity_type: str, entity_id: str
+       ) -> list:
+    2:     rows = conn.execute(
+    1:         "SELECT * FROM ai_insights WHERE entity_type = :t AND entity_id = :id ORDER BY id",
+    1:         {"t": entity_type, "id": entity_id},
+           ).fetchall()
+    3:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # AnalysisRun (Phase 8 — lineage metadata)
+       #
+       # One row per multi-agent workflow run. Lets the Data Pipeline page answer
+       # "which dataset produced this AI insight?" end to end:
+       #   AI insight <- analysis run <- data import <- data source.
+       # The workflow result itself stays in the UI (it is returned in real time);
+       # this table only records durable metadata (counts + status + provenance).
+       # ---------------------------------------------------------------------------
+       
+    1: ANALYSIS_RUN_STATUSES = ("COMPLETED", "FAILED", "INSUFFICIENT_DATA")
+       
+    1: SCENARIO_TYPES = ("DEMAND_CHANGE", "SUPPLY_DELAY", "INVENTORY_CHANGE", "COMBINED")
+       
+       
+    1: def insert_analysis_run(
+           conn: sqlite3.Connection,
+           *,
+           analysis_id: str,
+    1:     data_import_id: Optional[int] = None,
+    1:     dataset_mode: str = "synthetic",
+    1:     status: str = "COMPLETED",
+    1:     anomaly_count: int = 0,
+    1:     finding_count: int = 0,
+    1:     case_count: int = 0,
+    1:     alert_count: int = 0,
+    1:     insight_count: int = 0,
+    1:     analysis_types: Optional[list] = None,
+    1:     filters: Optional[dict] = None,
+    1:     timings: Optional[dict] = None,
+    1:     duration_ms: Optional[int] = None,
+    1:     summary: Optional[str] = None,
+    1:     error: Optional[str] = None,
+       ) -> int:
+           """Record one multi-agent analysis run; returns its id.
+       
+           ``analysis_types`` / ``filters`` / ``timings`` are stored as JSON so the
+           Analysis History page can reproduce each run's configuration (Phase 9).
+           """
+   35:     import json as _json
+       
+   35:     if not isinstance(analysis_id, str) or not analysis_id.strip():
+               raise ValueError("analysis_id must be a non-empty string")
+   35:     _require(dataset_mode, ("synthetic", "real"), "dataset_mode")
+   35:     _require(status, ANALYSIS_RUN_STATUSES, "analysis status")
+  210:     for field, value in (
+   35:         ("anomaly_count", anomaly_count),
+   35:         ("finding_count", finding_count),
+   35:         ("case_count", case_count),
+   35:         ("alert_count", alert_count),
+   35:         ("insight_count", insight_count),
+           ):
+  175:         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                   raise ValueError("%s must be a non-negative integer" % field)
+   70:     conn.execute(
+   35:         "INSERT OR REPLACE INTO analysis_runs "
+               "(analysis_id, data_import_id, dataset_mode, status, anomaly_count, "
+               " finding_count, case_count, alert_count, insight_count, "
+               " analysis_types, filters, timings, duration_ms, summary, error, created_at) "
+               "VALUES (:aid, :imp, :mode, :status, :anomalies, :findings, :cases, "
+               " :alerts, :insights, :types, :filters, :timings, :duration, :summary, "
+               " :error, :now)",
+   35:         {
+   35:             "aid": analysis_id.strip(),
+   35:             "imp": data_import_id,
+   35:             "mode": dataset_mode,
+   35:             "status": status,
+   35:             "anomalies": anomaly_count,
+   35:             "findings": finding_count,
+   35:             "cases": case_count,
+   35:             "alerts": alert_count,
+   35:             "insights": insight_count,
+   35:             "types": _json.dumps(analysis_types) if analysis_types else None,
+   35:             "filters": _json.dumps(filters) if filters else None,
+   35:             "timings": _json.dumps(timings) if timings else None,
+   35:             "duration": duration_ms,
+   35:             "summary": summary,
+   35:             "error": error,
+   35:             "now": _now_iso(),
+               },
+           )
+   70:     row = conn.execute(
+   35:         "SELECT id FROM analysis_runs WHERE analysis_id = :aid",
+   35:         {"aid": analysis_id.strip()},
+           ).fetchone()
+   35:     return row["id"]
+       
+       
+       def get_analysis_runs_for_import(
+    1:     conn: sqlite3.Connection, import_id: Optional[int] = None, limit: int = 20
+       ) -> list:
+           """Recent analysis runs, optionally filtered to one data import."""
+    3:     if import_id is not None:
+    6:         rows = conn.execute(
+    3:             "SELECT * FROM analysis_runs WHERE data_import_id = :imp "
+                   "ORDER BY id DESC LIMIT :limit",
+    3:             {"imp": import_id, "limit": limit},
+               ).fetchall()
+           else:
+               rows = conn.execute(
+                   "SELECT * FROM analysis_runs ORDER BY id DESC LIMIT :limit",
+                   {"limit": limit},
+               ).fetchall()
+    9:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Scenario (Phase 10 — decision-support what-if simulations)
+       #
+       # Stores ONLY simulation metadata/results — a scenario NEVER writes to
+       # inventory, beneficiaries, or transactions. ``parameters`` / ``results`` /
+       # ``ai_interpretation`` are JSON so the Decision Support page can reproduce
+       # any scenario (SIM-YYYY-NNNN) and trace it back to its dataset/import/source.
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_scenario(
+           conn: sqlite3.Connection,
+           *,
+           scenario_id: str,
+    1:     data_import_id: Optional[int] = None,
+    1:     entity_type: Optional[str] = None,
+    1:     entity_id: Optional[str] = None,
+    1:     commodity: Optional[str] = None,
+           scenario_type: str,
+    1:     parameters: Optional[dict] = None,
+    1:     results: Optional[dict] = None,
+    1:     ai_interpretation: Optional[dict] = None,
+    1:     risk: Optional[str] = None,
+       ) -> int:
+           """Record one what-if simulation; returns its id."""
+   26:     import json as _json
+       
+   26:     if not isinstance(scenario_id, str) or not scenario_id.strip():
+               raise ValueError("scenario_id must be a non-empty string")
+   26:     if scenario_type not in SCENARIO_TYPES:
+               _require(scenario_type, SCENARIO_TYPES, "scenario type")
+   52:     conn.execute(
+   26:         "INSERT OR REPLACE INTO scenarios "
+               "(scenario_id, data_import_id, entity_type, entity_id, commodity, "
+               " scenario_type, parameters, results, ai_interpretation, risk, created_at) "
+               "VALUES (:sid, :imp, :etype, :eid, :commodity, :stype, :params, :results, "
+               " :ai, :risk, :now)",
+   26:         {
+   26:             "sid": scenario_id.strip(),
+   26:             "imp": data_import_id,
+   26:             "etype": entity_type,
+   26:             "eid": entity_id,
+   26:             "commodity": commodity,
+   26:             "stype": scenario_type,
+   26:             "params": _json.dumps(parameters) if parameters else None,
+   26:             "results": _json.dumps(results) if results else None,
+   26:             "ai": _json.dumps(ai_interpretation) if ai_interpretation else None,
+   26:             "risk": risk,
+   26:             "now": _now_iso(),
+               },
+           )
+   52:     row = conn.execute(
+   26:         "SELECT id FROM scenarios WHERE scenario_id = :sid", {"sid": scenario_id.strip()}
+           ).fetchone()
+   26:     return row["id"]
+       
+       
+    1: def get_scenarios(conn: sqlite3.Connection, limit: int = 20) -> list:
+           rows = conn.execute(
+               "SELECT * FROM scenarios ORDER BY id DESC LIMIT :limit", {"limit": limit}
+           ).fetchall()
+           return [dict(row) for row in rows]
+       
+       
+    1: def get_scenario(conn: sqlite3.Connection, scenario_id: str):
+           row = conn.execute(
+               "SELECT * FROM scenarios WHERE scenario_id = :sid", {"sid": scenario_id}
+           ).fetchone()
+           return dict(row) if row is not None else None
+       
+       
+    1: def get_scenario_by_id(conn: sqlite3.Connection, scenario_pk: int):
+    4:     row = conn.execute(
+    2:         "SELECT * FROM scenarios WHERE id = :id", {"id": scenario_pk}
+           ).fetchone()
+    2:     return dict(row) if row is not None else None
+       
+       
+       # ---------------------------------------------------------------------------
+       # Alert rules + alerts (Phase 11 — early warning & monitoring)
+       #
+       # One row per deterministic monitoring rule (configurable threshold/enabled)
+       # and one row per detected condition. Alerts carry evidence (JSON), an AI
+       # explanation (JSON, with a deterministic fallback), and lineage links
+       # (source / import / analysis) so every alert can be traced back to data.
+       # ---------------------------------------------------------------------------
+       
+    1: ALERT_TYPES = (
+           "INVENTORY_RISK",
+           "OPERATIONAL_RISK",
+           "DISTRIBUTION_ANOMALY",
+           "DEMAND_SPIKE",
+           "DEMAND_DROP",
+           "SUPPLY_DELAY",
+           "DATA_QUALITY",
+           "DATA_FRESHNESS",
+           "SOURCE_FAILURE",
+       )
+    1: ALERT_STATUSES = ("OPEN", "ACKNOWLEDGED", "RESOLVED", "DISMISSED")
+    1: ALERT_SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+       
+       
+    1: def insert_alert_rule(
+           conn: sqlite3.Connection,
+           *,
+           name: str,
+           rule_type: str,
+           condition: str,
+    1:     description: Optional[str] = None,
+    1:     severity: str = "MEDIUM",
+    1:     enabled: bool = True,
+    1:     threshold: Optional[float] = None,
+    1:     threshold_unit: Optional[str] = None,
+    1:     scope: str = "GLOBAL",
+       ) -> int:
+           """Insert a monitoring rule; returns its id. ``name`` must be unique."""
+           if not isinstance(name, str) or not name.strip():
+               raise ValueError("rule name must be a non-empty string")
+           _require(rule_type, ALERT_TYPES, "alert rule type")
+           _require(severity, ALERT_SEVERITIES, "alert rule severity")
+           now = _now_iso()
+           cur = conn.execute(
+               "INSERT INTO alert_rules "
+               "(name, rule_type, condition, description, severity, enabled, threshold, "
+               " threshold_unit, scope, created_at, updated_at) "
+               "VALUES (:name, :rtype, :cond, :desc, :severity, :enabled, :threshold, "
+               " :unit, :scope, :now, :now)",
+               {
+                   "name": name.strip(),
+                   "rtype": rule_type,
+                   "cond": condition,
+                   "desc": description,
+                   "severity": severity,
+                   "enabled": 1 if enabled else 0,
+                   "threshold": threshold,
+                   "unit": threshold_unit,
+                   "scope": scope,
+                   "now": now,
+               },
+           )
+           return cur.lastrowid
+       
+       
+    1: def seed_alert_rules(conn: sqlite3.Connection, rules: list) -> None:
+           """Idempotently upsert the default rule set (by name)."""
+   31:     now = _now_iso()
+  372:     for rule in rules:
+  682:         conn.execute(
+  341:             "INSERT INTO alert_rules "
+                   "(name, rule_type, condition, description, severity, enabled, threshold, "
+                   " threshold_unit, scope, created_at, updated_at) "
+                   "VALUES (:name, :rtype, :cond, :desc, :severity, :enabled, :threshold, "
+                   " :unit, :scope, :now, :now) "
+                   "ON CONFLICT(name) DO UPDATE SET "
+                   "  description = excluded.description, severity = excluded.severity, "
+                   "  threshold = excluded.threshold, threshold_unit = excluded.threshold_unit, "
+                   "  updated_at = excluded.updated_at",
+  341:             {
+  341:                 "name": rule["name"],
+  341:                 "rtype": rule["rule_type"],
+  341:                 "cond": rule["condition"],
+  341:                 "desc": rule["description"],
+  341:                 "severity": rule["severity"],
+  341:                 "enabled": 1 if rule.get("enabled", True) else 0,
+  341:                 "threshold": rule.get("threshold"),
+  341:                 "unit": rule.get("threshold_unit"),
+  341:                 "scope": rule.get("scope", "GLOBAL"),
+  341:                 "now": now,
+                   },
+               )
+       
+       
+    1: def list_alert_rules(conn: sqlite3.Connection) -> list:
+   72:     rows = conn.execute(
+   36:         "SELECT * FROM alert_rules ORDER BY id"
+           ).fetchall()
+  413:     return [dict(row) for row in rows]
+       
+       
+    1: def get_alert_rule(conn: sqlite3.Connection, rule_id: int) -> Optional[dict]:
+   12:     row = conn.execute(
+    6:         "SELECT * FROM alert_rules WHERE id = :id", {"id": rule_id}
+           ).fetchone()
+    6:     return dict(row) if row is not None else None
+       
+       
+    1: def update_alert_rule(
+           conn: sqlite3.Connection,
+           rule_id: int,
+           *,
+    1:     enabled: Optional[bool] = None,
+    1:     threshold: Optional[float] = None,
+       ) -> None:
+           """Update a rule's enabled flag and/or numeric threshold."""
+    3:     sets, params = [], {}
+    3:     if enabled is not None:
+    2:         sets.append("enabled = :enabled")
+    2:         params["enabled"] = 1 if enabled else 0
+    3:     if threshold is not None:
+    1:         sets.append("threshold = :threshold")
+    1:         params["threshold"] = threshold
+    3:     if not sets:
+               return
+    3:     sets.append("updated_at = :now")
+    3:     params["now"] = _now_iso()
+    3:     params["id"] = rule_id
+    6:     conn.execute(
+    3:         "UPDATE alert_rules SET %s WHERE id = :id" % ", ".join(sets), params
+           )
+       
+       
+    1: def insert_alert(
+           conn: sqlite3.Connection,
+           *,
+           alert_id: str,
+           rule_type: str,
+           condition: str,
+           severity: str,
+           title: str,
+    1:     description: Optional[str] = None,
+    1:     status: str = "OPEN",
+    1:     entity_type: Optional[str] = None,
+    1:     entity_id: Optional[str] = None,
+    1:     commodity: Optional[str] = None,
+    1:     current_value: Optional[float] = None,
+    1:     threshold: Optional[float] = None,
+    1:     evidence: Optional[dict] = None,
+    1:     ai_explanation: Optional[dict] = None,
+    1:     recommendation: Optional[str] = None,
+    1:     source_id: Optional[int] = None,
+    1:     import_id: Optional[int] = None,
+    1:     analysis_id: Optional[str] = None,
+    1:     created_at: Optional[str] = None,
+       ) -> int:
+           """Insert one alert; returns its id."""
+  144:     import json as _json
+       
+  144:     if not isinstance(alert_id, str) or not alert_id.strip():
+               raise ValueError("alert_id must be a non-empty string")
+  144:     _require(rule_type, ALERT_TYPES, "alert type")
+  144:     _require(severity, ALERT_SEVERITIES, "alert severity")
+  144:     _require(status, ALERT_STATUSES, "alert status")
+  144:     if not isinstance(title, str) or not title.strip():
+               raise ValueError("title must be a non-empty string")
+  144:     now = created_at or _now_iso()
+  288:     cur = conn.execute(
+  144:         "INSERT INTO alerts "
+               "(alert_id, rule_type, condition, severity, title, description, status, "
+               " entity_type, entity_id, commodity, current_value, threshold, evidence, "
+               " ai_explanation, recommendation, source_id, import_id, analysis_id, "
+               " created_at, last_detected_at) "
+               "VALUES (:aid, :rtype, :cond, :severity, :title, :desc, :status, "
+               " :etype, :eid, :commodity, :cur, :thr, :evidence, :ai, :rec, "
+               " :sid, :iid, :aid2, :now, :now)",
+  144:         {
+  144:             "aid": alert_id.strip(),
+  144:             "rtype": rule_type,
+  144:             "cond": condition,
+  144:             "severity": severity,
+  144:             "title": title,
+  144:             "desc": description,
+  144:             "status": status,
+  144:             "etype": entity_type,
+  144:             "eid": entity_id,
+  144:             "commodity": commodity,
+  144:             "cur": current_value,
+  144:             "thr": threshold,
+  144:             "evidence": _json.dumps(evidence) if evidence else None,
+  144:             "ai": _json.dumps(ai_explanation) if ai_explanation else None,
+  144:             "rec": recommendation,
+  144:             "sid": source_id,
+  144:             "iid": import_id,
+  144:             "aid2": analysis_id,
+  144:             "now": now,
+               },
+           )
+  144:     return cur.lastrowid
+       
+       
+    1: def get_alert_by_alert_id(conn: sqlite3.Connection, alert_id: str) -> Optional[dict]:
+   30:     row = conn.execute(
+   15:         "SELECT * FROM alerts WHERE alert_id = :aid", {"aid": alert_id}
+           ).fetchone()
+   15:     return dict(row) if row is not None else None
+       
+       
+    1: def get_alert(conn: sqlite3.Connection, alert_pk: int) -> Optional[dict]:
+           row = conn.execute(
+               "SELECT * FROM alerts WHERE id = :id", {"id": alert_pk}
+           ).fetchone()
+           return dict(row) if row is not None else None
+       
+       
+    1: def get_active_alert_for_condition(
+           conn: sqlite3.Connection,
+           rule_type: str,
+           condition: str,
+           entity_type: Optional[str],
+           entity_id: Optional[str],
+           commodity: Optional[str],
+       ) -> Optional[dict]:
+           """The OPEN/ACKNOWLEDGED alert for one condition key, if any (dedup)."""
+  402:     row = conn.execute(
+  201:         "SELECT * FROM alerts WHERE rule_type = :rtype AND condition = :cond "
+               "AND COALESCE(entity_type, '') = COALESCE(:etype, '') "
+               "AND COALESCE(entity_id, '') = COALESCE(:eid, '') "
+               "AND COALESCE(commodity, '') = COALESCE(:commodity, '') "
+               "AND status IN ('OPEN','ACKNOWLEDGED') ORDER BY id DESC LIMIT 1",
+  201:         {
+  201:             "rtype": rule_type, "cond": condition, "etype": entity_type,
+  201:             "eid": entity_id, "commodity": commodity,
+               },
+           ).fetchone()
+  201:     return dict(row) if row is not None else None
+       
+       
+    1: def get_condition_history(
+           conn: sqlite3.Connection,
+           rule_type: str,
+           condition: str,
+           entity_type: Optional[str],
+           entity_id: Optional[str],
+           commodity: Optional[str],
+       ) -> list:
+           """All alerts (any status) for one condition key, newest first."""
+  254:     rows = conn.execute(
+  127:         "SELECT * FROM alerts WHERE rule_type = :rtype AND condition = :cond "
+               "AND COALESCE(entity_type, '') = COALESCE(:etype, '') "
+               "AND COALESCE(entity_id, '') = COALESCE(:eid, '') "
+               "AND COALESCE(commodity, '') = COALESCE(:commodity, '') "
+               "ORDER BY id DESC",
+  127:         {
+  127:             "rtype": rule_type, "cond": condition, "etype": entity_type,
+  127:             "eid": entity_id, "commodity": commodity,
+               },
+           ).fetchall()
+  256:     return [dict(row) for row in rows]
+       
+       
+    1: def list_alerts(
+           conn: sqlite3.Connection,
+           *,
+    1:     q: Optional[str] = None,
+    1:     severity: Optional[str] = None,
+    1:     rule_type: Optional[str] = None,
+    1:     status: Optional[str] = None,
+    1:     days: Optional[int] = None,
+    1:     entity_type: Optional[str] = None,
+    1:     entity_id: Optional[str] = None,
+    1:     commodity: Optional[str] = None,
+    1:     page: int = 1,
+    1:     per_page: int = 20,
+       ) -> dict:
+           """Server-side filtered + searched + paginated alert list."""
+   31:     if isinstance(per_page, bool) or not isinstance(per_page, int) or per_page <= 0:
+               per_page = 20
+   31:     if isinstance(page, bool) or not isinstance(page, int) or page <= 0:
+               page = 1
+   31:     per_page = min(per_page, 200)
+   31:     where, params = [], {}
+   31:     if q:
+    2:         escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    2:         where.append("(a.alert_id LIKE :q ESCAPE '\\' OR a.title LIKE :q ESCAPE '\\' "
+                            "OR a.description LIKE :q ESCAPE '\\' OR COALESCE(a.entity_id, '') LIKE :q ESCAPE '\\' "
+                            "OR COALESCE(a.commodity, '') LIKE :q ESCAPE '\\')")
+    2:         params["q"] = "%" + escaped + "%"
+  217:     for field, column in (
+               ("severity", "a.severity"), ("rule_type", "a.rule_type"),
+               ("status", "a.status"), ("entity_type", "a.entity_type"),
+               ("entity_id", "a.entity_id"), ("commodity", "a.commodity"),
+           ):
+  186:         value = locals().get(field)
+  186:         if value and value != "all":
+   16:             where.append("%s = :%s" % (column, field))
+   16:             params[field] = value
+   31:     if days and days != "all":
+    4:         try:
+    8:             cutoff = (
+    4:                 datetime.now(timezone.utc) - timedelta(days=int(days))
+    4:             ).isoformat(timespec="seconds")
+               except (TypeError, ValueError):
+                   cutoff = None
+    4:         if cutoff:
+    4:             where.append("a.created_at >= :cutoff")
+    4:             params["cutoff"] = cutoff
+   31:     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+   93:     total = conn.execute(
+   31:         "SELECT COUNT(*) AS n FROM alerts a" + where_sql, params
+   31:     ).fetchone()["n"]
+   62:     rows = conn.execute(
+   93:         "SELECT a.*, s.name AS source_name, i.dataset_name "
+               "FROM alerts a LEFT JOIN data_sources s ON s.id = a.source_id "
+               "LEFT JOIN data_imports i ON i.id = a.import_id "
+   62:         + where_sql + " ORDER BY a.last_detected_at DESC, a.id DESC "
+               "LIMIT :limit OFFSET :offset",
+   31:         {**params, "limit": per_page, "offset": (page - 1) * per_page},
+           ).fetchall()
+   31:     return {
+   31:         "total": total,
+   31:         "page": page,
+   31:         "per_page": per_page,
+   31:         "pages": max(1, -(-total // per_page)),
+  210:         "alerts": [_decode_alert(dict(row)) for row in rows],
+           }
+       
+       
+    1: def _decode_alert(row: dict) -> dict:
+           """Decode JSON columns on an alert row into dicts for the API."""
+  148:     import json as _json
+       
+  444:     for field in ("evidence", "ai_explanation"):
+  296:         raw = row.get(field)
+  296:         if isinstance(raw, str):
+  296:             try:
+  296:                 row[field] = _json.loads(raw)
+                   except ValueError:
+                       row[field] = None
+  148:     return row
+       
+       
+    1: def get_open_alert_counts(conn: sqlite3.Connection) -> dict:
+           """Active alert counts by severity (OPEN + ACKNOWLEDGED)."""
+  189:     counts = {sev: 0 for sev in ALERT_SEVERITIES}
+   54:     rows = conn.execute(
+   27:         "SELECT severity, status, COUNT(*) AS n FROM alerts "
+               "WHERE status IN ('OPEN','ACKNOWLEDGED') GROUP BY severity, status"
+           ).fetchall()
+  189:     open_by_sev = {sev: 0 for sev in ALERT_SEVERITIES}
+  189:     ack_by_sev = {sev: 0 for sev in ALERT_SEVERITIES}
+   27:     total_open = total_ack = 0
+  126:     for r in rows:
+   99:         if r["status"] == "OPEN":
+   99:             open_by_sev[r["severity"]] = r["n"]
+   99:             total_open += r["n"]
+               else:
+                   ack_by_sev[r["severity"]] = r["n"]
+                   total_ack += r["n"]
+   27:     return {
+   27:         "open": open_by_sev,
+   27:         "acknowledged": ack_by_sev,
+   27:         "total_open": total_open,
+   27:         "total_acknowledged": total_ack,
+   27:         "total_active": total_open + total_ack,
+           }
+       
+       
+    1: def get_alert_trend(conn: sqlite3.Connection, days: int = 7) -> dict:
+           """Alerts created per day for the last ``days`` days (actual records)."""
+   41:     from datetime import timedelta
+       
+   41:     days = max(1, min(int(days), 90))
+   41:     today = datetime.now(timezone.utc).date()
+   82:     rows = conn.execute(
+   41:         "SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n "
+               "FROM alerts WHERE substr(created_at, 1, 10) >= :start "
+               "GROUP BY day ORDER BY day",
+   41:         {"start": (today - timedelta(days=days - 1)).isoformat()},
+           ).fetchall()
+  108:     by_day = {r["day"]: r["n"] for r in rows}
+   41:     series = []
+  328:     for offset in range(days):
+  287:         day = (today - timedelta(days=days - 1 - offset)).isoformat()
+  287:         series.append({"date": day, "count": by_day.get(day, 0)})
+   82:     return {"days": days, "series": series,
+  369:             "total": sum(item["count"] for item in series)}
+       
+       
+    1: def update_alert_status(
+           conn: sqlite3.Connection,
+           alert_id: str,
+           status: str,
+           *,
+    1:     dismissed_reason: Optional[str] = None,
+       ) -> bool:
+           """Transition one alert's status; returns True when a row changed.
+       
+           OPEN -> ACKNOWLEDGED (records acknowledged_at), OPEN/ACKNOWLEDGED ->
+           RESOLVED (records resolved_at), and -> DISMISSED (records dismissed_at +
+           optional reason). The alert row is never deleted — history is preserved.
+           """
+    7:     _require(status, ALERT_STATUSES, "alert status")
+    7:     row = get_alert_by_alert_id(conn, alert_id)
+    7:     if row is None:
+               return False
+    7:     now = _now_iso()
+    7:     if status == "ACKNOWLEDGED":
+    4:         conn.execute(
+    2:             "UPDATE alerts SET status = 'ACKNOWLEDGED', acknowledged_at = :now "
+    2:             "WHERE id = :id", {"now": now, "id": row["id"]})
+    5:     elif status == "RESOLVED":
+    4:         conn.execute(
+    2:             "UPDATE alerts SET status = 'RESOLVED', resolved_at = :now "
+    2:             "WHERE id = :id", {"now": now, "id": row["id"]})
+    3:     elif status == "DISMISSED":
+    6:         conn.execute(
+    3:             "UPDATE alerts SET status = 'DISMISSED', dismissed_at = :now, "
+                   " dismissed_reason = :reason WHERE id = :id",
+    3:             {"now": now, "reason": dismissed_reason, "id": row["id"]})
+           else:  # re-open (used by tests / recovery)
+               conn.execute(
+                   "UPDATE alerts SET status = 'OPEN' WHERE id = :id", {"id": row["id"]})
+    7:     return True
+       
+       
+       # ---------------------------------------------------------------------------
+       # Intelligence reports (Phase 12 — Executive Command Center)
+       #
+       # One row per generated report. ``payload`` holds the full structured report
+       # (KPIs, risk, trends, insights, alerts, recommendations, quality, lineage) so
+       # history can reproduce any report; reports are never overwritten.
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def insert_report(
+           conn: sqlite3.Connection,
+           *,
+           report_id: str,
+    1:     period_label: Optional[str] = None,
+    1:     source_label: Optional[str] = None,
+    1:     filters: Optional[dict] = None,
+    1:     payload: Optional[dict] = None,
+    1:     status: str = "READY",
+       ) -> int:
+           """Insert one generated report; returns its id."""
+    9:     import json as _json
+       
+    9:     if not isinstance(report_id, str) or not report_id.strip():
+               raise ValueError("report_id must be a non-empty string")
+   18:     cur = conn.execute(
+    9:         "INSERT INTO reports "
+               "(report_id, period_label, source_label, filters, payload, status, created_at) "
+               "VALUES (:rid, :period, :source, :filters, :payload, :status, :now)",
+    9:         {
+    9:             "rid": report_id.strip(),
+    9:             "period": period_label,
+    9:             "source": source_label,
+    9:             "filters": _json.dumps(filters) if filters else None,
+    9:             "payload": _json.dumps(payload) if payload else None,
+    9:             "status": status,
+    9:             "now": _now_iso(),
+               },
+           )
+    9:     return cur.lastrowid
+       
+       
+    1: def list_reports(conn: sqlite3.Connection, limit: int = 50) -> list:
+    6:     rows = conn.execute(
+    3:         "SELECT id, report_id, period_label, source_label, status, created_at "
+    3:         "FROM reports ORDER BY id DESC LIMIT :limit", {"limit": limit}
+           ).fetchall()
+   11:     return [dict(row) for row in rows]
+       
+       
+    1: def get_report_by_report_id(conn: sqlite3.Connection, report_id: str) -> Optional[dict]:
+    4:     import json as _json
+       
+    8:     row = conn.execute(
+    4:         "SELECT * FROM reports WHERE report_id = :rid", {"rid": report_id}
+           ).fetchone()
+    4:     if row is None:
+    2:         return None
+    2:     report = dict(row)
+    6:     for field in ("filters", "payload"):
+    4:         raw = report.get(field)
+    4:         if isinstance(raw, str):
+    4:             try:
+    4:                 report[field] = _json.loads(raw)
+                   except ValueError:
+                       report[field] = None
+    2:     return report
+       
+       
+       # ---------------------------------------------------------------------------
+       # Audit log (Phase 14 — append-only operational trail, never stores secrets)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def record_audit(
+           conn: sqlite3.Connection,
+           *,
+           action: str,
+    1:     actor: str = "admin",
+    1:     entity_type: Optional[str] = None,
+    1:     entity_id: Optional[str] = None,
+    1:     detail: Optional[str] = None,
+    1:     request_id: Optional[str] = None,
+       ) -> int:
+           """Append one audit entry. ``detail`` must never contain secrets; callers
+           pass short human summaries only. Returns the new row id."""
+   28:     if not isinstance(action, str) or not action.strip():
+               raise ValueError("action must be a non-empty string")
+   56:     cur = conn.execute(
+   28:         "INSERT INTO audit_log "
+               "(actor, action, entity_type, entity_id, detail, request_id, created_at) "
+               "VALUES (:actor, :action, :entity_type, :entity_id, :detail, :request_id, :now)",
+   28:         {
+   28:             "actor": (actor or "admin").strip()[:64],
+   28:             "action": action.strip()[:64],
+   28:             "entity_type": (entity_type or "").strip()[:64] or None,
+   28:             "entity_id": (entity_id or "").strip()[:128] or None,
+   28:             "detail": (detail or "").strip()[:512] or None,
+   28:             "request_id": (request_id or "").strip()[:64] or None,
+   28:             "now": _now_iso(),
+               },
+           )
+   28:     return cur.lastrowid
+       
+       
+    1: def list_audit(
+           conn: sqlite3.Connection,
+           *,
+    1:     limit: int = 50,
+    1:     action: Optional[str] = None,
+    1:     entity_type: Optional[str] = None,
+       ) -> list:
+           """Recent audit entries, newest first. Limit is clamped to 1..500."""
+    3:     if isinstance(limit, bool) or not isinstance(limit, int):
+               limit = 50
+    3:     limit = max(1, min(int(limit), 500))
+    3:     sql = "SELECT id, actor, action, entity_type, entity_id, detail, request_id, created_at " \
+                 "FROM audit_log"
+    3:     clauses, params = [], {}
+    3:     if action:
+    1:         clauses.append("action = :action")
+    1:         params["action"] = str(action)[:64]
+    3:     if entity_type:
+               clauses.append("entity_type = :entity_type")
+               params["entity_type"] = str(entity_type)[:64]
+    3:     if clauses:
+    1:         sql += " WHERE " + " AND ".join(clauses)
+    3:     sql += " ORDER BY id DESC LIMIT :limit"
+    3:     params["limit"] = limit
+    3:     rows = conn.execute(sql, params).fetchall()
+    8:     return [dict(row) for row in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Seeding — the existing synthetic dataset
+       # ---------------------------------------------------------------------------
+       
+    1: SYNTHETIC_SOURCE_NAME = "Synthetic Demo Dataset"
+       
+       
+    1: def seed_synthetic(
+    1:     conn: sqlite3.Connection, dataset_path=DEFAULT_DATASET_PATH
+       ) -> dict:
+           """Import the Phase 1 synthetic dataset into the normalized schema.
+       
+           Deterministic and idempotent: running it again resets only the synthetic
+           source's imports/transactions and re-imports them, so the demo database is
+           always in the same state. Beneficiaries are upserted (never deleted — real
+           data may reference them). The synthetic data contains no FPS centers,
+           inventory, or AI insights, so none are created and nothing is invented.
+           """
+   57:     dataset = load_dataset(dataset_path)
+   57:     transactions = dataset["transactions"]
+   57:     metadata = dataset.get("metadata", {})
+   57:     now = _now_iso()
+       
+           # --- reset any previous synthetic import (children first, then import) ---
+   57:     source = get_data_source_by_name(conn, SYNTHETIC_SOURCE_NAME)
+   57:     if source is not None:
+    8:         import_ids = [
+    2:             row["id"]
+    6:             for row in conn.execute(
+    2:                 "SELECT id FROM data_imports WHERE data_source_id = :sid",
+    2:                 {"sid": source["id"]},
+                   ).fetchall()
+               ]
+    4:         for import_id in import_ids:
+    8:             for table in ("ai_insights", "inventory", "ration_transactions"):
+   12:                 conn.execute(
+    6:                     "DELETE FROM %s WHERE source_import_id = :iid" % table,
+    6:                     {"iid": import_id},
+                       )
+    2:             conn.execute("DELETE FROM data_imports WHERE id = :iid", {"iid": import_id})
+    2:         conn.execute("DELETE FROM data_sources WHERE id = :sid", {"sid": source["id"]})
+       
+           # --- data source + import (provenance) ---
+  114:     source_id = insert_data_source(
+   57:         conn,
+   57:         name=SYNTHETIC_SOURCE_NAME,
+   57:         source_type="JSON",
+   57:         description=metadata.get("description"),
+   57:         status="ACTIVE",
+   57:         last_sync_at=now,
+           )
+  114:     import_id = insert_data_import(
+   57:         conn,
+   57:         data_source_id=source_id,
+   57:         dataset_name=metadata.get("dataset_name") or "rationright-synthetic-transactions",
+   57:         file_name="transactions.json",
+   57:         file_type="json",
+   57:         record_count=len(transactions),
+   57:         successful_records=len(transactions),
+   57:         failed_records=0,
+   57:         duplicate_records=0,
+   57:         status="COMPLETED",
+   57:         started_at=now,
+   57:         completed_at=now,
+           )
+       
+           # --- beneficiaries + transactions ---
+   57:     beneficiary_ids = {}
+ 1482:     for tx in transactions:
+ 1425:         ref = tx["beneficiary_id"]
+ 1425:         if ref not in beneficiary_ids:
+  285:             beneficiary_ids[ref] = upsert_beneficiary(conn, external_reference=ref, status="ACTIVE")
+ 2850:         insert_transaction(
+ 1425:             conn,
+ 1425:             external_transaction_id=tx["transaction_id"],
+ 1425:             beneficiary_id=beneficiary_ids[ref],
+ 1425:             transaction_date=tx["timestamp"],
+ 1425:             commodity=tx["ration_type"],
+ 1425:             quantity=tx["quantity"],
+ 1425:             unit=DEFAULT_TRANSACTION_UNIT,
+ 1425:             latitude=tx["latitude"],
+ 1425:             longitude=tx["longitude"],
+ 1425:             status="COMPLETED",
+ 1425:             source_import_id=import_id,
+               )
+       
+   57:     conn.commit()
+   57:     return {
+   57:         "data_source_id": source_id,
+   57:         "data_import_id": import_id,
+   57:         "beneficiaries": len(beneficiary_ids),
+   57:         "transactions": len(transactions),
+   57:         "fps_centers": 0,
+   57:         "inventory": 0,
+   57:         "ai_insights": 0,
+           }
+       
+       
+    1: def seed_database(db_path=DEFAULT_DB_PATH, dataset_path=DEFAULT_DATASET_PATH) -> dict:
+           """Open (creating if needed) the database and seed the synthetic dataset."""
+    1:     conn = open_db(db_path)
+    1:     try:
+    2:         return seed_synthetic(conn, dataset_path=dataset_path)
+           finally:
+    1:         conn.close()
+       
+       
+       # ---------------------------------------------------------------------------
+       # Batch helpers (used by the ingestion pipeline for large datasets).
+       #
+       # Values passed to these helpers are expected to be pre-validated and
+       # normalized by ``ingestion/``; they exist so an import streams through
+       # ``executemany`` batches instead of thousands of single-row round trips.
+       # ---------------------------------------------------------------------------
+       
+       
+    1: _BENEFICIARY_KEYS = (
+           "external_reference", "state", "district", "block",
+           "ration_category", "family_size", "status",
+       )
+       
+       
+    1: def upsert_beneficiaries(conn: sqlite3.Connection, records: list) -> None:
+           """Bulk upsert beneficiaries. Each record is a dict with
+           ``external_reference`` (required) plus optional state/district/block/
+           ration_category/family_size/status; missing keys default to None (records
+           derived from transaction rows carry only the fields they have)."""
+  260:     now = _now_iso()
+  260:     rows = []
+20588:     for record in records:
+182952:         row = {key: record.get(key) for key in _BENEFICIARY_KEYS}
+20328:         row["status"] = row["status"] or "ACTIVE"
+20328:         row["now"] = now
+20328:         rows.append(row)
+  520:     conn.executemany(
+  260:         "INSERT INTO beneficiaries "
+               "(external_reference, state, district, block, ration_category, family_size, status, created_at, updated_at) "
+               "VALUES (:external_reference, :state, :district, :block, :ration_category, "
+               " :family_size, :status, :now, :now) "
+               "ON CONFLICT(external_reference) DO UPDATE SET "
+               "  state = excluded.state, district = excluded.district, block = excluded.block, "
+               "  ration_category = excluded.ration_category, family_size = excluded.family_size, "
+               "  status = excluded.status, updated_at = excluded.updated_at",
+  260:         rows,
+           )
+       
+       
+    1: def beneficiary_ids(conn: sqlite3.Connection, refs) -> dict:
+           """Map external references to internal beneficiary ids (only those found)."""
+20959:     refs = [r for r in refs if r]
+  307:     if not refs:
+   43:         return {}
+20873:     placeholders = ",".join("?" for _ in refs)
+  528:     rows = conn.execute(
+  528:         "SELECT id, external_reference FROM beneficiaries "
+  264:         "WHERE external_reference IN (%s)" % placeholders,
+  264:         list(refs),
+           ).fetchall()
+20801:     return {row["external_reference"]: row["id"] for row in rows}
+       
+       
+    1: def existing_beneficiary_refs(conn: sqlite3.Connection) -> set:
+   45:     rows = conn.execute("SELECT external_reference FROM beneficiaries").fetchall()
+  105:     return {row["external_reference"] for row in rows}
+       
+       
+    1: _FPS_CENTER_KEYS = (
+           "fps_code", "name", "state", "district", "block", "location",
+           "latitude", "longitude", "capacity", "status",
+       )
+       
+       
+    1: def upsert_fps_centers(conn: sqlite3.Connection, records: list) -> None:
+           """Bulk upsert FPS centers. Each record is a dict with ``fps_code``
+           (required) plus optional name/state/district/block/location/latitude/
+           longitude/capacity/status; missing keys default to None."""
+  298:     now = _now_iso()
+  298:     rows = []
+30691:     for record in records:
+364716:         row = {key: record.get(key) for key in _FPS_CENTER_KEYS}
+30393:         row["status"] = row["status"] or "ACTIVE"
+30393:         row["now"] = now
+30393:         rows.append(row)
+  596:     conn.executemany(
+  298:         "INSERT INTO fps_centers "
+               "(fps_code, name, state, district, block, location, latitude, longitude, capacity, status, created_at, updated_at) "
+               "VALUES (:fps_code, :name, :state, :district, :block, :location, :latitude, "
+               " :longitude, :capacity, :status, :now, :now) "
+               "ON CONFLICT(fps_code) DO UPDATE SET "
+               "  name = excluded.name, state = excluded.state, district = excluded.district, "
+               "  block = excluded.block, location = excluded.location, latitude = excluded.latitude, "
+               "  longitude = excluded.longitude, capacity = excluded.capacity, "
+               "  status = excluded.status, updated_at = excluded.updated_at",
+  298:         rows,
+           )
+       
+       
+    1: def fps_center_ids(conn: sqlite3.Connection, codes) -> dict:
+           """Map FPS codes to internal center ids (only those found)."""
+31088:     codes = [c for c in codes if c]
+  345:     if not codes:
+   44:         return {}
+31000:     placeholders = ",".join("?" for _ in codes)
+  602:     rows = conn.execute(
+  301:         "SELECT id, fps_code FROM fps_centers WHERE fps_code IN (%s)" % placeholders,
+  301:         list(codes),
+           ).fetchall()
+20913:     return {row["fps_code"]: row["id"] for row in rows}
+       
+       
+    1: def existing_fps_codes(conn: sqlite3.Connection) -> set:
+   45:     rows = conn.execute("SELECT fps_code FROM fps_centers").fetchall()
+   93:     return {row["fps_code"] for row in rows}
+       
+       
+    1: def existing_transaction_ids(conn: sqlite3.Connection) -> set:
+   45:     rows = conn.execute("SELECT external_transaction_id FROM ration_transactions").fetchall()
+  129:     return {row["external_transaction_id"] for row in rows}
+       
+       
+    1: def insert_transactions_batch(conn: sqlite3.Connection, records: list) -> None:
+           """Bulk insert normalized transaction records (already validated)."""
+  315:     now = _now_iso()
+  630:     conn.executemany(
+  315:         "INSERT INTO ration_transactions "
+               "(external_transaction_id, beneficiary_id, fps_center_id, transaction_date, "
+               " commodity, quantity, unit, latitude, longitude, status, source_import_id, created_at) "
+               "VALUES (:external_transaction_id, :beneficiary_id, :fps_center_id, :transaction_date, "
+               " :commodity, :quantity, :unit, :latitude, :longitude, :status, :source_import_id, :now)",
+31915:         [dict(record, now=now) for record in records],
+           )
+       
+       
+    1: def insert_inventory_batch(conn: sqlite3.Connection, records: list) -> None:
+           """Bulk insert normalized inventory records (already validated).
+       
+           Missing optional keys (``last_updated``, ``monthly_consumption``,
+           ``reorder_threshold``) default to None so partial records import safely.
+           """
+   94:     now = _now_iso()
+   94:     defaults = {
+   94:         "fps_center_id": None, "commodity": "", "current_stock": 0.0,
+   94:         "monthly_consumption": None, "reorder_threshold": None,
+   94:         "last_updated": None, "source_import_id": None,
+           }
+  188:     conn.executemany(
+   94:         "INSERT INTO inventory "
+               "(fps_center_id, commodity, current_stock, monthly_consumption, reorder_threshold, "
+               " last_updated, source_import_id, created_at) "
+               "VALUES (:fps_center_id, :commodity, :current_stock, :monthly_consumption, "
+               " :reorder_threshold, :last_updated, :source_import_id, :now)",
+  357:         [dict(defaults, **record, now=now) for record in records],
+           )

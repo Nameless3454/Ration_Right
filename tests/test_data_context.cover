@@ -1,0 +1,336 @@
+    1: """RationRight — Phase 6: real-data multi-agent connection tests.
+       
+       Covers the data context layer (``data_context.py``): dataset selection for
+       the agents, agent-contract transaction export, data sufficiency checks,
+       provenance + data-quality attachment, and the extended ``/api/analyze``
+       contract (``synthetic`` vs ``real`` + ``data_import_id``). The four existing
+       agents and the orchestrator are NOT modified — this phase only changes what
+       data feeds them.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import data_context as dc
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+    1: def _seed(conn, with_tiny_import=False):
+           """Deterministic temp DB: synthetic seed + one real upload import."""
+   15:     db.seed_synthetic(conn)
+   15:     src_id = db.get_data_source_by_name(conn, "Uploaded Dataset")
+   15:     if src_id is None:
+   30:         src_id = db.insert_data_source(
+   15:             conn, name="Uploaded Dataset", source_type="MANUAL",
+   15:             description="test", status="ACTIVE",
+               )
+   30:     imp_id = db.insert_data_import(
+   15:         conn, data_source_id=src_id, dataset_name="up_test_aug",
+   15:         file_name="up_test.csv", file_type="CSV", record_count=3,
+   15:         successful_records=3, status="COMPLETED",
+           )
+   30:     db.upsert_beneficiaries(conn, [
+   30:         {"external_reference": "RB001", "state": "UP", "district": "Lucknow",
+   15:          "ration_category": "AAY", "family_size": 4, "status": "ACTIVE"},
+           ])
+   15:     ben_map = db.beneficiary_ids(conn, ["RB001"])
+   30:     db.upsert_fps_centers(conn, [
+   30:         {"fps_code": "FPS99", "name": "Test Center", "district": "Lucknow",
+   15:          "state": "UP", "status": "ACTIVE"},
+           ])
+   15:     center_map = db.fps_center_ids(conn, ["FPS99"])
+   30:     db.insert_transactions_batch(conn, [
+   30:         {"external_transaction_id": "RT1", "beneficiary_id": ben_map["RB001"],
+   15:          "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-01",
+   15:          "commodity": "rice", "quantity": 100.0, "unit": "kg", "status": "COMPLETED",
+   15:          "source_import_id": imp_id, "latitude": 26.8, "longitude": 80.9},
+   30:         {"external_transaction_id": "RT2", "beneficiary_id": ben_map["RB001"],
+   15:          "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-02",
+   15:          "commodity": "rice", "quantity": 120.0, "unit": "kg", "status": "COMPLETED",
+   15:          "source_import_id": imp_id, "latitude": 26.9, "longitude": 81.0},
+   30:         {"external_transaction_id": "RT3", "beneficiary_id": ben_map["RB001"],
+   15:          "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-03",
+   15:          "commodity": "wheat", "quantity": 40.0, "unit": "kg", "status": "COMPLETED",
+   15:          "source_import_id": imp_id, "latitude": 26.7, "longitude": 80.8},
+           ])
+   15:     tiny_imp_id = None
+   15:     if with_tiny_import:
+   16:         tiny_imp_id = db.insert_data_import(
+    8:             conn, data_source_id=src_id, dataset_name="tiny_one_tx",
+    8:             file_name="tiny.csv", file_type="CSV", record_count=1,
+    8:             successful_records=1, status="COMPLETED",
+               )
+   16:         db.insert_transactions_batch(conn, [
+   16:             {"external_transaction_id": "RT9", "beneficiary_id": ben_map["RB001"],
+    8:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-04",
+    8:              "commodity": "rice", "quantity": 10.0, "unit": "kg", "status": "COMPLETED",
+    8:              "source_import_id": tiny_imp_id, "latitude": 26.8, "longitude": 80.9},
+               ])
+   15:     conn.commit()
+   15:     return imp_id, tiny_imp_id
+       
+       
+    2: class DataContextServiceTests(unittest.TestCase):
+    1:     def setUp(self):
+    8:         self._tmp = tempfile.TemporaryDirectory()
+    8:         self.db_path = Path(self._tmp.name) / "dc.db"
+    8:         self.addCleanup(self._tmp.cleanup)
+    8:         self.conn = db.open_db(self.db_path)
+    8:         self.imp_id, self.tiny_imp_id = _seed(self.conn, with_tiny_import=True)
+       
+    1:     def tearDown(self):
+    8:         self.conn.close()
+       
+           # ---- dataset selection ----
+       
+    1:     def test_list_agent_datasets_excludes_synthetic_source(self):
+    1:         datasets = dc.list_agent_datasets(str(self.db_path))
+    4:         names = [d["dataset_name"] for d in datasets]
+    1:         self.assertIn("up_test_aug", names)
+               # The seeded synthetic source must not appear as a "real" dataset.
+    1:         self.assertNotIn("rationright-synthetic-transactions", names)
+    4:         by_name = {d["dataset_name"]: d for d in datasets}
+    1:         self.assertEqual(by_name["up_test_aug"]["transaction_count"], 3)
+       
+    1:     def test_prepare_agent_context_returns_agent_contract(self):
+    1:         ctx = dc.prepare_agent_context(self.imp_id, str(self.db_path))
+    1:         self.assertTrue(ctx["sufficient"])
+    1:         self.assertEqual(len(ctx["transactions"]), 3)
+    1:         tx = ctx["transactions"][0]
+               # Exactly the documented 7-field agent shape + coordinates.
+    2:         self.assertEqual(
+    1:             set(tx),
+    1:             {"transaction_id", "beneficiary_id", "timestamp", "latitude",
+                    "longitude", "ration_type", "quantity"},
+               )
+    1:         self.assertEqual(tx["transaction_id"], "RT1")
+    1:         self.assertEqual(tx["beneficiary_id"], "RB001")
+    1:         self.assertEqual(tx["timestamp"], "2026-08-01")
+    1:         self.assertEqual(tx["ration_type"], "rice")
+       
+    1:     def test_provenance_and_quality(self):
+    1:         ctx = dc.prepare_agent_context(self.imp_id, str(self.db_path))
+    1:         d = ctx["dataset"]
+    1:         self.assertEqual(d["mode"], "real")
+    1:         self.assertEqual(d["data_import_id"], self.imp_id)
+    1:         self.assertEqual(d["dataset_name"], "up_test_aug")
+    1:         self.assertEqual(d["source_name"], "Uploaded Dataset")
+    1:         self.assertEqual(d["data_quality"], 1.0)  # 3/3 successful
+    1:         self.assertEqual(d["transaction_count"], 3)
+    1:         self.assertEqual(d["date_range"], ["2026-08-01", "2026-08-03"])
+    1:         self.assertEqual(d["commodities"], ["rice", "wheat"])
+       
+    1:     def test_unknown_import_returns_none(self):
+    1:         self.assertIsNone(dc.prepare_agent_context(9999, str(self.db_path)))
+    1:         self.assertIsNone(dc.run_workflow_on_dataset(9999, db_path=str(self.db_path)))
+       
+           # ---- sufficiency ----
+       
+    1:     def test_insufficient_data_never_invokes_agents(self):
+    1:         ctx = dc.prepare_agent_context(self.tiny_imp_id, str(self.db_path))
+    1:         self.assertFalse(ctx["sufficient"])
+    1:         self.assertIn("at least 2 are required", ctx["dataset"]["reason"])
+    1:         self.assertIsInstance(ctx["dataset"]["required_data"], list)
+    1:         result = dc.run_workflow_on_dataset(self.tiny_imp_id, db_path=str(self.db_path))
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(result["stages"]["agent_1"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_2"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_3"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_4"], "skipped")
+    1:         self.assertEqual(result["anomalies"], [])
+    1:         self.assertEqual(result["alerts"], [])
+    1:         self.assertIn("reason", result["dataset"])
+       
+           # ---- end-to-end real workflow ----
+       
+    1:     def test_real_workflow_completes_with_provenance(self):
+    1:         result = dc.run_workflow_on_dataset(self.imp_id, db_path=str(self.db_path))
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(result["stages"]["agent_1"], "completed")
+               # Clean data -> no anomalies -> later stages skipped, not failed.
+    1:         self.assertEqual(result["anomalies"], [])
+    1:         self.assertEqual(result["findings"], [])
+    1:         self.assertEqual(result["cases"], [])
+    1:         self.assertEqual(result["alerts"], [])
+    1:         self.assertEqual(result["dataset"]["data_import_id"], self.imp_id)
+    1:         self.assertEqual(result["dataset"]["transaction_count"], 3)
+       
+    1:     def test_real_workflow_traceability_when_anomaly_present(self):
+               # A dataset with a rapid geographic pattern must flow through ALL
+               # agents and keep IDs connected end to end.
+    1:         conn = db.open_db(self.db_path)
+    1:         src = db.get_data_source_by_name(conn, "Uploaded Dataset")
+    1:         src_id = src["id"] if src else db.insert_data_source(
+                   conn, name="Uploaded Dataset", source_type="MANUAL",
+                   description="test", status="ACTIVE",
+               )
+    2:         imp = db.insert_data_import(
+    1:             conn, data_source_id=src_id, dataset_name="anomaly_set",
+    1:             file_name="a.csv", file_type="CSV", record_count=4,
+    1:             successful_records=4, status="COMPLETED",
+               )
+    1:         ben_map = db.beneficiary_ids(conn, ["RB001"])
+    1:         center_map = db.fps_center_ids(conn, ["FPS99"])
+    2:         db.insert_transactions_batch(conn, [
+    2:             {"external_transaction_id": "AX1", "beneficiary_id": ben_map["RB001"],
+    1:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-01 10:00",
+    1:              "commodity": "rice", "quantity": 100.0, "unit": "kg", "status": "COMPLETED",
+    1:              "source_import_id": imp, "latitude": 26.8, "longitude": 80.9},
+                   # Same beneficiary, 30 minutes later, ~400 km away -> candidate.
+    2:             {"external_transaction_id": "AX2", "beneficiary_id": ben_map["RB001"],
+    1:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-01 10:30",
+    1:              "commodity": "rice", "quantity": 120.0, "unit": "kg", "status": "COMPLETED",
+    1:              "source_import_id": imp, "latitude": 29.9, "longitude": 78.1},
+    2:             {"external_transaction_id": "AX3", "beneficiary_id": ben_map["RB001"],
+    1:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-02 09:00",
+    1:              "commodity": "wheat", "quantity": 30.0, "unit": "kg", "status": "COMPLETED",
+    1:              "source_import_id": imp, "latitude": 26.8, "longitude": 80.9},
+    2:             {"external_transaction_id": "AX4", "beneficiary_id": ben_map["RB001"],
+    1:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-02 09:15",
+    1:              "commodity": "wheat", "quantity": 20.0, "unit": "kg", "status": "COMPLETED",
+    1:              "source_import_id": imp, "latitude": 26.9, "longitude": 81.0},
+               ])
+    1:         conn.commit()
+    1:         conn.close()
+       
+    1:         result = dc.run_workflow_on_dataset(imp, db_path=str(self.db_path))
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(result["stages"]["agent_4"], "completed")
+    1:         self.assertTrue(result["anomalies"])
+    1:         self.assertTrue(result["findings"])
+    1:         self.assertTrue(result["cases"])
+    1:         self.assertTrue(result["alerts"])
+               # Traceability: alert -> case -> finding -> anomaly -> transactions.
+    1:         alert = result["alerts"][0]
+    2:         case = next(c for c in result["cases"] if c["case_id"] == alert["case_id"])
+    2:         finding = next(f for f in result["findings"] if f["finding_id"] in case["finding_ids"])
+    2:         anomaly = next(a for a in result["anomalies"] if a["anomaly_id"] == finding["anomaly_id"])
+    1:         tx_ids = anomaly["transaction_ids"]
+    1:         self.assertTrue(tx_ids)
+    1:         self.assertEqual(set(tx_ids), {"AX1", "AX2"})
+    1:         self.assertEqual(result["dataset"]["data_import_id"], imp)
+               # Evidence is deterministic backend math, present on the finding.
+    1:         self.assertGreaterEqual(finding["evidence"]["distance_km"], 300)
+       
+    1:     def test_quality_reflects_partial_import(self):
+               # successful 2 of 5 -> quality 0.4
+    1:         conn = db.open_db(self.db_path)
+    1:         src = db.get_data_source_by_name(conn, "Uploaded Dataset")
+    1:         src_id = src["id"] if src else db.insert_data_source(
+                   conn, name="Uploaded Dataset", source_type="MANUAL",
+                   description="test", status="ACTIVE",
+               )
+    2:         imp = db.insert_data_import(
+    1:             conn, data_source_id=src_id, dataset_name="partial_set",
+    1:             file_name="p.csv", file_type="CSV", record_count=5,
+    1:             successful_records=2, status="PARTIAL",
+               )
+    1:         ben_map = db.beneficiary_ids(conn, ["RB001"])
+    1:         center_map = db.fps_center_ids(conn, ["FPS99"])
+    6:         db.insert_transactions_batch(conn, [
+    6:             {"external_transaction_id": "PX%d" % n, "beneficiary_id": ben_map["RB001"],
+    3:              "fps_center_id": center_map["FPS99"], "transaction_date": "2026-08-%02d" % n,
+    3:              "commodity": "rice", "quantity": 10.0, "unit": "kg", "status": "COMPLETED",
+    3:              "source_import_id": imp, "latitude": 26.8, "longitude": 80.9}
+    4:             for n in (5, 6, 7)
+               ])
+    1:         conn.commit()
+    1:         conn.close()
+    1:         ctx = dc.prepare_agent_context(imp, str(self.db_path))
+    1:         self.assertEqual(ctx["dataset"]["data_quality"], 0.4)
+       
+       
+    2: class AnalyzeApiTests(unittest.TestCase):
+    1:     def setUp(self):
+    7:         self._tmp = tempfile.TemporaryDirectory()
+    7:         self.db_path = Path(self._tmp.name) / "api.db"
+    7:         self.addCleanup(self._tmp.cleanup)
+    7:         conn = db.open_db(self.db_path)
+    7:         self.imp_id, _ = _seed(conn)
+    7:         conn.close()
+    7:         self.server = make_server("127.0.0.1", 0, db_path=str(self.db_path))
+    7:         self.port = self.server.server_address[1]
+    7:         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+    7:         self.thread.start()
+       
+    1:     def tearDown(self):
+    7:         self.server.shutdown()
+    7:         self.server.server_close()
+       
+    1:     def _post(self, path, body):
+   12:         req = urllib.request.Request(
+    6:             BASE + ":%d%s" % (self.port, path),
+    6:             data=json.dumps(body).encode("utf-8"),
+    6:             headers={"Content-Type": "application/json"},
+    6:             method="POST",
+               )
+    6:         try:
+    6:             with urllib.request.urlopen(req, timeout=30) as resp:
+    3:                 return resp.status, json.loads(resp.read().decode("utf-8"))
+    3:         except urllib.error.HTTPError as exc:
+    3:             return exc.code, json.loads(exc.read().decode("utf-8"))
+       
+    1:     def _get(self, path):
+    1:         with urllib.request.urlopen(BASE + ":%d%s" % (self.port, path), timeout=30) as resp:
+    1:             return resp.status, json.loads(resp.read().decode("utf-8"))
+       
+    1:     def test_datasets_endpoint(self):
+    1:         status, payload = self._get("/api/datasets")
+    1:         self.assertEqual(status, 200)
+    3:         names = [d["dataset_name"] for d in payload["datasets"]]
+    1:         self.assertIn("up_test_aug", names)
+       
+    1:     def test_analyze_real(self):
+    1:         status, result = self._post("/api/analyze", {"dataset": "real", "data_import_id": self.imp_id})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(result["dataset"]["mode"], "real")
+    1:         self.assertEqual(result["dataset"]["data_import_id"], self.imp_id)
+    1:         self.assertEqual(result["dataset"]["data_quality"], 1.0)
+       
+    1:     def test_analyze_real_requires_import_id(self):
+    1:         status, payload = self._post("/api/analyze", {"dataset": "real"})
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("data_import_id", payload["error"])
+       
+    1:     def test_analyze_real_unknown_import(self):
+    1:         status, payload = self._post("/api/analyze", {"dataset": "real", "data_import_id": 9999})
+    1:         self.assertEqual(status, 404)
+    1:         self.assertIn("Unknown data_import_id", payload["error"])
+       
+    1:     def test_analyze_unknown_mode(self):
+    1:         status, payload = self._post("/api/analyze", {"dataset": "bogus"})
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("synthetic", payload["error"])
+       
+    1:     def test_analyze_synthetic_unchanged_with_dataset_block(self):
+    1:         status, result = self._post("/api/analyze", {"dataset": "synthetic"})
+    1:         self.assertEqual(status, 200)
+               # Regression: the demo dataset still produces its planted anomaly.
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(len(result["anomalies"]), 1)
+    1:         self.assertEqual(len(result["alerts"]), 1)
+    1:         self.assertEqual(result["dataset"]["mode"], "synthetic")
+    1:         self.assertEqual(result["dataset"]["dataset_name"], "Synthetic Demo Dataset")
+    1:         self.assertEqual(result["dataset"]["transaction_count"], 25)
+       
+    1:     def test_analyze_defaults_to_synthetic(self):
+    1:         status, result = self._post("/api/analyze", {})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(result["dataset"]["mode"], "synthetic")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

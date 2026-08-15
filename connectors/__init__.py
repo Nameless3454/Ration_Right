@@ -1,0 +1,46 @@
+"""RationAI — external data connectors (Phase 7).
+
+    DataSource -> Connector -> Fetcher -> Raw response -> Parser
+        -> Column mapper -> Validator -> Normalizer -> Database
+
+The sync service drives one registered source through the existing Phase 3/4
+ingestion pipeline, records DataImport provenance, and updates DataSource
+status/timestamps. Only registered, profile-backed sources can be synced —
+no arbitrary URLs, no credentials in the browser, no data loss on failure.
+"""
+
+from connectors.errors import (
+    AuthError,
+    ConnectorError,
+    HttpStatusError,
+    InvalidResponseError,
+    RateLimitError,
+    SourceNotConfiguredError,
+    SyncFailure,
+    TimeoutError,
+    UnreachableError,
+)
+from connectors.service import (
+    connection_status,
+    get_source_status,
+    list_sources,
+    register_configured_sources,
+    sync_source,
+)
+
+__all__ = [
+    "AuthError",
+    "ConnectorError",
+    "HttpStatusError",
+    "InvalidResponseError",
+    "RateLimitError",
+    "SourceNotConfiguredError",
+    "SyncFailure",
+    "TimeoutError",
+    "UnreachableError",
+    "connection_status",
+    "get_source_status",
+    "list_sources",
+    "register_configured_sources",
+    "sync_source",
+]

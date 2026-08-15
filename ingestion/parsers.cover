@@ -1,0 +1,506 @@
+    1: """RationRight — file parsers (Phase 3).
+       
+       Parses uploaded CSV, JSON, and XLSX files into a uniform shape:
+       
+           {"headers": [str, ...], "rows": [[...], ...], "sheets": [str, ...],
+            "warnings": [str, ...]}
+       
+       Everything here is standard library only: ``csv``, ``json``, ``zipfile``, and
+       ``xml.etree``. XLSX is an OOXML ZIP container, so a minimal, dependency-free
+       reader is implemented that handles the shapes real government/Excel exports
+       use: shared strings, inline strings, plain numbers, multiple worksheets, and
+       header rows. Formulas are not evaluated (the cached value is read), and date
+       cells stored as Excel serial numbers are converted during validation (see
+       ``ingestion.validation.parse_date``).
+       
+       Errors raise ``ParseError`` (bad content), ``EmptyDatasetError`` (no records),
+       ``UnsupportedFileTypeError`` (bad extension/content type), or
+       ``FileTooLargeError`` (enforced by the caller, defined here).
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import csv
+    1: import json
+    1: import re
+    1: import zipfile
+    1: import xml.etree.ElementTree as ET
+    1: from pathlib import Path
+    1: from typing import Optional
+       
+    1: MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB default; see service.get_max_upload_bytes
+    1: MAX_ROWS = 500_000  # row cap; see get_max_rows()
+       
+    1: EXT_TO_TYPE = {
+    1:     ".csv": "csv",
+    1:     ".xlsx": "xlsx",
+    1:     ".json": "json",
+       }
+       
+       # Content types considered acceptable per file type (base part, before ';').
+    1: CONTENT_TYPE_OK = {
+    1:     "csv": {"text/csv", "application/csv", "text/plain", "application/octet-stream"},
+    1:     "xlsx": {
+               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               "application/zip",
+               "application/octet-stream",
+           },
+    1:     "json": {"application/json", "text/json", "application/octet-stream"},
+       }
+       
+    1: JSON_WRAPPER_KEYS = ("data", "records", "rows", "transactions", "items", "results")
+       
+       
+    2: class ParseError(Exception):
+    1:     """Raised when a file cannot be parsed or does not look like its type."""
+       
+       
+    2: class EmptyDatasetError(ParseError):
+    1:     """Raised when a file contains no data rows."""
+       
+       
+    2: class UnsupportedFileTypeError(ParseError):
+    1:     """Raised for unsupported extensions or mismatched content types."""
+       
+       
+    2: class FileTooLargeError(ParseError):
+    1:     """Raised when the upload exceeds the configured maximum size."""
+       
+       
+       # ---------------------------------------------------------------------------
+       # File-type detection
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def get_max_upload_bytes() -> int:
+           """Maximum upload size in bytes; overridable via RATIONRIGHT_MAX_UPLOAD_MB."""
+   67:     import os
+   67:     try:
+   67:         mb = float(os.environ.get("RATIONRIGHT_MAX_UPLOAD_MB", "") or 0)
+           except ValueError:
+               mb = 0
+   67:     return int(mb * 1024 * 1024) if mb > 0 else MAX_UPLOAD_BYTES
+       
+       
+    1: def get_max_rows() -> int:
+           """Maximum number of rows per uploaded dataset; overridable via
+           RATIONRIGHT_MAX_ROWS. Guards memory/CPU on large files."""
+   41:     import os
+       
+   41:     try:
+   41:         rows = int(os.environ.get("RATIONRIGHT_MAX_ROWS", "") or 0)
+           except ValueError:
+               rows = 0
+   41:     return rows if rows > 0 else MAX_ROWS
+       
+       
+    1: def sniff_file_type(filename: str, content_type: str = "") -> str:
+           """Return ``csv``/``xlsx``/``json`` or raise UnsupportedFileTypeError."""
+   56:     if not filename:
+               raise UnsupportedFileTypeError("No file was provided.")
+   56:     ext = Path(filename).suffix.lower()
+   56:     if ext not in EXT_TO_TYPE:
+    8:         raise UnsupportedFileTypeError(
+    4:             "Unsupported file type. Please upload CSV, XLSX, or JSON."
+               )
+   52:     file_type = EXT_TO_TYPE[ext]
+       
+   52:     base = (content_type or "").split(";", 1)[0].strip().lower()
+   52:     if base:
+   52:         ok_for_this = CONTENT_TYPE_OK[file_type]
+   52:         if base not in ok_for_this:
+                   # If it matches a *different* type, the extension/content-type
+                   # disagree; otherwise it is an unknown type we still accept.
+    4:             for other, accepted in CONTENT_TYPE_OK.items():
+    4:                 if other != file_type and base in accepted:
+    4:                     raise UnsupportedFileTypeError(
+    4:                         "The file content type (%s) does not match its extension (.%s)."
+    2:                         % (base or "unknown", file_type)
+                           )
+   50:     return file_type
+       
+       
+    1: def verify_magic_bytes(file_type: str, data: bytes) -> None:
+           """Cheap content checks that catch mislabeled files before full parsing."""
+   47:     if file_type == "xlsx":
+    1:         if not data[:2] == b"PK":
+    1:             raise ParseError("The file is not a valid XLSX workbook (missing ZIP header).")
+   46:     elif file_type == "json":
+    1:         stripped = data.lstrip(b"\xef\xbb\xbf \t\r\n")
+    1:         if not stripped or stripped[:1] not in (b"{", b"["):
+                   raise ParseError("The file is not valid JSON: expected an array or object.")
+   45:     elif file_type == "csv":
+   45:         try:
+   45:             data.decode("utf-8-sig")
+               except UnicodeDecodeError:
+                   raise ParseError("The CSV file is not valid UTF-8.")
+       
+       
+       # ---------------------------------------------------------------------------
+       # CSV
+       # ---------------------------------------------------------------------------
+       
+    1: _CSV_DELIMITERS = (",", ";", "\t", "|")
+       
+       
+    1: def parse_csv(path: Path) -> dict:
+           """Parse a CSV file (UTF-8, optional BOM, common delimiters, quoted
+           fields, commas inside quotes). The first non-empty row is the header."""
+   60:     try:
+   60:         raw = Path(path).read_bytes()
+           except OSError as exc:
+               raise ParseError("Could not read the uploaded file: %s" % exc)
+   60:     try:
+   60:         text = raw.decode("utf-8-sig")
+           except UnicodeDecodeError:
+               raise ParseError("The CSV file is not valid UTF-8.")
+       
+   60:     lines = text.splitlines()
+   60:     if not lines:
+               raise EmptyDatasetError("The CSV file is empty.")
+       
+           # Sniff delimiter from the first non-empty line.
+  120:     first = next((ln for ln in lines if ln.strip()), "")
+   60:     delimiter = ","
+   60:     best = -1
+  300:     for candidate in _CSV_DELIMITERS:
+  240:         count = first.count(candidate)
+  240:         if count > best:
+   61:             best, delimiter = count, candidate
+       
+           # A single unbalanced double-quote is the most common sign of a truncated
+           # or otherwise corrupted CSV (the csv module silently tolerates it).
+   60:     if text.count('"') % 2 != 0:
+    2:         raise ParseError(
+    1:             "Could not parse the CSV file: unterminated quoted field."
+               )
+       
+   59:     try:
+   59:         reader = csv.reader(lines, delimiter=delimiter)
+60788:         rows = [row for row in reader if any(cell.strip() for cell in row)]
+           except csv.Error as exc:
+               raise ParseError("Could not parse the CSV file: %s" % exc)
+       
+   59:     if not rows:
+               raise EmptyDatasetError("The CSV file contains no data rows.")
+   59:     return _rows_to_records(rows, "CSV")
+       
+       
+       # ---------------------------------------------------------------------------
+       # JSON
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def parse_json(path: Path) -> dict:
+           """Parse a JSON dataset: either a top-level array of records or an object
+           wrapping a record array under a key such as ``data``/``records``/``rows``."""
+    6:     try:
+    6:         raw = Path(path).read_bytes()
+           except OSError as exc:
+               raise ParseError("Could not read the uploaded file: %s" % exc)
+    6:     try:
+    6:         parsed = json.loads(raw.decode("utf-8-sig"))
+    2:     except (ValueError, UnicodeDecodeError) as exc:
+    4:         raise ParseError("The JSON file could not be parsed: %s" % exc)
+       
+    4:     records = None
+    4:     if isinstance(parsed, list):
+    2:         records = parsed
+    2:     elif isinstance(parsed, dict):
+    8:         for key in JSON_WRAPPER_KEYS:
+    7:             if isinstance(parsed.get(key), list):
+    1:                 records = parsed[key]
+    1:                 break
+    2:         if records is None:
+                   # A single record object (all scalar values) is accepted as one row.
+    2:             if all(not isinstance(v, (list, dict)) for v in parsed.values()):
+                       records = [parsed]
+                   else:
+    2:                 raise ParseError(
+    1:                     "The JSON structure was not recognized: expected an array of "
+                           "records or an object wrapping a record array (e.g. {\"data\": [...]})."
+                       )
+           else:
+               raise ParseError(
+                   "The JSON structure was not recognized: expected an array of records "
+                   "or an object wrapping a record array."
+               )
+       
+    3:     if not records:
+               raise EmptyDatasetError("The JSON dataset contains no records.")
+       
+   14:     if all(isinstance(r, dict) for r in records):
+    3:         headers = []
+   11:         for record in records:
+   44:             for key in record:
+   36:                 if key not in headers:
+   12:                     headers.append(str(key))
+   17:         rows = [
+   52:             ["" if key not in record else _scalar(record[key]) for key in headers]
+   11:             for record in records
+               ]
+    3:         return {"headers": headers, "rows": rows, "sheets": [], "warnings": []}
+       
+           if all(isinstance(r, (list, tuple)) for r in records):
+               width = max((len(r) for r in records), default=0)
+               headers = ["column_%d" % (i + 1) for i in range(width)]
+               rows = [[_scalar(cell) for cell in r] for r in records]
+               return {"headers": headers, "rows": rows, "sheets": [], "warnings": []}
+       
+           raise ParseError(
+               "The JSON records are inconsistent: mix of objects and arrays."
+           )
+       
+       
+    1: def _scalar(value):
+   36:     if isinstance(value, bool):
+               return "TRUE" if value else "FALSE"
+   36:     if value is None:
+               return ""
+   36:     return value
+       
+       
+       # ---------------------------------------------------------------------------
+       # XLSX (minimal stdlib reader)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def parse_xlsx(path: Path, sheet: Optional[str] = None) -> dict:
+           """Parse an XLSX workbook.
+       
+           ``sheet`` may be a sheet name or a 1-based index; defaults to the first
+           worksheet. Returns headers, rows, and the list of available sheet names so
+           the UI can let the user pick one when the file has several.
+           """
+    8:     try:
+    8:         raw = Path(path).read_bytes()
+           except OSError as exc:
+               raise ParseError("Could not read the uploaded file: %s" % exc)
+    8:     if not raw[:2] == b"PK":
+    1:         raise ParseError("The file is not a valid XLSX workbook (missing ZIP header).")
+    7:     try:
+    7:         archive = zipfile.ZipFile(Path(path))
+           except zipfile.BadZipFile:
+               raise ParseError("The file is not a valid XLSX workbook (corrupt ZIP).")
+       
+    7:     warnings = []
+    7:     try:
+    7:         sheets = _sheet_names(archive)
+    7:         if not sheets:
+                   raise ParseError("The XLSX workbook contains no worksheets.")
+    7:         sheet_target = _resolve_sheet(archive, sheets, sheet, warnings)
+    6:         shared = _shared_strings(archive)
+    6:         rows = _sheet_rows(archive, sheet_target, shared)
+    1:     except ParseError:
+    1:         raise
+           except Exception as exc:  # noqa: BLE001
+               raise ParseError("Could not read the XLSX workbook: %s" % exc)
+           finally:
+    6:         archive.close()
+       
+    6:     if not rows:
+               raise EmptyDatasetError("The selected worksheet contains no data.")
+    6:     return _rows_to_records(rows, "XLSX", extra={"sheets": sheets, "warnings": warnings})
+       
+       
+    1: def _sheet_names(archive: zipfile.ZipFile) -> list:
+           """Sheet display names in workbook order."""
+    7:     try:
+    7:         root = ET.fromstring(archive.read("xl/workbook.xml"))
+           except KeyError:
+               raise ParseError("The XLSX workbook is missing xl/workbook.xml.")
+   14:     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    7:           "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    7:     names = []
+   22:     for sheet in root.findall(".//m:sheets/m:sheet", ns):
+   15:         name = sheet.get("name")
+   15:         if name:
+   15:             names.append(name)
+    7:     return names
+       
+       
+    1: def _resolve_sheet(archive, sheets, requested, warnings) -> str:
+           """Return the worksheet XML path for the requested sheet (name or index)."""
+    7:     if requested is None:
+    4:         index = 0
+    3:     elif isinstance(requested, int):
+    1:         index = requested - 1 if requested >= 1 else 0
+           else:
+   10:         lowered = {name.lower(): i for i, name in enumerate(sheets)}
+    2:         if requested.lower() not in lowered:
+    2:             raise ParseError(
+    2:                 "Worksheet '%s' not found. Available sheets: %s"
+    1:                 % (requested, ", ".join(sheets))
+                   )
+    1:         index = lowered[requested.lower()]
+       
+    6:     if index < 0 or index >= len(sheets):
+               raise ParseError(
+                   "Worksheet index %s is out of range (available sheets: %s)"
+                   % (index + 1, ", ".join(sheets))
+               )
+    6:     if len(sheets) > 1 and requested is None:
+    2:         warnings.append(
+    2:             "The workbook has %d worksheets (%s); using the first. Select a sheet "
+    1:             "to import another." % (len(sheets), ", ".join(sheets))
+               )
+       
+           # Map workbook r:id -> worksheet target via xl/_rels/workbook.xml.rels.
+    6:     rels = {}
+    6:     try:
+    6:         rel_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    6:         ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+   18:         for rel in rel_root.findall(".//r:Relationship", ns):
+   12:             rid = rel.get("Id")
+   12:             target = rel.get("Target")
+   12:             if rid and target:
+   12:                 rels[rid] = target.lstrip("/")
+           except (KeyError, ET.ParseError):
+               rels = {}
+       
+    6:     try:
+    6:         wb_root = ET.fromstring(archive.read("xl/workbook.xml"))
+   12:         ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    6:               "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    6:         sheet_els = wb_root.findall(".//m:sheets/m:sheet", ns)
+           except (KeyError, ET.ParseError):
+               sheet_els = []
+       
+    6:     if index < len(sheet_els):
+    6:         rid = sheet_els[index].get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+    6:         if rid and rid in rels:
+    6:             target = rels[rid]
+    6:             if not target.startswith("xl/"):
+    6:                 target = "xl/" + target
+    6:             return target
+       
+           # Fallback to the conventional worksheets/sheetN.xml layout.
+           return "xl/worksheets/sheet%d.xml" % (index + 1)
+       
+       
+    1: def _shared_strings(archive: zipfile.ZipFile) -> list:
+           """Shared strings table: concatenated <t> text per <si> entry."""
+    6:     try:
+    6:         root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    5:     except (KeyError, ET.ParseError):
+    5:         return []
+    1:     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    1:     strings = []
+    5:     for si in root.findall(".//m:si", ns):
+    4:         parts = []
+    8:         for t in si.findall(".//m:t", ns):
+    4:             if t.text:
+    4:                 parts.append(t.text)
+    4:         strings.append("".join(parts))
+    1:     return strings
+       
+       
+    1: def _sheet_rows(archive: zipfile.ZipFile, sheet_target: str, shared: list) -> list:
+           """Parse a worksheet into a list of rows (each a list of cell values)."""
+    6:     try:
+    6:         root = ET.fromstring(archive.read(sheet_target))
+           except KeyError:
+               raise ParseError("The XLSX workbook is missing %s." % sheet_target)
+           except ET.ParseError as exc:
+               raise ParseError("The XLSX worksheet could not be read: %s" % exc)
+       
+    6:     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    6:     rows = []
+   19:     for row_el in root.findall(".//m:sheetData/m:row", ns):
+   13:         cells = {}
+   13:         max_col = -1
+   39:         for cell in row_el.findall("m:c", ns):
+   26:             ref = cell.get("r", "")
+   26:             col = _column_index(ref)
+   26:             if col is None:
+                       continue
+   26:             max_col = max(max_col, col)
+   26:             value = _cell_value(cell, ns, shared)
+   26:             if value != "":
+   26:                 cells[col] = value
+   52:         row = [cells.get(i, "") for i in range(max_col + 1)]
+   13:         rows.append(row)
+    6:     return rows
+       
+       
+    1: def _cell_value(cell, ns, shared: list) -> str:
+   26:     cell_type = cell.get("t")
+   26:     if cell_type == "inlineStr":
+   16:         parts = []
+   32:         for t in cell.findall(".//m:t", ns):
+   16:             if t.text:
+   16:                 parts.append(t.text)
+   16:         return "".join(parts)
+   10:     v_el = cell.find("m:v", ns)
+   10:     raw = v_el.text if v_el is not None and v_el.text is not None else ""
+   10:     if cell_type == "s":
+    4:         index = int(raw) if raw.isdigit() else -1
+    4:         if 0 <= index < len(shared):
+    4:             return shared[index]
+               return ""
+    6:     if cell_type == "b":
+               return "TRUE" if raw == "1" else "FALSE"
+    6:     return raw
+       
+       
+    1: def _column_index(ref: str) -> Optional[int]:
+           """'A' -> 0, 'B' -> 1, ..., 'AA' -> 26; None for empty refs."""
+   84:     letters = "".join(ch for ch in ref if ch.isalpha())
+   26:     if not letters:
+               return None
+   26:     index = 0
+   52:     for ch in letters.upper():
+   26:         index = index * 26 + (ord(ch) - ord("A") + 1)
+   26:     return index - 1
+       
+       
+       # ---------------------------------------------------------------------------
+       # Shared row/header normalization
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def _rows_to_records(rows: list, label: str, extra: Optional[dict] = None) -> dict:
+           """First non-empty row becomes the header; rows are padded to the header
+           length. Returns the uniform parser output dict."""
+  511:     header = [str(cell).strip() for cell in rows[0]]
+   65:     body = rows[1:]
+   65:     warnings = list((extra or {}).get("warnings", []))
+  446:     for i, name in enumerate(header):
+  381:         if not name:
+                   warnings.append("Column %d has no header name; it will be ignored." % (i + 1))
+  446:     for i, name in enumerate(header):
+  381:         if header.count(name) > 1 and name:
+                   warnings.append("Duplicate column name %r; only the first is used." % name)
+                   break
+       
+   65:     width = len(header)
+   65:     normalized = []
+30348:     for row in body:
+30283:         if len(row) > width:
+                   warnings.append(
+                       "Row %d has more cells than the header; extra cells ignored." % (len(normalized) + 2)
+                   )
+                   row = row[:width]
+252657:         normalized.append(["" if cell is None else cell for cell in row] + [""] * (width - len(row)))
+       
+   65:     if not normalized:
+    6:         raise EmptyDatasetError("The %s file contains no data rows." % label)
+   59:     return {"headers": header, "rows": normalized, "sheets": list(extra.get("sheets", [])) if extra else [], "warnings": warnings}
+       
+       
+       # ---------------------------------------------------------------------------
+       # Dispatch
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def parse_file(path, file_type: str, sheet: Optional[str] = None) -> dict:
+           """Parse a file by its detected type (``csv``/``xlsx``/``json``)."""
+   58:     if file_type == "csv":
+   55:         return parse_csv(path)
+    3:     if file_type == "json":
+    2:         return parse_json(path)
+    1:     if file_type == "xlsx":
+               return parse_xlsx(path, sheet=sheet)
+    2:     raise UnsupportedFileTypeError(
+    1:         "Unsupported file type. Please upload CSV, XLSX, or JSON."
+           )

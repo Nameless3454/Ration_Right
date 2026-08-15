@@ -1,0 +1,823 @@
+    1: """RationAI — AI Analysis Command Center backend (Phase 9).
+       
+       Builds the command-center experience on top of the EXISTING Phase 6
+       multi-agent architecture and Phase 8 lineage — no second AI architecture, no
+       new agents, no fake results:
+       
+           Dataset (real import or synthetic)
+               -> filters (commodity / FPS / district / date range, validated)
+               -> Phase 6 workflow (the same 4 agents) for agent-based analysis types
+               -> deterministic per-import calculations for the rest
+               -> a unified ``insights`` array + per-type status map
+               -> a persisted analysis run (RA-YYYY-NNNN) with types/filters/timings
+       
+       Five analysis types are offered. Two map to the real agents; three are
+       clearly labeled deterministic calculations (no LLM) computed by this module
+       from database records with documented sufficiency gates:
+       
+           distribution_anomaly  -> Agents 1-2 (detect + verify)   [agents]
+           recommendations       -> Agents 3-4 (case + alert)      [agents]
+           operational_risk      -> DB checks (failure rate,       [deterministic]
+                                    recent distribution, low stock)
+           inventory_risk        -> stock vs consumption projection [deterministic]
+           demand_forecast       -> linear trend projection with a  [deterministic]
+                                    sufficiency gate (>=3 periods)
+       
+       Every insight carries ``deterministic: true|false`` so the UI can always
+       distinguish CALCULATED values from AI interpretation, and a ``source`` block
+       (dataset, import, analysis id) so each insight stays traceable.
+       
+       Nothing is invented: agents that lack data report INSUFFICIENT_DATA with a
+       reason instead of producing guesses, and no token/cost metrics are exposed
+       (the backend does not record them).
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import json
+    1: import logging
+    1: from datetime import datetime, timedelta, timezone
+    1: from typing import Optional
+       
+    1: from analytics import (
+           FAILURE_MIN_TRANSACTIONS,
+           FAILURE_RATE_THRESHOLD,
+           INVENTORY_CRITICAL_DAYS,
+           INVENTORY_WARNING_DAYS,
+           NO_RECENT_DISTRIBUTION_DAYS,
+       )
+    1: from data_context import (
+           MIN_TRANSACTIONS_FOR_AGENTS,
+           get_import_metadata,
+           prepare_agent_context,
+           run_workflow_on_dataset,
+           synthetic_dataset_block,
+       )
+    1: from database import (
+           DEFAULT_DB_PATH,
+           get_data_source_by_name,
+           insert_ai_insight,
+           open_db,
+       )
+    1: from pipeline import record_analysis_run
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+    1: from workflow import run_workflow
+       
+    1: logger = logging.getLogger("rationright.analysis_center")
+       
+       #: Minimum distinct months of history required for a deterministic forecast.
+    1: MIN_FORECAST_PERIODS = 3
+       
+    1: ANALYSIS_TYPES = [
+    1:     {
+    1:         "key": "distribution_anomaly",
+    1:         "label": "Distribution Anomaly Detection",
+    1:         "kind": "agents",
+    1:         "agents": ["agent_1", "agent_2"],
+    1:         "description": "Identify unusual distribution patterns using the real "
+                              "Agent 1 (detection) and Agent 2 (verification) pipeline.",
+           },
+    1:     {
+    1:         "key": "recommendations",
+    1:         "label": "Recommendations & Alerts",
+    1:         "kind": "agents",
+    1:         "agents": ["agent_3", "agent_4"],
+    1:         "description": "Build an investigation case (Agent 3) and generate a "
+                              "human-review alert with a recommended action (Agent 4).",
+           },
+    1:     {
+    1:         "key": "operational_risk",
+    1:         "label": "Operational Risk",
+    1:         "kind": "deterministic",
+    1:         "description": "Deterministic database checks: elevated transaction "
+                              "failure rate, no recent distribution, low inventory.",
+           },
+    1:     {
+    1:         "key": "inventory_risk",
+    1:         "label": "Inventory Risk",
+    1:         "kind": "deterministic",
+    1:         "description": "Deterministic stock projection: days remaining from "
+                              "current stock and monthly consumption.",
+           },
+    1:     {
+    1:         "key": "demand_forecast",
+    1:         "label": "Demand Forecasting",
+    1:         "kind": "deterministic",
+    2:         "description": "Deterministic linear-trend projection of future demand "
+    1:                        "from at least %d months of history." % MIN_FORECAST_PERIODS,
+           },
+       ]
+       
+    7: VALID_ANALYSIS_TYPES = {t["key"] for t in ANALYSIS_TYPES}
+       
+       
+    1: def _now_iso() -> str:
+    3:     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+       
+       
+    1: def analysis_type_registry() -> list:
+           """Public registry of selectable analysis types (labels + descriptions)."""
+    2:     return list(ANALYSIS_TYPES)
+       
+       
+    1: def _synthetic_import_id(conn) -> Optional[int]:
+    5:     source = get_data_source_by_name(conn, "Synthetic Demo Dataset")
+    5:     if source is None:
+               return None
+   10:     row = conn.execute(
+    5:         "SELECT id FROM data_imports WHERE data_source_id = :sid ORDER BY id DESC LIMIT 1",
+    5:         {"sid": source["id"]},
+           ).fetchone()
+    5:     return row["id"] if row else None
+       
+       
+    1: def _filter_synthetic(transactions: list, filters: dict) -> list:
+           """Apply commodity/date filters to the synthetic transaction list."""
+    5:     commodity = (filters.get("commodity") or "").strip().lower()
+    5:     from_date = (filters.get("from_date") or "").strip()
+    5:     to_date = (filters.get("to_date") or "").strip()
+    5:     out = []
+  130:     for tx in transactions:
+  125:         if commodity and (tx.get("ration_type") or "").strip().lower() != commodity:
+   10:             continue
+  115:         ts = (tx.get("timestamp") or "")[:10]
+  115:         if from_date and ts < from_date[:10]:
+                   continue
+  115:         if to_date and ts > to_date[:10]:
+                   continue
+  115:         out.append(tx)
+    5:     return out
+       
+       
+       # ---------------------------------------------------------------------------
+       # Precheck — verified before anything runs
+       # ---------------------------------------------------------------------------
+       
+    1: def precheck(
+           *,
+           dataset_mode: str,
+    1:     data_import_id: Optional[int] = None,
+    1:     db_path: str = DEFAULT_DB_PATH,
+       ) -> dict:
+           """Readiness report for one dataset + every analysis type.
+       
+           Every number is queried from the database. Types whose required data is
+           missing are reported DISABLED with a reason — they never run and never
+           produce guessed results.
+           """
+    4:     conn = open_db(db_path)
+    4:     try:
+    4:         if dataset_mode == "real":
+    2:             imp = get_import_metadata(data_import_id, db_path) if data_import_id else None
+    2:             if imp is None:
+    2:                 return {"ok": False, "error": "Unknown dataset import."}
+    1:             record_count = imp.get("record_count") or 0
+    1:             valid_count = imp.get("successful_records") or 0
+    3:             tx_count = conn.execute(
+    1:                 "SELECT COUNT(*) AS n FROM ration_transactions WHERE source_import_id = :imp",
+    1:                 {"imp": data_import_id},
+    1:             ).fetchone()["n"]
+    3:             coords = conn.execute(
+    1:                 "SELECT COUNT(*) AS n FROM ration_transactions "
+                       "WHERE source_import_id = :imp AND latitude IS NOT NULL AND longitude IS NOT NULL",
+    1:                 {"imp": data_import_id},
+    1:             ).fetchone()["n"]
+    3:             inventory_count = conn.execute(
+    1:                 "SELECT COUNT(*) AS n FROM inventory WHERE source_import_id = :imp",
+    1:                 {"imp": data_import_id},
+    1:             ).fetchone()["n"]
+    3:             months = conn.execute(
+    1:                 "SELECT COUNT(DISTINCT substr(transaction_date, 1, 7)) AS n "
+                       "FROM ration_transactions WHERE source_import_id = :imp "
+                       "AND transaction_date IS NOT NULL",
+    1:                 {"imp": data_import_id},
+    1:             ).fetchone()["n"]
+    1:             dataset = {
+    1:                 "dataset_name": imp.get("dataset_name"),
+    1:                 "source_name": imp.get("source_name"),
+    1:                 "data_import_id": data_import_id,
+    1:                 "record_count": record_count,
+    1:                 "valid_records": valid_count,
+    1:                 "invalid_records": imp.get("failed_records") or 0,
+    1:                 "duplicates": imp.get("duplicate_records") or 0,
+    1:                 "transaction_count": tx_count,
+    1:                 "inventory_count": inventory_count,
+    1:                 "historical_months": months,
+    1:                 "quality": round(valid_count / record_count * 100, 1) if record_count else None,
+                   }
+               else:
+    4:             tx_count = len(_filter_synthetic(
+    2:                 load_dataset(DEFAULT_DATASET_PATH)["transactions"], {}
+                   ))
+    2:             coords = tx_count  # the synthetic dataset always carries coordinates
+    2:             inventory_count = 0
+    8:             months = conn.execute(
+    2:                 "SELECT COUNT(DISTINCT substr(transaction_date, 1, 7)) AS n "
+                       "FROM ration_transactions WHERE source_import_id = :imp",
+    2:                 {"imp": _synthetic_import_id(conn)},
+    4:             ).fetchone()["n"] if _synthetic_import_id(conn) else 0
+    2:             dataset = {
+    2:                 "dataset_name": "Synthetic Demo Dataset",
+    2:                 "source_name": "Synthetic Demo Dataset",
+    2:                 "data_import_id": None,
+    2:                 "record_count": tx_count,
+    2:                 "valid_records": tx_count,
+    2:                 "invalid_records": 0,
+    2:                 "duplicates": 0,
+    2:                 "transaction_count": tx_count,
+    2:                 "inventory_count": 0,
+    2:                 "historical_months": months,
+    2:                 "quality": 100.0,
+                   }
+       
+    3:         checks = {
+    3:             "dataset_available": {"ok": True, "detail": dataset["dataset_name"]},
+    6:             "valid_records": {"ok": dataset["valid_records"] > 0,
+    3:                               "detail": "%d valid record(s)" % dataset["valid_records"]},
+    6:             "sufficient_transactions": {"ok": tx_count >= MIN_TRANSACTIONS_FOR_AGENTS,
+    6:                                         "detail": "%d transaction(s); %d required for agent analysis"
+    3:                                                   % (tx_count, MIN_TRANSACTIONS_FOR_AGENTS)},
+    6:             "coordinates_available": {"ok": coords > 0,
+    6:                                       "detail": "%d transaction(s) with coordinates"
+    6:                                                 % coords if coords else "no coordinates — "
+                                                       "geographic verification is limited"},
+               }
+       
+    3:         types = []
+   18:         for t in ANALYSIS_TYPES:
+   15:             key = t["key"]
+   15:             if key == "distribution_anomaly":
+    3:                 enabled = tx_count >= MIN_TRANSACTIONS_FOR_AGENTS
+    6:                 reason = None if enabled else (
+                           "Only %d transaction(s) available; at least %d required." % (
+                               tx_count, MIN_TRANSACTIONS_FOR_AGENTS))
+   12:             elif key == "recommendations":
+    3:                 enabled = tx_count >= MIN_TRANSACTIONS_FOR_AGENTS
+    6:                 reason = None if enabled else (
+                           "Requires distribution anomaly detection to run first.")
+    9:             elif key == "operational_risk":
+    3:                 enabled = tx_count > 0
+    3:                 reason = None if enabled else "No transactions to check."
+    6:             elif key == "inventory_risk":
+    3:                 enabled = inventory_count > 0
+    6:                 reason = None if enabled else (
+    2:                     "This dataset has no inventory records; import an inventory "
+                           "dataset to enable stock-risk analysis.")
+    3:             elif key == "demand_forecast":
+    3:                 enabled = months >= MIN_FORECAST_PERIODS
+    6:                 reason = None if enabled else (
+    4:                     "Only %d historical month(s) available; at least %d are "
+    2:                     "required for a reliable forecast." % (months, MIN_FORECAST_PERIODS))
+                   else:
+                       enabled, reason = False, "Unknown analysis type."
+   30:             types.append({"key": key, "label": t["label"], "kind": t["kind"],
+   15:                           "enabled": enabled, "reason": reason})
+           finally:
+    4:         conn.close()
+       
+    6:     return {"ok": True, "dataset": dataset, "checks": checks, "types": types,
+    3:             "generated_at": _now_iso()}
+       
+       
+       # ---------------------------------------------------------------------------
+       # Deterministic per-import insights (calculated, not AI)
+       # ---------------------------------------------------------------------------
+       
+    2: def _insight(insight_type, severity, title, summary, *, evidence=None,
+    1:              confidence=None, recommendation=None, entity_type=None,
+    1:              entity_id=None, deterministic=True, status="completed",
+    1:              reason=None, source=None):
+   21:     return {
+   21:         "insight_type": insight_type,
+   21:         "severity": severity,
+   21:         "title": title,
+   21:         "summary": summary,
+   21:         "evidence": evidence or {},
+   21:         "confidence": confidence,
+   21:         "recommendation": recommendation,
+   21:         "entity_type": entity_type,
+   21:         "entity_id": entity_id,
+   21:         "deterministic": deterministic,
+   21:         "status": status,
+   21:         "reason": reason,
+   21:         "source": source or {},
+           }
+       
+       
+    1: def operational_risk_insights(conn, import_id: int, source: dict) -> list:
+           """Per-import operational checks (failure rate / inactivity / low stock).
+       
+           Same documented thresholds as the Phase 5 operational alerts
+           (FAILURE_RATE_THRESHOLD, NO_RECENT_DISTRIBUTION_DAYS), computed only for
+           centers touched by this dataset.
+           """
+    3:     insights = []
+       
+           # 1. Elevated failure rate per FPS in this import.
+    9:     for r in conn.execute(
+    3:         "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+               " COALESCE(SUM(CASE WHEN t.status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, "
+               " COALESCE(SUM(CASE WHEN t.status IN ('COMPLETED','FAILED') THEN 1 ELSE 0 END), 0) AS total "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+               "WHERE t.source_import_id = :imp GROUP BY fps_code",
+    3:         {"imp": import_id},
+           ):
+    3:         total = r["total"]
+    3:         if total < FAILURE_MIN_TRANSACTIONS:
+                   continue
+    3:         rate = r["failed"] / total
+    3:         if rate >= FAILURE_RATE_THRESHOLD:
+    4:             insights.append(_insight(
+    2:                 "OPERATIONAL_RISK", "MEDIUM",
+    2:                 "Transaction failure rate is elevated at %s" % r["fps_code"],
+    4:                 "%d of %d transactions at %s failed (%.0f%% >= %.0f%% threshold). "
+    4:                 "Requires human review." % (r["failed"], total, r["fps_code"],
+    2:                                             rate * 100, FAILURE_RATE_THRESHOLD * 100),
+    4:                 evidence={"failed_transactions": r["failed"], "total_transactions": total,
+    2:                           "failure_rate": round(rate, 4),
+    2:                           "threshold": FAILURE_RATE_THRESHOLD},
+    2:                 entity_type="fps_center", entity_id=r["fps_code"], source=source,
+                   ))
+       
+           # 2. No recent distribution — reference date is this import's newest tx.
+    9:     latest = conn.execute(
+    3:         "SELECT MAX(transaction_date) AS d FROM ration_transactions "
+    3:         "WHERE source_import_id = :imp", {"imp": import_id},
+    3:     ).fetchone()["d"]
+    3:     if latest:
+    6:         cutoff = (datetime.fromisoformat(str(latest)[:10]) -
+    3:                   timedelta(days=NO_RECENT_DISTRIBUTION_DAYS)).date().isoformat()
+    6:         for r in conn.execute(
+    3:             "SELECT f.id, f.fps_code, f.name, f.district, "
+                   " COALESCE(SUM(CASE WHEN t.status = 'COMPLETED' THEN 1 ELSE 0 END), 0) AS completed "
+                   "FROM fps_centers f LEFT JOIN ration_transactions t "
+                   "  ON t.fps_center_id = f.id AND t.source_import_id = :imp "
+                   "  AND substr(t.transaction_date, 1, 10) >= :cutoff "
+                   "GROUP BY f.id HAVING completed = 0",
+    3:             {"imp": import_id, "cutoff": cutoff},
+               ):
+                   insights.append(_insight(
+                       "OPERATIONAL_RISK", "LOW",
+                       "No recent distribution activity at %s" % r["fps_code"],
+                       "No completed distribution was recorded at %s in the last %d days "
+                       "(reference date %s)." % (r["fps_code"], NO_RECENT_DISTRIBUTION_DAYS, cutoff),
+                       evidence={"reference_date": cutoff,
+                                 "recent_days": NO_RECENT_DISTRIBUTION_DAYS},
+                       entity_type="fps_center", entity_id=r["fps_code"], source=source,
+                   ))
+       
+           # 3. Low stock from this import's inventory records.
+    6:     for r in conn.execute(
+    3:         "SELECT i.commodity, i.current_stock, i.reorder_threshold, "
+               " COALESCE(f.fps_code, 'Unknown') AS fps_code "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "WHERE i.source_import_id = :imp AND i.reorder_threshold IS NOT NULL "
+               "AND i.current_stock < i.reorder_threshold "
+               "ORDER BY (i.reorder_threshold - i.current_stock) DESC",
+    3:         {"imp": import_id},
+           ):
+               insights.append(_insight(
+                   "OPERATIONAL_RISK", "HIGH",
+                   "Inventory below reorder threshold at %s" % r["fps_code"],
+                   "Stock of %s at %s is below the reorder threshold (%.2f < %.2f)."
+                   % (r["commodity"], r["fps_code"], r["current_stock"], r["reorder_threshold"]),
+                   evidence={"current_stock": r["current_stock"],
+                             "reorder_threshold": r["reorder_threshold"]},
+                   recommendation="Review replenishment for %s at %s." % (r["commodity"], r["fps_code"]),
+                   entity_type="fps_center", entity_id=r["fps_code"], source=source,
+               ))
+    3:     return insights
+       
+       
+    1: def inventory_risk_insights(conn, import_id: int, source: dict) -> list:
+           """Stock-vs-consumption projection with documented thresholds.
+       
+           days_remaining = current_stock / (monthly_consumption / 30); CRITICAL < 15,
+           WARNING < 30, else HEALTHY (same constants as Phase 5 analytics).
+           """
+    5:     insights = []
+   14:     for r in conn.execute(
+    5:         "SELECT i.commodity, i.current_stock, i.monthly_consumption, "
+               " i.reorder_threshold, COALESCE(f.fps_code, 'Unknown') AS fps_code "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "WHERE i.source_import_id = :imp ORDER BY i.commodity, fps_code",
+    5:         {"imp": import_id},
+           ):
+    4:         stock = r["current_stock"]
+    4:         monthly = r["monthly_consumption"]
+    4:         if monthly is None or monthly <= 0:
+                   continue
+    4:         days = stock / (monthly / 30.0)
+    4:         if days < INVENTORY_CRITICAL_DAYS:
+    4:             severity, status = "CRITICAL", "at risk of running out within %d days" % INVENTORY_CRITICAL_DAYS
+               elif days < INVENTORY_WARNING_DAYS:
+                   severity, status = "HIGH", "approaching the %d-day warning threshold" % INVENTORY_WARNING_DAYS
+               else:
+                   severity, status = "LOW", "healthy"
+    8:         insights.append(_insight(
+    4:             "INVENTORY_RISK", severity,
+    4:             "%s stock at %s may fall below safe levels" % (r["commodity"], r["fps_code"]),
+    8:             "Current stock of %s at %s covers approximately %.1f days at the "
+    4:             "observed consumption rate (%s)." % (r["commodity"], r["fps_code"], days, status),
+    4:             evidence={
+    4:                 "current_stock": stock,
+    4:                 "monthly_consumption": monthly,
+    4:                 "daily_consumption": round(monthly / 30.0, 2),
+    4:                 "days_remaining": round(days, 1),
+    4:                 "reorder_threshold": r["reorder_threshold"],
+    4:                 "critical_threshold_days": INVENTORY_CRITICAL_DAYS,
+    4:                 "warning_threshold_days": INVENTORY_WARNING_DAYS,
+                   },
+    8:             recommendation="Initiate replenishment review for %s at %s." % (
+    4:                 r["commodity"], r["fps_code"]),
+    4:             entity_type="fps_center", entity_id=r["fps_code"], source=source,
+               ))
+    5:     return insights
+       
+       
+    1: def demand_forecast_insights(conn, import_id: int, source: dict) -> list:
+           """Deterministic linear-trend forecast per commodity.
+       
+           Uses each commodity's monthly totals; at least MIN_FORECAST_PERIODS months
+           are required, otherwise a structured INSUFFICIENT_DATA insight is returned
+           instead of a guessed forecast. The formula (least-squares slope projected
+           one period) is documented and reproducible.
+           """
+   10:     rows = conn.execute(
+    5:         "SELECT substr(transaction_date, 1, 7) AS period, commodity, "
+               " SUM(quantity) AS qty "
+               "FROM ration_transactions WHERE source_import_id = :imp "
+               "AND transaction_date IS NOT NULL "
+               "GROUP BY period, commodity ORDER BY period",
+    5:         {"imp": import_id},
+           ).fetchall()
+    5:     by_commodity = {}
+   25:     for r in rows:
+   20:         by_commodity.setdefault(r["commodity"], {})[r["period"]] = r["qty"]
+       
+    5:     insights = []
+   14:     for commodity in sorted(by_commodity):
+    9:         periods = sorted(by_commodity[commodity])
+    9:         if len(periods) < MIN_FORECAST_PERIODS:
+   14:             insights.append(_insight(
+    7:                 "DEMAND_FORECAST", "LOW",
+    7:                 "Demand forecast not available for %s" % commodity,
+    7:                 "Not enough history for a reliable forecast.",
+   14:                 evidence={"historical_periods": len(periods),
+    7:                           "required_periods": MIN_FORECAST_PERIODS},
+    7:                 status="insufficient_data",
+   14:                 reason="Only %d historical period(s) available for %s; at least %d "
+    7:                        "are required." % (len(periods), commodity, MIN_FORECAST_PERIODS),
+    7:                 entity_type="commodity", entity_id=commodity, source=source,
+                   ))
+    7:             continue
+               # least-squares slope over index positions 0..n-1
+    2:         n = len(periods)
+    2:         x_mean = (n - 1) / 2.0
+   12:         y_mean = sum(by_commodity[commodity][p] for p in periods) / n
+   22:         num = sum((i - x_mean) * (by_commodity[commodity][p] - y_mean)
+   10:                   for i, p in enumerate(periods))
+   12:         den = sum((i - x_mean) ** 2 for i in range(n))
+    2:         slope = num / den if den else 0.0
+    2:         predicted = max(0.0, y_mean + slope * n)  # one period ahead
+    2:         trend = "INCREASING" if slope > 0 else ("DECREASING" if slope < 0 else "STABLE")
+               # deterministic confidence: fit quality, capped at 0.9
+   12:         if den and sum((i - x_mean) ** 2 for i in range(n)) > 0:
+   22:             ss_res = sum((by_commodity[commodity][p] - (y_mean + slope * (i - x_mean))) ** 2
+   10:                          for i, p in enumerate(periods))
+   12:             ss_tot = sum((by_commodity[commodity][p] - y_mean) ** 2 for p in periods)
+    2:             r_squared = 1 - ss_res / ss_tot if ss_tot else 0.0
+    2:             confidence = round(max(0.0, min(0.9, r_squared)), 2)
+               else:
+                   confidence = None
+    4:         insights.append(_insight(
+    2:             "DEMAND_FORECAST", "MEDIUM" if abs(slope) > 0 else "LOW",
+    2:             "%s demand forecast for %s" % (trend.title(), commodity),
+    4:             "Monthly demand for %s is projected at %.0f kg for the next period "
+    2:             "(%s trend across %d observed period(s))." % (
+    2:                 commodity, predicted, trend.lower(), n),
+    4:             evidence={"commodity": commodity,
+    2:                       "forecast_period": _next_period(periods[-1]),
+    2:                       "predicted_quantity": round(predicted, 1),
+    2:                       "trend": trend,
+    2:                       "historical_periods": len(periods),
+   22:                       "historical_basis": {p: round(by_commodity[commodity][p], 1)
+   10:                                            for p in periods}},
+    2:             confidence=confidence,
+    4:             recommendation="Use the projected demand to plan allocation for %s."
+    2:                            % commodity,
+    2:             entity_type="commodity", entity_id=commodity, source=source,
+               ))
+    5:     if not insights:
+               insights.append(_insight(
+                   "DEMAND_FORECAST", "LOW", "Demand forecast not available",
+                   "This dataset has no dated transactions to project demand from.",
+                   status="insufficient_data",
+                   reason="No historical transaction periods are available.",
+                   source=source,
+               ))
+    5:     return insights
+       
+       
+    1: def _next_period(period: str) -> str:
+    2:     year, month = int(period[:4]), int(period[5:7])
+    2:     month += 1
+    2:     if month > 12:
+               month, year = 1, year + 1
+    2:     return "%04d-%02d" % (year, month)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Run (the command center path)
+       # ---------------------------------------------------------------------------
+       
+    1: def _source_block(dataset_block: dict, analysis_id: str) -> dict:
+    6:     return {
+    6:         "dataset_name": dataset_block.get("dataset_name"),
+    6:         "source_name": dataset_block.get("source_name"),
+    6:         "data_import_id": dataset_block.get("data_import_id"),
+    6:         "mode": dataset_block.get("mode"),
+    6:         "analysis_id": analysis_id,
+           }
+       
+       
+    1: def run_analysis(
+           *,
+           dataset_mode: str,
+    1:     data_import_id: Optional[int] = None,
+    1:     types: Optional[list] = None,
+    1:     filters: Optional[dict] = None,
+    1:     db_path: str = DEFAULT_DB_PATH,
+    1:     max_interval_minutes: Optional[int] = None,
+    1:     min_distance_km: Optional[float] = None,
+       ) -> Optional[dict]:
+           """Run the command-center analysis and return the merged result.
+       
+           Returns None if the requested real import does not exist. The result keeps
+           the exact Phase 6 shape (so the existing Analysis view still works) plus:
+           ``insights`` (unified array), ``types`` (per-type status map), ``config``,
+           ``analysis_run`` (persisted lineage metadata), and ``timings``.
+           """
+    8:     import time as _time
+       
+    8:     _started = _time.perf_counter()
+   38:     types = [t for t in (types or []) if t in VALID_ANALYSIS_TYPES]
+   18:     filters = {k: v for k, v in (filters or {}).items() if v}
+    8:     if not types:
+               types = ["distribution_anomaly", "recommendations"]
+       
+   38:     agent_types = [t for t in types if t in ("distribution_anomaly", "recommendations")]
+   38:     deterministic_types = [t for t in types if t not in ("distribution_anomaly", "recommendations")]
+       
+    8:     if dataset_mode == "real":
+   10:         result = run_workflow_on_dataset(
+    5:             data_import_id, db_path=db_path, filters=filters,
+    5:             max_interval_minutes=max_interval_minutes,
+    5:             min_distance_km=min_distance_km,
+               )
+    5:         if result is None:
+    2:             return None
+    3:         dataset_block = result.get("dataset") or {}
+           else:
+    6:         transactions = _filter_synthetic(
+    3:             load_dataset(DEFAULT_DATASET_PATH)["transactions"], filters)
+    3:         kwargs = {}
+    3:         if max_interval_minutes is not None:
+                   kwargs["max_interval_minutes"] = max_interval_minutes
+    3:         if min_distance_km is not None:
+                   kwargs["min_distance_km"] = min_distance_km
+    3:         result = run_workflow(transactions, **kwargs)
+    3:         result["dataset"] = synthetic_dataset_block(transactions)
+    3:         if filters:
+    1:             result["dataset"]["filters_applied"] = filters
+    3:         dataset_block = result["dataset"]
+       
+           # ---- deterministic types ----------------------------------------------
+    6:     insights = []
+    6:     types_status = {}
+    6:     analysis_id = "PENDING"
+    6:     if deterministic_types:
+    4:         conn = open_db(db_path)
+    4:         try:
+    4:             import_id_for_deterministic = data_import_id if dataset_mode == "real" else _synthetic_import_id(conn)
+    8:             source = {"dataset_name": dataset_block.get("dataset_name"),
+    4:                       "source_name": dataset_block.get("source_name"),
+    4:                       "data_import_id": import_id_for_deterministic,
+    4:                       "mode": dataset_mode,
+    4:                       "analysis_id": analysis_id}
+    4:             if "operational_risk" in deterministic_types:
+    2:                 ops = operational_risk_insights(conn, import_id_for_deterministic, source) if import_id_for_deterministic else []
+    4:                 types_status["operational_risk"] = {"status": "completed",
+    2:                                                     "count": len(ops),
+    2:                                                     "reason": None if ops else "No operational signals detected in this dataset."}
+    2:                 insights.extend(ops)
+    4:             if "inventory_risk" in deterministic_types:
+    4:                 inv = inventory_risk_insights(conn, import_id_for_deterministic, source) if import_id_for_deterministic else []
+    8:                 types_status["inventory_risk"] = {"status": "completed" if inv else "insufficient_data",
+    4:                                                   "count": len(inv),
+    4:                                                   "reason": None if inv else "No inventory records in this dataset."}
+    4:                 insights.extend(inv)
+    4:             if "demand_forecast" in deterministic_types:
+    3:                 fc = demand_forecast_insights(conn, import_id_for_deterministic, source) if import_id_for_deterministic else [
+                           _insight("DEMAND_FORECAST", "LOW", "Demand forecast not available",
+                                    "No transaction history to project demand from.",
+                                    status="insufficient_data",
+                                    reason="No historical transaction periods are available.",
+                                    source=source)]
+   13:                 completed_fc = [i for i in fc if i["status"] == "completed"]
+    6:                 types_status["demand_forecast"] = {"status": "completed" if completed_fc else "insufficient_data",
+    3:                                                    "count": len(completed_fc),
+    3:                                                    "reason": None if completed_fc else (fc[0].get("reason") if fc else None)}
+    3:                 insights.extend(fc)
+               finally:
+    4:             conn.close()
+       
+           # ---- agent types: map the workflow result onto insights ----------------
+    6:     if agent_types:
+    6:         anomalies = result.get("anomalies") or []
+    6:         findings = result.get("findings") or []
+    6:         alerts = result.get("alerts") or []
+    6:         if "distribution_anomaly" in agent_types:
+    5:             anomaly_insights = []
+    8:             for finding in findings:
+    6:                 anomaly = next((a for a in anomalies if a.get("anomaly_id") == finding.get("anomaly_id")), None)
+    3:                 severity = "HIGH" if finding.get("evidence", {}).get("distance_km") else "MEDIUM"
+    6:                 anomaly_insights.append(_insight(
+    3:                     "DISTRIBUTION_ANOMALY", severity,
+    3:                     "Distribution anomaly detected for %s" % (anomaly or {}).get("beneficiary_id", "unknown beneficiary"),
+    3:                     finding.get("explanation") or (finding.get("summary") or "Anomalous distribution pattern verified against transaction data."),
+    3:                     evidence=finding.get("evidence") or {},
+    3:                     confidence=finding.get("confidence"),
+    3:                     recommendation=alerts[0].get("recommended_action") if alerts else None,
+    3:                     entity_type="beneficiary",
+    3:                     entity_id=(anomaly or {}).get("beneficiary_id"),
+    3:                     deterministic=False,
+    3:                     source=_source_block(dataset_block, "PENDING"),
+                       ))
+    5:             insights.extend(anomaly_insights)
+    5:             types_status["distribution_anomaly"] = {
+    5:                 "status": "completed" if anomaly_insights else ("skipped" if not anomalies else "completed"),
+    5:                 "count": len(anomaly_insights),
+    5:                 "reason": None if anomaly_insights else ("No anomaly candidates detected." if not anomalies else "No verified findings."),
+                   }
+    6:         if "recommendations" in agent_types:
+    6:             rec_insights = []
+    9:             for alert in alerts:
+    6:                 rec_insights.append(_insight(
+    3:                     "RECOMMENDATION", "HIGH" if (alert.get("severity") or "low").lower() == "high" else "MEDIUM",
+    3:                     "Recommendation: %s" % (alert.get("recommended_action") or "human review"),
+    3:                     alert.get("message") or "An investigation case was created for human review.",
+    6:                     evidence={"case_id": alert.get("case_id"),
+    3:                               "alert_id": alert.get("alert_id")},
+    3:                     confidence=alert.get("confidence"),
+    3:                     recommendation=alert.get("recommended_action"),
+    3:                     entity_type="beneficiary",
+    3:                     entity_id=alerts[0].get("beneficiary_id") if alerts else None,
+    3:                     deterministic=False,
+    3:                     source=_source_block(dataset_block, "PENDING"),
+                       ))
+    6:             insights.extend(rec_insights)
+    6:             types_status["recommendations"] = {
+    6:                 "status": "completed" if rec_insights else "skipped",
+    6:                 "count": len(rec_insights),
+    6:                 "reason": None if rec_insights else "No alert was generated (no verified anomalies).",
+                   }
+       
+           # ---- persist the run (with the real analysis id) -----------------------
+    6:     result["insights"] = insights
+    6:     result["types"] = types_status
+    6:     result["config"] = {"analysis_types": types, "filters": filters}
+    6:     duration_ms = int((_time.perf_counter() - _started) * 1000)
+   12:     run = record_analysis_run(
+    6:         result,
+    6:         dataset_mode=dataset_mode,
+    6:         data_import_id=data_import_id,
+    6:         db_path=db_path,
+    6:         analysis_types=types,
+    6:         filters=filters,
+    6:         timings=result.get("timings"),
+    6:         duration_ms=duration_ms,
+           )
+    6:     analysis_id = run["analysis_id"]
+           # stamp the real analysis id onto insight sources (they were built with a
+           # placeholder id before persistence)
+   23:     for insight in insights:
+   17:         insight["source"]["analysis_id"] = analysis_id
+       
+           # Persist REAL-dataset insights so monitoring can convert them into alerts
+           # with full lineage (alert <- insight <- analysis <- import). Synthetic
+           # demo insights stay ephemeral — they never become monitoring alerts.
+    6:     if dataset_mode == "real" and data_import_id is not None:
+    3:         conn = open_db(db_path)
+    3:         try:
+   10:             for insight in insights:
+    7:                 if insight.get("status") == "insufficient_data":
+    2:                     continue  # nothing was actually detected — never alert on it
+   10:                 insert_ai_insight(
+    5:                     conn,
+    5:                     insight_type=insight["insight_type"],
+    5:                     severity=insight["severity"],
+    5:                     title=insight["title"],
+    5:                     description=insight.get("summary"),
+    5:                     entity_type=insight.get("entity_type"),
+    5:                     entity_id=insight.get("entity_id"),
+    5:                     confidence=insight.get("confidence"),
+    5:                     recommendation=insight.get("recommendation"),
+    5:                     evidence=insight.get("evidence"),
+    5:                     analysis_id=analysis_id,
+    5:                     source_import_id=data_import_id,
+                       )
+    3:             conn.commit()
+               finally:
+    3:             conn.close()
+       
+    6:     result["analysis_run"] = run
+    6:     result["duration_ms"] = duration_ms
+   12:     logger.info(
+    6:         "[AnalysisCenter] %s %s: %d insight(s) across %d type(s) (%.3fs)",
+    6:         analysis_id, dataset_mode, len(insights), len(types), duration_ms / 1000.0,
+           )
+    6:     return result
+       
+       
+       # ---------------------------------------------------------------------------
+       # History / detail (real persisted runs)
+       # ---------------------------------------------------------------------------
+       
+    1: def analysis_history(db_path: str = DEFAULT_DB_PATH, *, page: int = 1, per_page: int = 10) -> dict:
+    3:     conn = open_db(db_path)
+    3:     try:
+    3:         total = conn.execute("SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"]
+    6:         rows = conn.execute(
+    3:             "SELECT r.*, i.dataset_name, i.file_name, s.name AS source_name "
+                   "FROM analysis_runs r "
+                   "LEFT JOIN data_imports i ON i.id = r.data_import_id "
+                   "LEFT JOIN data_sources s ON s.id = i.data_source_id "
+                   "ORDER BY r.id DESC LIMIT :limit OFFSET :offset",
+    3:             {"limit": per_page, "offset": (page - 1) * per_page},
+               ).fetchall()
+           finally:
+    3:         conn.close()
+       
+    3:     runs = []
+    9:     for row in rows:
+    6:         r = dict(row)
+   12:         runs.append({
+    6:             "id": r["id"],
+    6:             "analysis_id": r["analysis_id"],
+    6:             "dataset_mode": r["dataset_mode"],
+    6:             "data_import_id": r["data_import_id"],
+    6:             "dataset_name": r.get("dataset_name") or ("Synthetic Demo Dataset" if r["dataset_mode"] == "synthetic" else None),
+    6:             "source_name": r.get("source_name"),
+    6:             "status": r["status"],
+    6:             "insight_count": r["insight_count"],
+    6:             "anomaly_count": r["anomaly_count"],
+    6:             "finding_count": r["finding_count"],
+    6:             "case_count": r["case_count"],
+    6:             "alert_count": r["alert_count"],
+    6:             "analysis_types": json.loads(r["analysis_types"]) if r.get("analysis_types") else None,
+    6:             "duration_ms": r.get("duration_ms"),
+    6:             "created_at": r["created_at"],
+    6:             "summary": r.get("summary"),
+               })
+    6:     return {"runs": runs, "total": total, "page": page, "per_page": per_page,
+    3:             "pages": max(1, -(-total // per_page))}
+       
+       
+    1: def analysis_detail(run_id: int, db_path: str = DEFAULT_DB_PATH):
+    3:     conn = open_db(db_path)
+    3:     try:
+    6:         row = conn.execute(
+    3:             "SELECT r.*, i.dataset_name, s.name AS source_name "
+                   "FROM analysis_runs r "
+                   "LEFT JOIN data_imports i ON i.id = r.data_import_id "
+                   "LEFT JOIN data_sources s ON s.id = i.data_source_id "
+                   "WHERE r.id = :id",
+    3:             {"id": run_id},
+               ).fetchone()
+           finally:
+    3:         conn.close()
+    3:     if row is None:
+    1:         return None
+    2:     r = dict(row)
+    2:     return {
+    2:         "id": r["id"],
+    2:         "analysis_id": r["analysis_id"],
+    2:         "dataset_mode": r["dataset_mode"],
+    2:         "data_import_id": r["data_import_id"],
+    2:         "dataset_name": r.get("dataset_name") or ("Synthetic Demo Dataset" if r["dataset_mode"] == "synthetic" else None),
+    2:         "source_name": r.get("source_name"),
+    2:         "status": r["status"],
+    2:         "insight_count": r["insight_count"],
+    2:         "anomaly_count": r["anomaly_count"],
+    2:         "finding_count": r["finding_count"],
+    2:         "case_count": r["case_count"],
+    2:         "alert_count": r["alert_count"],
+    2:         "analysis_types": json.loads(r["analysis_types"]) if r.get("analysis_types") else None,
+    2:         "filters": json.loads(r["filters"]) if r.get("filters") else None,
+    2:         "timings": json.loads(r["timings"]) if r.get("timings") else None,
+    2:         "duration_ms": r.get("duration_ms"),
+    2:         "created_at": r["created_at"],
+    2:         "summary": r.get("summary"),
+    2:         "error": r.get("error"),
+           }

@@ -1,0 +1,797 @@
+    1: """RationAI — Executive Command Center & Intelligence Reports backend (Phase 12).
+       
+       An ORCHESTRATION layer, not another analytics engine. Everything here is a
+       read-only projection of the existing Phase 5 analytics, Phase 9 AI insights,
+       Phase 10 simulations, and Phase 11 alerts — the same formulas, thresholds,
+       and severity conventions are reused, never duplicated.
+       
+       The command center answers, for a configurable scope (state / district / FPS /
+       commodity / date range):
+       
+           What is happening?          -> KPIs (with current vs previous comparison)
+           Where are the problems?     -> district + FPS risk tables (ranked)
+           How serious are they?       -> risk overview from Phase 11 alerts
+           What changed?               -> distribution/demand/alert trends
+           What does the AI recommend? -> executive summary + recommended actions
+           What should be investigated?-> top AI insights + active alerts
+           How fresh is the data?      -> Phase 8 freshness + source status
+           Where did it come from?     -> lineage (sources -> imports -> analyses)
+       
+       Hard rules:
+       - No fake values: every number comes from the database or a stored Phase 11
+         alert / Phase 9 insight. Missing data renders as None -> "Not available".
+       - The executive summary is generated ONLY from a compact structured context
+         (KPIs, counts, top alerts/insights) via ``agents.llm.maybe_generate`` with
+         a deterministic fallback; the LLM never sees raw rows and never calculates.
+       - Reports are persisted (``reports`` table, RPT-YYYY-NNNN, never overwritten)
+         and carry full lineage for auditability.
+       - Simulation results are NEVER mixed into live KPIs (Phase 10 writes only to
+         the scenarios table, which this module ignores).
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import date, datetime, timedelta, timezone
+    1: from typing import Optional
+       
+    1: from agents.llm import maybe_generate
+    1: from analytics import INVENTORY_CRITICAL_DAYS, INVENTORY_WARNING_DAYS
+    1: from database import (
+           DEFAULT_DB_PATH,
+           get_report_by_report_id,
+           insert_report,
+           list_reports,
+           open_db,
+       )
+    1: from pipeline import freshness, quality_panel
+       
+    1: logger = logging.getLogger("rationright.command_center")
+       
+       #: Default comparison window when no explicit dates are given: the last 30
+       #: days vs the 30 days before that.
+    1: DEFAULT_WINDOW_DAYS = 30
+    1: TREND_RANGES = ("7d", "30d", "90d")
+       
+    1: _SEVERITY_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+       
+       
+    1: def _now() -> datetime:
+  118:     return datetime.now(timezone.utc)
+       
+       
+    1: def _iso_date(value) -> Optional[str]:
+  119:     value = (value or "").strip()
+  119:     if not value:
+   70:         return None
+   49:     try:
+   49:         return date.fromisoformat(value).isoformat()
+           except ValueError:
+               return None
+       
+       
+    1: def _window(from_date: Optional[str], to_date: Optional[str]):
+           """Return ``(from_d, to_d, prev_from_d, prev_to_d)`` as ISO dates.
+       
+           Current window is [from, to] (default: the last 30 days); the previous
+           window is the same length immediately before it. Deterministic, validated.
+           """
+   40:     to = _iso_date(to_date) or _now().date().isoformat()
+   40:     frm = _iso_date(from_date)
+   40:     if frm is None:
+   35:         frm = (_now().date() - timedelta(days=DEFAULT_WINDOW_DAYS - 1)).isoformat()
+   40:     if frm > to:
+    1:         raise ValueError("from date must be on or before to date")
+   39:     length = (date.fromisoformat(to) - date.fromisoformat(frm)).days + 1
+   39:     prev_to = (date.fromisoformat(frm) - timedelta(days=1)).isoformat()
+   39:     prev_from = (date.fromisoformat(prev_to) - timedelta(days=length - 1)).isoformat()
+   39:     return frm, to, prev_from, prev_to
+       
+       
+       # ---------------------------------------------------------------------------
+       # Scope helpers (parameterized — never user-supplied SQL)
+       # ---------------------------------------------------------------------------
+       
+    2: def _scope(conn, *, state=None, district=None, fps=None, commodity=None,
+    1:            from_date=None, to_date=None, tx_alias="t"):
+           """WHERE clause + params scoping transactions by geography/commodity/date.
+       
+           Geography resolves through fps_centers (an FPS belongs to a district/state).
+           Date uses the documented date-only comparison (both YYYY-MM-DD and
+           YYYY-MM-DDTHH:MM:SS values exist in the DB).
+           """
+   39:     where, params = [], {}
+   39:     if commodity:
+    2:         where.append("LOWER(%s.commodity) = LOWER(:commodity)" % tx_alias)
+    2:         params["commodity"] = commodity.strip()
+   39:     if fps:
+    3:         where.append("f.fps_code = :fps")
+    3:         params["fps"] = fps.strip()
+   36:     elif district:
+    1:         where.append("COALESCE(f.district, '') = :district")
+    1:         params["district"] = district.strip()
+   35:     elif state:
+               where.append("COALESCE(f.state, '') = :state")
+               params["state"] = state.strip()
+   39:     if from_date:
+   39:         where.append("substr(%s.transaction_date, 1, 10) >= :from_date" % tx_alias)
+   39:         params["from_date"] = from_date
+   39:     if to_date:
+   39:         where.append("substr(%s.transaction_date, 1, 10) <= :to_date" % tx_alias)
+   39:         params["to_date"] = to_date
+   39:     return (" WHERE " + " AND ".join(where)) if where else "", params
+       
+       
+    1: def _districts(conn) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT DISTINCT district FROM fps_centers "
+               "WHERE district IS NOT NULL AND district != '' ORDER BY district"
+           ).fetchall()
+  100:     return [r["district"] for r in rows]
+       
+       
+    1: def _commodities(conn) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT DISTINCT commodity FROM ration_transactions "
+               "WHERE commodity IS NOT NULL ORDER BY commodity"
+           ).fetchall()
+  135:     return [r["commodity"] for r in rows]
+       
+       
+    1: def _fps_list(conn) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT fps_code FROM fps_centers WHERE fps_code IS NOT NULL "
+               "ORDER BY fps_code"
+           ).fetchall()
+  650:     return [r["fps_code"] for r in rows]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Alert scoping — an alert references an FPS (by code), a commodity, a data
+       # source, or a beneficiary; geography resolves through fps_centers.
+       # ---------------------------------------------------------------------------
+       
+    1: def _scoped_alerts(conn, *, state=None, district=None, fps=None, commodity=None) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT a.*, f.district AS fps_district, f.state AS fps_state "
+               "FROM alerts a LEFT JOIN fps_centers f ON f.fps_code = a.entity_id "
+               "AND a.entity_type = 'fps_center' "
+               "WHERE a.status IN ('OPEN','ACKNOWLEDGED') ORDER BY a.last_detected_at DESC"
+           ).fetchall()
+   39:     out = []
+   65:     for row in rows:
+   26:         a = dict(row)
+   26:         if commodity and (a.get("commodity") or "") != commodity:
+    1:             continue
+   25:         if fps and not (a["entity_type"] == "fps_center" and a["entity_id"] == fps):
+                   continue
+   25:         if district and a.get("fps_district") != district:
+                   continue
+   25:         if state and a.get("fps_state") != state:
+                   continue
+   25:         out.append(a)
+   39:     return out
+       
+       
+       # ---------------------------------------------------------------------------
+       # KPIs (current vs previous window, deterministic comparisons)
+       # ---------------------------------------------------------------------------
+       
+    1: def _change_pct(current, previous):
+  316:     if previous is None or current is None:
+  235:         return None
+   81:     if previous == 0:
+   33:         return None
+   48:     return round((current - previous) / previous * 100.0, 1)
+       
+       
+    1: def _kpi(key, label, value, unit, status, current, previous=None, *, note=None):
+  312:     return {
+  312:         "key": key, "label": label, "value": value, "unit": unit,
+  312:         "status": status, "note": note,
+  312:         "comparison": {
+  312:             "current": current,
+  312:             "previous": previous,
+  312:             "change_pct": _change_pct(current, previous),
+  312:             "available": previous is not None,
+               },
+           }
+       
+       
+    1: def _distribution_kpis(conn, *, from_date, to_date, prev_from, prev_to, scope_sql,
+                              scope_params, filters) -> list:
+   39:     clause = scope_sql
+   39:     params = dict(scope_params)
+       
+   39:     def _sum(frm, to):
+   78:         p = dict(params)
+   78:         p["from_date"] = frm
+   78:         p["to_date"] = to
+   78:         w = " AND substr(t.transaction_date, 1, 10) >= :from_date AND substr(t.transaction_date, 1, 10) <= :to_date"
+  156:         row = conn.execute(
+  234:             "SELECT COALESCE(SUM(t.quantity), 0) AS qty, COUNT(*) AS n "
+                   "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id "
+  234:             + clause + w, p).fetchone()
+   78:         return row["qty"], row["n"]
+       
+   39:     cur_qty, cur_n = _sum(from_date, to_date)
+   39:     prev_qty, prev_n = _sum(prev_from, prev_to)
+   39:     return [
+   78:         _kpi("distribution", "Total distribution", round(cur_qty, 2), "kg",
+   39:              "ok" if cur_qty > 0 else "muted", cur_qty, prev_qty),
+   39:         _kpi("transactions", "Transactions", cur_n, "", "muted", cur_n, prev_n),
+           ]
+       
+       
+    1: def _inventory_scope(scope_sql, scope_params):
+           """Inventory is a point-in-time snapshot: reuse the geography/commodity
+           scope but drop the date window (inventory has no transaction date)."""
+   78:     where = scope_sql.replace("t.", "i.")
+  324:     parts = [p.strip() for p in where.replace(" WHERE ", "", 1).split(" AND ") if p.strip()]
+  324:     parts = [p for p in parts if "transaction_date" not in p]
+   78:     clause = (" WHERE " + " AND ".join(parts)) if parts else ""
+  324:     params = {k: v for k, v in scope_params.items() if k not in ("from_date", "to_date")}
+   78:     return clause, params
+       
+       
+    1: def _inventory_kpis(conn, *, scope_sql, scope_params) -> list:
+           # Inventory is a point-in-time snapshot (no history) — comparison is not
+           # available and is reported honestly as such.
+   39:     where, params = _inventory_scope(scope_sql, scope_params)
+   78:     row = conn.execute(
+   78:         "SELECT COALESCE(SUM(i.current_stock), 0) AS stock, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN "
+               "   i.current_stock / (i.monthly_consumption / 30.0) END), 0) AS coverage_sum, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN 1 ELSE 0 END), 0) AS coverage_n, "
+               " COUNT(DISTINCT i.fps_center_id) AS centers "
+   39:         "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id" + where,
+   39:         params,
+           ).fetchone()
+   39:     avg_coverage = (row["coverage_sum"] / row["coverage_n"]) if row["coverage_n"] else None
+   39:     return [
+   78:         _kpi("inventory", "Total inventory", round(row["stock"], 2), "kg",
+   39:              "ok" if row["stock"] > 0 else "muted", row["stock"], None,
+   39:              note="point-in-time snapshot — no historical comparison"),
+   78:         _kpi("coverage", "Avg inventory coverage",
+   39:              round(avg_coverage, 1) if avg_coverage is not None else None,
+   39:              "days", ("warning" if avg_coverage is not None and avg_coverage < INVENTORY_WARNING_DAYS
+   32:                       else "ok" if avg_coverage is not None else "muted"),
+   39:              avg_coverage, None, note="current_stock / daily consumption"),
+           ]
+       
+       
+    1: def _risk_fps(conn, *, scope_sql, scope_params, filters) -> list:
+           """FPS with coverage below thresholds or below reorder (scoped)."""
+   39:     where, params = _inventory_scope(scope_sql, scope_params)
+   78:     rows = conn.execute(
+   78:         "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, f.district, "
+               " i.commodity, i.current_stock, i.monthly_consumption, i.reorder_threshold "
+   39:         "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id" + where,
+   39:         params,
+           ).fetchall()
+   39:     high = set()
+   89:     for r in rows:
+   50:         stock = r["current_stock"] or 0
+   50:         monthly = r["monthly_consumption"]
+   50:         if r["reorder_threshold"] is not None and stock < r["reorder_threshold"]:
+   28:             high.add(r["fps_code"])
+   50:         if monthly and monthly > 0 and stock / (monthly / 30.0) < INVENTORY_WARNING_DAYS:
+    7:             high.add(r["fps_code"])
+   39:     return sorted(high)
+       
+       
+       # ---------------------------------------------------------------------------
+       # District / FPS risk tables
+       # ---------------------------------------------------------------------------
+       
+    1: def _district_risk(conn, *, from_date, to_date, scope_sql, scope_params, alerts) -> list:
+           # Distribution per district (scoped by the caller's geography/date).
+   39:     p = dict(scope_params)
+   39:     p["from_date"] = from_date
+   39:     p["to_date"] = to_date
+   78:     rows = conn.execute(
+  117:         "SELECT COALESCE(f.district, 'Unknown') AS district, "
+               " COALESCE(SUM(t.quantity), 0) AS qty, COUNT(t.id) AS n "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id" +
+   39:         scope_sql +
+   39:         " AND substr(t.transaction_date, 1, 10) >= :from_date "
+               " AND substr(t.transaction_date, 1, 10) <= :to_date "
+               "GROUP BY district ORDER BY qty DESC",
+   39:         p,
+           ).fetchall()
+           # Coverage per district from inventory (point-in-time).
+   78:     inv = conn.execute(
+   39:         "SELECT COALESCE(f.district, 'Unknown') AS district, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN "
+               "   i.current_stock / (i.monthly_consumption / 30.0) END), 0) AS coverage_sum, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN 1 ELSE 0 END), 0) AS coverage_n "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "GROUP BY district"
+           ).fetchall()
+  181:     coverage = {r["district"]: (r["coverage_sum"] / r["coverage_n"] if r["coverage_n"] else None)
+   71:                 for r in inv}
+           # Alerts per district (alerts reference FPS codes).
+   39:     alert_counts = {}
+   39:     alert_max = {}
+  161:     fps_to_district = {
+  122:         r["fps_code"]: r["district"] for r in conn.execute(
+   39:             "SELECT fps_code, district FROM fps_centers WHERE district IS NOT NULL")
+           }
+   64:     for a in alerts:
+   25:         dist = a.get("fps_district")
+   25:         if not dist and a["entity_type"] == "fps_center":
+    4:             dist = fps_to_district.get(a["entity_id"])
+   25:         if not dist:
+    4:             continue
+   21:         alert_counts[dist] = alert_counts.get(dist, 0) + 1
+   21:         alert_max[dist] = max(alert_max.get(dist, 0), _SEVERITY_RANK.get(a["severity"], 0))
+       
+   39:     out = []
+   74:     for r in rows:
+   35:         dist = r["district"]
+   35:         cov = coverage.get(dist)
+   35:         n_alerts = alert_counts.get(dist, 0)
+   35:         severity = alert_max.get(dist, 0)
+   35:         if severity >= 4 or (cov is not None and cov < INVENTORY_CRITICAL_DAYS):
+    7:             risk = "HIGH"
+   28:         elif severity >= 3 or (cov is not None and cov < INVENTORY_WARNING_DAYS):
+   21:             risk = "MEDIUM"
+    7:         elif n_alerts or r["n"]:
+    7:             risk = "LOW"
+               else:
+                   risk = "LOW"
+   70:         out.append({
+   35:             "district": dist, "distribution_kg": round(r["qty"], 2),
+   35:             "transactions": r["n"],
+   35:             "coverage_days": round(cov, 1) if cov is not None else None,
+   35:             "alerts": n_alerts, "risk": risk,
+               })
+   39:     rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+   74:     out.sort(key=lambda d: (rank.get(d["risk"], 3), -d["distribution_kg"]))
+   39:     return out
+       
+       
+    1: def _fps_risk(conn, *, from_date, to_date, scope_sql, scope_params, alerts) -> list:
+   39:     p = dict(scope_params)
+   39:     p["from_date"] = from_date
+   39:     p["to_date"] = to_date
+   78:     rows = conn.execute(
+  117:         "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, f.district, "
+               " COALESCE(SUM(t.quantity), 0) AS qty, COUNT(t.id) AS n "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id" +
+   39:         scope_sql +
+   39:         " AND substr(t.transaction_date, 1, 10) >= :from_date "
+               " AND substr(t.transaction_date, 1, 10) <= :to_date "
+               "GROUP BY fps_code ORDER BY qty DESC",
+   39:         p,
+           ).fetchall()
+   78:     inv = conn.execute(
+   39:         "SELECT COALESCE(f.fps_code, 'Unknown') AS fps_code, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN "
+               "   i.current_stock / (i.monthly_consumption / 30.0) END), 0) AS coverage_sum, "
+               " COALESCE(SUM(CASE WHEN i.monthly_consumption > 0 THEN 1 ELSE 0 END), 0) AS coverage_n, "
+               " MIN(CASE WHEN i.reorder_threshold IS NOT NULL AND i.current_stock < i.reorder_threshold "
+               "     THEN 1 ELSE 0 END) AS below_reorder "
+               "FROM inventory i LEFT JOIN fps_centers f ON f.id = i.fps_center_id "
+               "GROUP BY fps_code"
+           ).fetchall()
+  225:     coverage = {r["fps_code"]: (r["coverage_sum"] / r["coverage_n"] if r["coverage_n"] else None)
+   93:                 for r in inv}
+  132:     below = {r["fps_code"]: bool(r["below_reorder"]) for r in inv}
+   39:     alert_counts, alert_max = {}, {}
+   64:     for a in alerts:
+   25:         if a["entity_type"] == "fps_center" and a["entity_id"]:
+   25:             alert_counts[a["entity_id"]] = alert_counts.get(a["entity_id"], 0) + 1
+   50:             alert_max[a["entity_id"]] = max(
+   25:                 alert_max.get(a["entity_id"], 0), _SEVERITY_RANK.get(a["severity"], 0))
+       
+   39:     out = []
+  585:     for r in rows:
+  546:         fps_code = r["fps_code"]
+  546:         cov = coverage.get(fps_code)
+  546:         sev = alert_max.get(fps_code, 0)
+  546:         if sev >= 4 or (cov is not None and cov < INVENTORY_CRITICAL_DAYS) or below.get(fps_code):
+   28:             risk = "HIGH"
+  518:         elif sev >= 3 or (cov is not None and cov < INVENTORY_WARNING_DAYS):
+                   risk = "MEDIUM"
+               else:
+  518:             risk = "LOW"
+ 1092:         out.append({
+  546:             "fps_code": fps_code, "district": r["district"],
+  546:             "distribution_kg": round(r["qty"], 2), "transactions": r["n"],
+  546:             "coverage_days": round(cov, 1) if cov is not None else None,
+  546:             "alerts": alert_counts.get(fps_code, 0), "risk": risk,
+               })
+   39:     rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+  585:     out.sort(key=lambda d: (rank.get(d["risk"], 3), -d["distribution_kg"]))
+   39:     return out
+       
+       
+       # ---------------------------------------------------------------------------
+       # Trends
+       # ---------------------------------------------------------------------------
+       
+    1: def _trends(conn, *, trend_range, from_date, to_date, scope_sql, scope_params) -> dict:
+   39:     if trend_range not in TREND_RANGES:
+               trend_range = "30d"
+   39:     days = int(trend_range[:-1])
+   39:     to = _iso_date(to_date) or _now().date().isoformat()
+   39:     frm = (date.fromisoformat(to) - timedelta(days=days - 1)).isoformat()
+   39:     p = dict(scope_params)
+   39:     p["from_date"] = frm
+   39:     p["to_date"] = to
+       
+   78:     distribution = conn.execute(
+  117:         "SELECT substr(t.transaction_date, 1, 10) AS day, "
+               " COALESCE(SUM(t.quantity), 0) AS qty, COUNT(*) AS n "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id" +
+   39:         scope_sql +
+   39:         " AND substr(t.transaction_date, 1, 10) >= :from_date "
+               " AND substr(t.transaction_date, 1, 10) <= :to_date "
+               "GROUP BY day ORDER BY day",
+   39:         p,
+           ).fetchall()
+  167:     by_day = {r["day"]: r for r in distribution}
+   39:     series = []
+ 1209:     for offset in range(days):
+ 1170:         day = (date.fromisoformat(to) - timedelta(days=days - 1 - offset)).isoformat()
+ 1170:         r = by_day.get(day)
+ 2340:         series.append({"date": day, "quantity": round(r["qty"], 2) if r else 0.0,
+ 1170:                        "count": r["n"] if r else 0})
+   78:     by_commodity = conn.execute(
+  117:         "SELECT t.commodity, COALESCE(SUM(t.quantity), 0) AS qty, COUNT(*) AS n "
+               "FROM ration_transactions t LEFT JOIN fps_centers f ON f.id = t.fps_center_id" +
+   39:         scope_sql +
+   39:         " AND substr(t.transaction_date, 1, 10) >= :from_date "
+               " AND substr(t.transaction_date, 1, 10) <= :to_date "
+               "GROUP BY t.commodity ORDER BY qty DESC",
+   39:         p,
+           ).fetchall()
+ 1248:     total_qty = sum(r["quantity"] for r in series)
+   39:     return {
+   39:         "range": trend_range,
+   39:         "from": frm, "to": to,
+   39:         "total_quantity": round(total_qty, 2),
+   39:         "distribution": series,
+  267:         "by_commodity": [{"commodity": r["commodity"], "quantity": round(r["qty"], 2),
+  139:                           "count": r["n"]} for r in by_commodity],
+           }
+       
+       
+    1: def _alert_trend(conn, days: int = 7) -> dict:
+   39:     from database import get_alert_trend
+       
+   39:     return get_alert_trend(conn, days)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Insights / alerts / recommended actions
+       # ---------------------------------------------------------------------------
+       
+    1: def _top_insights(conn, limit: int = 5) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT * FROM ai_insights ORDER BY "
+               "CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 "
+               "WHEN 'LOW' THEN 3 ELSE 4 END, id DESC LIMIT :limit",
+   39:         {"limit": limit},
+           ).fetchall()
+   39:     import json as _json
+       
+   39:     out = []
+   41:     for r in rows:
+    2:         d = dict(r)
+    2:         raw = d.get("evidence")
+    2:         if isinstance(raw, str):
+    2:             try:
+    2:                 d["evidence"] = _json.loads(raw)
+                   except ValueError:
+                       d["evidence"] = None
+    2:         out.append(d)
+   39:     return out
+       
+       
+    1: def _recommended_actions(alerts, insights, limit: int = 6) -> list:
+   39:     actions = []
+   64:     for a in alerts:
+   25:         text = (a.get("recommendation") or "").strip()
+   25:         if not text:
+   21:             continue
+    8:         actions.append({
+    4:             "priority": a["severity"], "action": text,
+    4:             "source": "alert", "entity": a.get("entity_id"), "alert_id": a["alert_id"],
+               })
+   41:     for i in insights:
+    2:         if i.get("insight_type") != "RECOMMENDATION":
+    2:             continue
+               text = (i.get("recommendation") or i.get("title") or "").strip()
+               if not text or any(x["action"] == text for x in actions):
+                   continue
+               actions.append({
+                   "priority": i["severity"], "action": text,
+                   "source": "ai", "entity": i.get("entity_id"),
+                   "analysis_id": i.get("analysis_id"),
+               })
+   43:     actions.sort(key=lambda x: -_SEVERITY_RANK.get(x["priority"], 0))
+   39:     return actions[:limit]
+       
+       
+       # ---------------------------------------------------------------------------
+       # Executive summary (AI from a compact structured context — deterministic
+       # fallback; never invents; never sees raw rows)
+       # ---------------------------------------------------------------------------
+       
+    1: def _executive_summary(payload: dict, generator=None) -> dict:
+  390:     kpis = {k["key"]: k for k in payload["kpis"]}
+   39:     risk = payload["risk_overview"]
+  103:     top_alerts = [a for a in payload["active_alerts"]][:3]
+   80:     top_insights = [i for i in payload["top_insights"]][:3]
+  113:     districts = [d for d in payload["district_risk"]][:3]
+   39:     quality = payload["data_quality"]
+   39:     context = {
+   39:         "total_distribution_kg": (kpis.get("distribution") or {}).get("value"),
+   39:         "active_alerts": risk.get("total", 0),
+  273:         "alert_counts": {sev: risk.get(sev.lower(), 0) for sev in
+   39:                          ("critical", "high", "medium", "low")},
+  192:         "top_alerts": [{"title": a.get("title"), "severity": a.get("severity"),
+   89:                         "entity": a.get("entity_id")} for a in top_alerts],
+  123:         "top_insights": [{"title": i.get("title"), "severity": i.get("severity"),
+   43:                           "entity": i.get("entity_id")} for i in top_insights],
+  222:         "top_districts": [{"district": d.get("district"), "risk": d.get("risk"),
+  109:                            "alerts": d.get("alerts")} for d in districts],
+   39:         "data_quality_pct": quality.get("overall"),
+   39:         "freshness_status": payload["freshness"].get("status"),
+   39:         "data_status_note": payload["disclaimer"],
+           }
+   78:     empty = (not (payload["kpis"] or [])) and risk.get("total", 0) == 0 \
+               and not payload["top_insights"]
+   39:     if empty:
+               return {"summary": "Insufficient data to provide a reliable executive summary.",
+                       "generated_by": "deterministic_fallback"}
+   39:     fallback = _fallback_summary(payload)
+   39:     text = maybe_generate("executive_summary", context, fallback, generator=generator)
+   78:     return {"summary": text,
+   39:             "generated_by": "llm" if text != fallback else "deterministic_fallback"}
+       
+       
+    1: def _fallback_summary(payload: dict) -> str:
+   39:     risk = payload["risk_overview"]
+  390:     kpis = {k["key"]: k for k in payload["kpis"]}
+   39:     parts = []
+   39:     dist = (kpis.get("distribution") or {}).get("value")
+   39:     if dist:
+   35:         parts.append("Total distribution is %.0f kg in the selected window." % dist)
+   39:     if risk.get("total"):
+   46:         parts.append("%d active alert(s) (%d critical, %d high) require attention." % (
+   23:             risk["total"], risk.get("critical", 0), risk.get("high", 0)))
+  113:     high_districts = [d for d in payload["district_risk"] if d["risk"] == "HIGH"][:3]
+   39:     if high_districts:
+   28:         parts.append("High-risk district(s): %s." % ", ".join(
+   14:             d["district"] for d in high_districts))
+   39:     if payload["top_insights"]:
+    4:         parts.append("Top AI insight: %s (%s)." % (
+    2:             payload["top_insights"][0]["title"], payload["top_insights"][0]["severity"]))
+   39:     if not parts:
+    4:         return "Insufficient data to provide a reliable executive summary."
+   35:     return " ".join(parts) + " This summary reflects the current monitored state and is not a prediction."
+       
+       
+       # ---------------------------------------------------------------------------
+       # Main orchestration entry point
+       # ---------------------------------------------------------------------------
+       
+    2: def command_center(
+    1:     db_path: str = DEFAULT_DB_PATH,
+           *,
+    1:     state: Optional[str] = None,
+    1:     district: Optional[str] = None,
+    1:     fps: Optional[str] = None,
+    1:     commodity: Optional[str] = None,
+    1:     from_date: Optional[str] = None,
+    1:     to_date: Optional[str] = None,
+    1:     trend_range: str = "30d",
+    1:     generator=None,
+       ) -> dict:
+           """The complete command-center payload for one scope. Read-only."""
+   40:     conn = open_db(db_path)
+   40:     try:
+   40:         frm, to, prev_from, prev_to = _window(from_date, to_date)
+   78:         scope_sql, scope_params = _scope(
+   39:             conn, state=state, district=district, fps=fps, commodity=commodity,
+   39:             from_date=frm, to_date=to)
+   78:         filters = {"state": state, "district": district, "fps": fps,
+   39:                    "commodity": commodity, "from": frm, "to": to,
+   39:                    "trend_range": trend_range}
+       
+   78:         alerts = _scoped_alerts(conn, state=state, district=district, fps=fps,
+   39:                                 commodity=commodity)
+   39:         kpis = []
+   78:         kpis.extend(_distribution_kpis(conn, from_date=frm, to_date=to,
+   39:                                        prev_from=prev_from, prev_to=prev_to,
+   39:                                        scope_sql=scope_sql, scope_params=scope_params,
+   39:                                        filters=filters))
+   39:         kpis.extend(_inventory_kpis(conn, scope_sql=scope_sql, scope_params=scope_params))
+   78:         high_risk_fps = _risk_fps(conn, scope_sql=scope_sql, scope_params=scope_params,
+   39:                                   filters=filters)
+   39:         risk_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+   64:         for a in alerts:
+   25:             sev = (a.get("severity") or "LOW").lower()
+   25:             if sev in risk_counts:
+   25:                 risk_counts[sev] += 1
+   78:         kpis.append(_kpi("active_alerts", "Active alerts", len(alerts), "",
+   39:                          "warning" if len(alerts) else "ok", len(alerts), None,
+   39:                          note="OPEN + acknowledged (Phase 11)"))
+   78:         kpis.append(_kpi("critical_alerts", "Critical alerts",
+   39:                          risk_counts["critical"], "", "error" if risk_counts["critical"] else "ok",
+   39:                          risk_counts["critical"], None))
+   78:         kpis.append(_kpi("high_risk_fps", "High-risk FPS", len(high_risk_fps), "",
+   39:                          "error" if high_risk_fps else "ok", len(high_risk_fps), None,
+   39:                          note="coverage < %dd or below reorder threshold" % INVENTORY_WARNING_DAYS))
+   39:         quality = quality_panel(db_path=db_path)
+   78:         kpis.append(_kpi("data_quality", "Data quality",
+   39:                          quality.get("overall"), "%",
+   39:                          "ok" if (quality.get("overall") or 0) >= 90 else
+   39:                          "warning" if (quality.get("overall") or 0) is not None else "muted",
+   39:                          quality.get("overall"), None, note="global — Phase 4 formula"))
+       
+   78:         district_risk = _district_risk(conn, from_date=frm, to_date=to,
+   39:                                        scope_sql=scope_sql, scope_params=scope_params,
+   39:                                        alerts=alerts)
+   78:         fps_risk = _fps_risk(conn, from_date=frm, to_date=to,
+   39:                              scope_sql=scope_sql, scope_params=scope_params, alerts=alerts)
+   78:         trends = _trends(conn, trend_range=trend_range, from_date=frm, to_date=to,
+   39:                          scope_sql=scope_sql, scope_params=scope_params)
+   39:         insights = _top_insights(conn)
+  167:         active = [a for a in alerts
+   64:                   if a["severity"] in ("CRITICAL", "HIGH")][:6]
+   39:         actions = _recommended_actions(alerts, insights)
+   39:         fresh = freshness(db_path=db_path)
+   39:         sources = _source_lineage(conn)
+   39:         payload = {
+   39:             "generated_at": _now().isoformat(timespec="seconds"),
+   39:             "filters": filters,
+   78:             "filter_options": {"states": _states(conn), "districts": _districts(conn),
+   39:                                "fps": _fps_list(conn), "commodities": _commodities(conn)},
+   39:             "freshness": fresh,
+   39:             "sources": sources,
+   39:             "disclaimer": _disclaimer(conn),
+   39:             "data_quality": quality,
+   39:             "kpis": kpis,
+   39:             "risk_overview": {**risk_counts, "total": len(alerts)},
+   39:             "district_risk": district_risk,
+   39:             "fps_risk": fps_risk,
+   39:             "trends": trends,
+   39:             "alert_trend": _alert_trend(conn, 7),
+   39:             "top_insights": insights,
+   39:             "active_alerts": active,
+   39:             "recommended_actions": actions,
+   39:             "lineage": _lineage(conn),
+               }
+   39:         payload["executive_summary"] = _executive_summary(payload, generator=generator)
+   78:         return payload
+           finally:
+   40:         conn.close()
+       
+       
+    1: def _states(conn) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT DISTINCT state FROM fps_centers WHERE state IS NOT NULL AND state != '' "
+               "ORDER BY state"
+           ).fetchall()
+  100:     return [r["state"] for r in rows]
+       
+       
+    1: def _source_lineage(conn) -> list:
+   78:     rows = conn.execute(
+   39:         "SELECT s.id, s.name, s.type, s.status, s.last_successful_sync_at, s.last_error, "
+               " (SELECT COUNT(*) FROM data_imports i WHERE i.data_source_id = s.id) AS imports "
+               "FROM data_sources s ORDER BY s.id"
+           ).fetchall()
+  137:     return [dict(r) for r in rows]
+       
+       
+    1: def _disclaimer(conn) -> str:
+  137:     sources = [r["name"] for r in conn.execute("SELECT name FROM data_sources").fetchall()]
+   78:     real = any(s != "Synthetic Demo Dataset" for s in sources)
+  126:     mock = any("sample" in (s or "").lower() for s in sources)
+   39:     parts = []
+   39:     if real:
+   38:         parts.append("Analysis based on imported dataset.")
+   39:     if mock:
+   11:         parts.append("Includes bundled sample data (mock/test), clearly labeled.")
+   39:     if not real and sources:
+               parts.append("Analysis based on synthetic demo data only.")
+  115:     if any(s == "ogd_pds_resource" for s in sources):
+   11:         parts.append("Government connector: CONNECTOR READY / NOT CONNECTED — no live source verified.")
+   39:     return " ".join(parts) if parts else "No data sources configured."
+       
+       
+    1: def _lineage(conn) -> dict:
+   39:     import_count = conn.execute("SELECT COUNT(*) AS n FROM data_imports").fetchone()["n"]
+   78:     latest_imports = conn.execute(
+   39:         "SELECT i.id, i.dataset_name, i.status, i.record_count, i.successful_records, "
+               " i.completed_at, s.name AS source_name "
+               "FROM data_imports i LEFT JOIN data_sources s ON s.id = i.data_source_id "
+               "ORDER BY i.id DESC LIMIT 5"
+           ).fetchall()
+   39:     analysis_count = conn.execute("SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"]
+   78:     latest_analysis = conn.execute(
+   39:         "SELECT analysis_id, dataset_mode, status, insight_count, created_at "
+               "FROM analysis_runs ORDER BY id DESC LIMIT 3"
+           ).fetchall()
+   39:     return {
+   39:         "import_count": import_count,
+  115:         "latest_imports": [dict(r) for r in latest_imports],
+   39:         "analysis_count": analysis_count,
+   80:         "latest_analysis_runs": [dict(r) for r in latest_analysis],
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Intelligence reports (persisted, never overwritten, fully traceable)
+       # ---------------------------------------------------------------------------
+       
+    2: def generate_report(
+    1:     db_path: str = DEFAULT_DB_PATH,
+           *,
+    1:     period: Optional[str] = None,
+    1:     source: Optional[str] = None,
+    1:     filters: Optional[dict] = None,
+    1:     generator=None,
+       ) -> dict:
+           """Build + persist one intelligence report; returns the stored report."""
+    9:     conn = open_db(db_path)
+    9:     try:
+    9:         seq = conn.execute("SELECT COUNT(*) AS n FROM reports").fetchone()["n"] + 1
+    9:         report_id = "RPT-%04d-%04d" % (_now().year, seq)
+           finally:
+    9:         conn.close()
+       
+    9:     cc = command_center(db_path, **(filters or {}), generator=generator)
+    9:     period_label = period or "%s – %s" % (cc["filters"]["from"], cc["filters"]["to"])
+   44:     source_label = source or (", ".join(
+   18:         s["name"] for s in cc["sources"][:3]) or "Not available")
+    9:     report = {
+    9:         "report_id": report_id,
+    9:         "period": period_label,
+    9:         "source": source_label,
+    9:         "generated_at": cc["generated_at"],
+    9:         "disclaimer": cc["disclaimer"],
+    9:         "executive_summary": cc["executive_summary"],
+    9:         "kpis": cc["kpis"],
+    9:         "risk_overview": cc["risk_overview"],
+    9:         "district_risk": cc["district_risk"],
+    9:         "fps_risk": cc["fps_risk"],
+    9:         "trends": cc["trends"],
+    9:         "top_insights": cc["top_insights"],
+    9:         "active_alerts": cc["active_alerts"],
+    9:         "recommended_actions": cc["recommended_actions"],
+    9:         "data_quality": cc["data_quality"],
+    9:         "freshness": cc["freshness"],
+    9:         "lineage": cc["lineage"],
+    9:         "filters": cc["filters"],
+           }
+    9:     conn = open_db(db_path)
+    9:     try:
+   18:         insert_report(
+    9:             conn, report_id=report_id, period_label=period_label,
+    9:             source_label=source_label, filters=cc["filters"], payload=report)
+    9:         conn.commit()
+           finally:
+    9:         conn.close()
+    9:     return report
+       
+       
+    1: def report_history(db_path: str = DEFAULT_DB_PATH) -> dict:
+    3:     conn = open_db(db_path)
+    3:     try:
+    6:         return {"reports": list_reports(conn)}
+           finally:
+    3:         conn.close()
+       
+       
+    1: def report_detail(report_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+    4:     conn = open_db(db_path)
+    4:     try:
+    8:         return get_report_by_report_id(conn, report_id)
+           finally:
+    4:         conn.close()

@@ -1,0 +1,373 @@
+    1: """RationRight — Phase 12: Executive Command Center & Intelligence Reports tests.
+       
+       Covers ``command_center.py`` + the reports database layer + the new server
+       routes: KPI accuracy and previous-period comparison, risk overview matching
+       persisted Phase 11 alerts, district/FPS risk ranking, trend aggregation
+       consistency (chart totals agree with KPI totals), executive summary with the
+       deterministic fallback and LLM injection, alert/insight integration, global
+       filters, report generation/persistence/history/detail with full lineage, the
+       no-fabricated-values guarantee on an empty database, and the API surface
+       through the real server on an isolated temp database.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import os
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from datetime import datetime, timedelta, timezone
+    1: from pathlib import Path
+       
+    1: import command_center
+    1: import database as db
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+    1: _SEED_COUNTER = [0]
+       
+       
+    1: def _now_iso_ago(days=0):
+  540:     return (datetime.now(timezone.utc) - timedelta(days=days)
+  270:             ).isoformat(timespec="seconds")
+       
+       
+    1: def _seed(conn, *, with_alerts=True, quality=100.0):
+           """A deterministic fixture with transactions, inventory and alerts.
+       
+           Two FPS centers: UP-A1 (rice, healthy coverage) and UP-B1 (rice,
+           low coverage -> warning), one district, one inventory record and one
+           persisted alert, so every command-center section has real data.
+           """
+   18:     _SEED_COUNTER[0] += 1
+   18:     seed_n = _SEED_COUNTER[0]
+       
+   36:     src = db.insert_data_source(
+   18:         conn, name="cc_source_%d" % seed_n, source_type="CSV",
+   18:         description="command center fixture", status="ACTIVE")
+   36:     imp = db.insert_data_import(
+   18:         conn, data_source_id=src, dataset_name="cc_fixture_%d" % seed_n,
+   18:         file_name="fixture.csv", file_type="CSV",
+   18:         record_count=12, successful_records=12, failed_records=0,
+   18:         duplicate_records=0, status="COMPLETED")
+       
+   36:     db.upsert_beneficiaries(conn, [{"external_reference": "R1", "name": "A",
+   18:                                     "state": "UP", "district": "Lucknow"}])
+   18:     ben = db.beneficiary_ids(conn, ["R1"])
+   36:     db.upsert_fps_centers(conn, [
+   36:         {"fps_code": "UP-A1", "name": "Center A", "state": "UP",
+   18:          "district": "Lucknow"},
+   36:         {"fps_code": "UP-B1", "name": "Center B", "state": "UP",
+   18:          "district": "Lucknow"},
+           ])
+   18:     fps_ids = db.fps_center_ids(conn, ["UP-A1", "UP-B1"])
+   36:     db.insert_inventory_batch(conn, [
+   36:         {"fps_center_id": fps_ids["UP-A1"], "commodity": "rice",
+   18:          "current_stock": 2000, "reorder_threshold": 500},
+   36:         {"fps_center_id": fps_ids["UP-B1"], "commodity": "rice",
+   18:          "current_stock": 200, "reorder_threshold": 500},
+           ])
+           # 4 rice transactions at UP-A1 (45 days ago -> previous window) and 10
+           # rice transactions at UP-B1 (yesterday -> current window): the KPI
+           # comparison must be current 1000 vs previous 400 (+150%).
+   18:     tx = []
+   90:     for i in range(4):
+  144:         tx.append({
+   72:             "external_transaction_id": "CC%02d-A-%d" % (seed_n, i),
+   72:             "beneficiary_id": ben["R1"], "fps_center_id": fps_ids["UP-A1"],
+   72:             "commodity": "rice", "quantity": 100,
+   72:             "transaction_date": _now_iso_ago(45),
+   72:             "unit": "kg", "latitude": 26.8, "longitude": 80.9,
+   72:             "status": "COMPLETED", "source_import_id": imp,
+               })
+  198:     for i in range(10):
+  360:         tx.append({
+  180:             "external_transaction_id": "CC%02d-B-%d" % (seed_n, i),
+  180:             "beneficiary_id": ben["R1"], "fps_center_id": fps_ids["UP-B1"],
+  180:             "commodity": "rice", "quantity": 100,
+  180:             "transaction_date": _now_iso_ago(1),
+  180:             "unit": "kg", "latitude": 26.8, "longitude": 80.9,
+  180:             "status": "COMPLETED", "source_import_id": imp,
+               })
+   18:     db.insert_transactions_batch(conn, tx)
+       
+   18:     if with_alerts:
+   36:         db.insert_alert(
+   18:             conn, alert_id="ALT-TEST-%04d" % seed_n, rule_type="INVENTORY_RISK",
+   18:             condition="coverage_low", severity="HIGH",
+   18:             title="Inventory coverage below threshold",
+   18:             status="OPEN", entity_type="fps_center", entity_id="UP-B1",
+   18:             commodity="rice", current_value=2.0, threshold=30.0,
+   18:             evidence="{}", created_at=_now_iso_ago(0))
+   18:     return {"src": src, "imp": imp, "seed_n": seed_n}
+       
+       
+    1: def _fresh_db():
+   19:     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+   19:     tmp.close()
+   19:     os.unlink(tmp.name)
+   19:     return tmp.name
+       
+       
+    2: class CommandCenterCoreTests(unittest.TestCase):
+    1:     def setUp(self):
+   12:         self.db_path = _fresh_db()
+   12:         self.conn = db.open_db(self.db_path)
+   12:         self.s = _seed(self.conn)
+   12:         self.conn.commit()
+   12:         self.conn.close()
+       
+    1:     def tearDown(self):
+   12:         if os.path.exists(self.db_path):
+   12:             os.unlink(self.db_path)
+       
+    1:     def test_kpi_accuracy(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+   10:         kpis = {k["key"]: k for k in cc["kpis"]}
+               # current window = last 30 days -> 10 transactions (1000 kg rice)
+    1:         self.assertEqual(kpis["distribution"]["value"], 1000.0)
+    1:         self.assertEqual(kpis["transactions"]["value"], 10)
+    1:         self.assertEqual(kpis["inventory"]["value"], 2200.0)
+               # active alerts KPI matches persisted alerts
+    1:         self.assertEqual(kpis["active_alerts"]["value"], 1)
+    1:         self.assertEqual(kpis["critical_alerts"]["value"], 0)
+    1:         self.assertEqual(kpis["high_risk_fps"]["value"], 1)  # UP-B1 below reorder
+       
+    1:     def test_kpi_previous_period_comparison(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+   10:         kpis = {k["key"]: k for k in cc["kpis"]}
+    1:         cmp = kpis["distribution"]["comparison"]
+    1:         self.assertTrue(cmp["available"])
+               # current 1000 vs previous 400 (4 x 100 on day 45) -> +150%
+    1:         self.assertEqual(cmp["current"], 1000.0)
+    1:         self.assertEqual(cmp["previous"], 400.0)
+    1:         self.assertEqual(cmp["change_pct"], 150.0)
+       
+    1:     def test_risk_overview_matches_alerts(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    1:         self.assertEqual(cc["risk_overview"]["total"], 1)
+    1:         self.assertEqual(cc["risk_overview"]["high"], 1)
+    1:         self.assertEqual(len(cc["active_alerts"]), 1)
+    1:         self.assertEqual(cc["active_alerts"][0]["severity"], "HIGH")
+       
+    1:     def test_district_and_fps_ranking(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    1:         self.assertTrue(cc["district_risk"])
+    1:         d = cc["district_risk"][0]
+    1:         self.assertEqual(d["district"], "Lucknow")
+    1:         self.assertEqual(d["distribution_kg"], 1000.0)
+    1:         self.assertEqual(d["alerts"], 1)
+               # one HIGH alert on a district -> documented MEDIUM district risk
+    1:         self.assertEqual(d["risk"], "MEDIUM")
+    3:         fps = {f["fps_code"]: f for f in cc["fps_risk"]}
+               # UP-B1 is below its reorder threshold -> HIGH, listed first (sorted)
+    1:         self.assertEqual(cc["fps_risk"][0]["fps_code"], "UP-B1")
+    1:         self.assertEqual(fps["UP-B1"]["risk"], "HIGH")
+       
+    1:     def test_trend_totals_consistent_with_kpis(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    1:         t = cc["trends"]
+   32:         series_total = sum(s["quantity"] for s in t["distribution"])
+    3:         by_comm_total = sum(c["quantity"] for c in t["by_commodity"])
+   10:         kpi_total = {k["key"]: k for k in cc["kpis"]}["distribution"]["value"]
+               # KPI totals and chart totals must agree (Phase 5 consistency rule)
+    1:         self.assertEqual(series_total, 1000.0)
+    1:         self.assertEqual(by_comm_total, 1000.0)
+    1:         self.assertEqual(series_total, kpi_total)
+    1:         self.assertEqual(t["by_commodity"][0]["commodity"], "rice")
+       
+    1:     def test_executive_summary_fallback_is_evidence_based(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    1:         es = cc["executive_summary"]
+    1:         self.assertEqual(es["generated_by"], "deterministic_fallback")
+    1:         self.assertIn("1000", es["summary"])       # real KPI number
+    1:         self.assertIn("1", es["summary"])          # real alert count
+               # the fallback is honest: it explicitly disclaims prediction
+    1:         self.assertIn("not a prediction", es["summary"])
+       
+    1:     def test_executive_summary_llm_injection(self):
+    1:         def gen(kind, context, fallback):
+    3:             return "A generated summary mentioning " + str(
+    2:                 context.get("active_alerts")) + " alert(s)."
+    2:         cc = command_center.command_center(
+    1:             db_path=self.db_path, generator=gen)
+    1:         es = cc["executive_summary"]
+    1:         self.assertEqual(es["generated_by"], "llm")
+    1:         self.assertIn("1 alert", es["summary"])
+       
+    1:     def test_executive_summary_survives_llm_failure(self):
+    1:         def boom(kind, context, fallback):
+    1:             raise RuntimeError("API down")
+    2:         cc = command_center.command_center(
+    1:             db_path=self.db_path, generator=boom)
+    2:         self.assertEqual(cc["executive_summary"]["generated_by"],
+    1:                          "deterministic_fallback")
+       
+    1:     def test_filters_narrow_kpis_and_trends(self):
+    1:         full = command_center.command_center(db_path=self.db_path)
+               # FPS filter -> only UP-B1's 10 transactions
+    2:         fps = command_center.command_center(
+    1:             db_path=self.db_path, fps="UP-B1")
+   11:         self.assertEqual({k["key"]: k for k in fps["kpis"]}["distribution"]["value"],
+    1:                          1000.0)
+    1:         self.assertEqual(fps["filters"]["fps"], "UP-B1")
+               # Commodity filter with an empty commodity -> honest zeros, no fabrications
+    1:         empty = command_center.command_center(db_path=self.db_path, commodity="wheat")
+   10:         self.assertEqual({k["key"]: k for k in empty["kpis"]}["distribution"]["value"], 0)
+    1:         self.assertEqual(empty["trends"]["total_quantity"], 0)
+               # The full-scope payload still carries the same totals
+   11:         self.assertEqual({k["key"]: k for k in full["kpis"]}["distribution"]["value"],
+    1:                          1000.0)
+       
+    1:     def test_sources_and_lineage(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    2:         self.assertTrue(any(s["name"].startswith("cc_source_") for s in cc["sources"]))
+    1:         self.assertEqual(cc["lineage"]["import_count"], 1)
+    2:         self.assertEqual(cc["lineage"]["latest_imports"][0]["dataset_name"],
+    1:                          "cc_fixture_%d" % self.s["seed_n"])
+               # honest disclaimer: imported dataset, no claim of live government data
+    1:         self.assertIn("Analysis based on imported dataset", cc["disclaimer"])
+       
+    1:     def test_freshness_honest(self):
+    1:         cc = command_center.command_center(db_path=self.db_path)
+               # No successful sync timestamp -> UNKNOWN, never assumed FRESH
+    1:         self.assertEqual(cc["freshness"]["status"], "UNKNOWN")
+       
+    1:     def test_empty_database_no_fabricated_values(self):
+    1:         path = _fresh_db()
+    1:         try:
+    1:             conn = db.open_db(path)
+    1:             conn.commit()
+    1:             conn.close()
+    1:             cc = command_center.command_center(db_path=path)
+   10:             kpis = {k["key"]: k for k in cc["kpis"]}
+    7:             for key in ("distribution", "transactions", "inventory",
+                               "active_alerts", "critical_alerts", "high_risk_fps"):
+    6:                 self.assertEqual(kpis[key]["value"], 0)
+    1:             self.assertIsNone(kpis["coverage"]["value"])
+    1:             self.assertEqual(cc["risk_overview"]["total"], 0)
+    2:             self.assertEqual(cc["executive_summary"]["summary"],
+    1:                              "Insufficient data to provide a reliable "
+                                    "executive summary.")
+    1:             self.assertEqual(cc["freshness"]["status"], "UNKNOWN")
+               finally:
+    1:             if os.path.exists(path):
+    1:                 os.unlink(path)
+       
+       
+    2: class ReportTests(unittest.TestCase):
+    1:     def setUp(self):
+    4:         self.db_path = _fresh_db()
+    4:         self.conn = db.open_db(self.db_path)
+    4:         self.s = _seed(self.conn)
+    4:         self.conn.commit()
+    4:         self.conn.close()
+       
+    1:     def tearDown(self):
+    4:         if os.path.exists(self.db_path):
+    4:             os.unlink(self.db_path)
+       
+    1:     def test_report_generation_persists(self):
+    2:         report = command_center.generate_report(
+    1:             db_path=self.db_path, period="Test window", source="Test source")
+    1:         self.assertTrue(report["report_id"].startswith("RPT-"))
+    1:         self.assertEqual(report["period"], "Test window")
+    1:         self.assertEqual(report["source"], "Test source")
+               # report carries the same evidence-backed sections
+    1:         self.assertEqual(len(report["kpis"]), 8)
+    1:         self.assertEqual(report["risk_overview"]["total"], 1)
+    2:         self.assertEqual(report["executive_summary"]["generated_by"],
+    1:                          "deterministic_fallback")
+    1:         self.assertTrue(report["disclaimer"])
+    1:         self.assertTrue(report["lineage"]["import_count"] >= 1)
+       
+    1:     def test_report_history_and_detail(self):
+    1:         r1 = command_center.generate_report(db_path=self.db_path, period="P1")
+    1:         r2 = command_center.generate_report(db_path=self.db_path, period="P2")
+    1:         history = command_center.report_history(db_path=self.db_path)
+    4:         ids = [h["report_id"] for h in history["reports"]]
+    1:         self.assertEqual(len(ids), 2)
+    1:         self.assertIn(r1["report_id"], ids)
+    1:         detail = command_center.report_detail(r1["report_id"], db_path=self.db_path)
+    1:         self.assertEqual(detail["report_id"], r1["report_id"])
+    1:         self.assertEqual(detail["period_label"], "P1")
+    1:         payload = detail["payload"]
+    1:         self.assertEqual(payload["kpis"][0]["key"], "distribution")
+    1:         self.assertEqual(payload["risk_overview"]["total"], 1)
+       
+    1:     def test_reports_never_overwrite(self):
+    1:         r1 = command_center.generate_report(db_path=self.db_path, period="P1")
+    1:         r2 = command_center.generate_report(db_path=self.db_path, period="P1")
+    1:         self.assertNotEqual(r1["report_id"], r2["report_id"])
+    1:         history = command_center.report_history(db_path=self.db_path)["reports"]
+    1:         self.assertEqual(len(history), 2)
+       
+    1:     def test_report_generator_injection(self):
+    1:         def gen(kind, context, fallback):
+    1:             return "Executive summary from the LLM."
+    2:         report = command_center.generate_report(
+    1:             db_path=self.db_path, period="P", generator=gen)
+    1:         self.assertEqual(report["executive_summary"]["generated_by"], "llm")
+       
+       
+    2: class CommandCenterApiTests(unittest.TestCase):
+    1:     """API tests on an isolated temp database (never pollutes the demo DB)."""
+       
+    1:     def setUp(self):
+    2:         self.db_path = _fresh_db()
+    2:         conn = db.open_db(self.db_path)
+    2:         _seed(conn)
+    2:         conn.commit()
+    2:         conn.close()
+    2:         self.httpd = make_server(port=0, db_path=self.db_path)
+    2:         self.port = self.httpd.server_address[1]
+    2:         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+       
+    1:     def tearDown(self):
+    2:         self.httpd.shutdown()
+    2:         if os.path.exists(self.db_path):
+    2:             os.unlink(self.db_path)
+       
+    1:     def _get(self, path):
+   10:         with urllib.request.urlopen(
+    9:                 "%s:%d%s" % (BASE, self.port, path), timeout=15) as resp:
+    4:             return json.loads(resp.read())
+       
+    1:     def test_command_center_endpoint(self):
+    1:         cc = self._get("/api/command-center")
+    1:         self.assertIn("kpis", cc)
+    1:         self.assertEqual(cc["risk_overview"]["total"], 1)
+    1:         self.assertIn("executive_summary", cc)
+               # filters accepted via query string
+    1:         filtered = self._get("/api/command-center?fps=UP-B1")
+    1:         self.assertEqual(filtered["filters"]["fps"], "UP-B1")
+   11:         self.assertEqual({k["key"]: k for k in filtered["kpis"]}["distribution"]["value"],
+    1:                          1000.0)
+       
+    1:     def test_report_endpoints(self):
+    2:         req = urllib.request.Request(
+    1:             "%s:%d/api/reports" % (BASE, self.port),
+    1:             data=json.dumps({"period": "API window"}).encode(),
+    1:             headers={"Content-Type": "application/json"}, method="POST")
+    1:         with urllib.request.urlopen(req, timeout=20) as resp:
+    1:             report = json.loads(resp.read())
+    1:         self.assertTrue(report["report_id"].startswith("RPT-"))
+    1:         history = self._get("/api/reports")
+    1:         self.assertEqual(len(history["reports"]), 1)
+    1:         detail = self._get("/api/reports/" + report["report_id"])
+    1:         self.assertEqual(detail["report_id"], report["report_id"])
+    1:         self.assertEqual(detail["period"], "API window")
+    1:         self.assertIn("kpis", detail)
+    1:         with self.assertRaises(urllib.error.HTTPError) as ctx:
+    2:             self._get("/api/reports/RPT-0000-9999")
+    1:         self.assertEqual(ctx.exception.code, 404)
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

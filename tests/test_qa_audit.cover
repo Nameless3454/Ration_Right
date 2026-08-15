@@ -1,0 +1,408 @@
+    1: """RationRight — Phase 15: Data accuracy audit.
+       
+       Independently verifies the data path: upload -> validate -> import ->
+       analytics -> command center -> API. Every expected value in this file is
+       computed from raw rows / independent arithmetic, never copied from the
+       application output.
+       
+       - Import reconciliation invariant: source = valid + invalid, imported == valid
+       - Normalization rules (commodity case/whitespace, date formats)
+       - Analytics recomputed from raw rows and compared to the service
+       - KPI chain: database -> analytics -> command center -> API agree
+       - Historical comparison: change % math + previous=0 guard
+       - Filter scoping isolation (no cross-scope leakage)
+       - Date boundaries (month / year / same-day) and null/missing data
+       - Duplicate-file idempotency (no double import)
+       
+       Run from the project root::
+       
+           python3 -m unittest tests.test_qa_audit -v
+       """
+       
+    1: import json
+    1: import os
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import analytics
+    1: import database as db
+    1: from ingestion import service as ingest
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+    1: TRANSACTION_CSV = (
+    1:     "Transaction ID,Beneficiary ID,FPS Code,Transaction Date,Commodity,Quantity,Unit\n"
+           "TX101,BEN001,FPS01,2026-08-01,rice,10,kg\n"
+           "TX102,BEN001,FPS01,2026-08-02,Rice,5,kg\n"        # case-different (valid)
+           "TX103,BEN002,FPS02,2026-08-01,wheat,8,kg\n"
+           "TX104,BEN002,FPS02,2026-08-01,wheat,8,kg\n"        # exact duplicate of TX103
+           "TX105,BEN003,FPS03,2026-08-03,rice,abc,kg\n"        # unparseable quantity
+           "TX106,BEN003,FPS03,not-a-date,rice,3,kg\n"          # invalid date
+           "TX107,BEN004,FPS01,2026-08-04,rice,12,kg\n"
+       )
+       
+       # 7 data rows. Valid = 5 (TX101, TX102, TX103, TX104, TX107 — the exact
+       # duplicate TX104 is still a valid record, just skipped at import).
+       # Invalid = 2 (TX105 bad quantity, TX106 bad date). Duplicates = 1 (TX104).
+       # Imported = valid - duplicates = 4. Distribution = 10+5+8+12 = 35 kg.
+    1: _VALID = 5
+    1: _INVALID = 2
+    1: _DUPES = 1
+    1: _IMPORTED = 4
+    1: _DISTRIBUTION_KG = 35.0
+       
+       
+    1: def _fresh_db():
+   12:     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+   12:     tmp.close()
+   12:     os.unlink(tmp.name)
+   12:     return tmp.name
+       
+       
+    1: def _import_csv(db_path, csv_text=TRANSACTION_CSV, name="qa.csv"):
+           """Full upload -> validate -> confirm pipeline; returns the summary."""
+    9:     upload = ingest.handle_upload(csv_text.encode(), name, "text/csv")
+    9:     token = upload["token"]
+   18:     validated = ingest.validate_step(token, dataset_type="ration_transactions",
+    9:                                      db_path=db_path)
+    9:     summary = ingest.confirm_step(token, db_path=db_path)
+    9:     return validated, summary
+       
+       
+    2: class ImportReconciliationTests(unittest.TestCase):
+    1:     """The source -> valid/invalid/duplicates -> imported invariant."""
+       
+    1:     def setUp(self):
+    2:         self.db_path = _fresh_db()
+    4:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_reconciliation_invariant(self):
+    1:         validated, summary = _import_csv(self.db_path)
+    1:         total = validated["record_count"]
+    1:         valid = validated["valid_records"]
+    1:         invalid = validated["invalid_records"]
+    1:         dupes = validated["duplicate_records"]
+       
+               # No silent loss: every source row is accounted for exactly once.
+    1:         self.assertEqual(total, valid + invalid, "source must equal valid + invalid")
+    1:         self.assertEqual(total, 7)
+    1:         self.assertEqual(valid, _VALID)
+    1:         self.assertEqual(invalid, _INVALID)
+    1:         self.assertEqual(dupes, _DUPES)
+    1:         self.assertLessEqual(dupes, valid)
+       
+               # Imported = valid records minus the exact duplicates skipped at import.
+    1:         self.assertEqual(summary["imported"], _IMPORTED)
+    1:         self.assertEqual(summary["imported"], valid - dupes)
+    1:         self.assertEqual(summary["failed"], invalid)
+       
+               # And the database must actually contain exactly that many rows.
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             inserted = conn.execute(
+    2:                 "SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(inserted, _IMPORTED, "inserted rows must match imported count")
+       
+    1:     def test_duplicate_file_is_idempotent(self):
+    1:         validated, summary = _import_csv(self.db_path)
+    1:         self.assertEqual(summary["status"], "PARTIAL")  # 2 invalid rows
+    1:         self.assertEqual(summary["imported"], _IMPORTED)
+               # Same bytes again -> ALREADY_IMPORTED, no additional rows.
+    1:         validated2, summary2 = _import_csv(self.db_path)
+    1:         self.assertEqual(summary2["status"], "ALREADY_IMPORTED")
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             inserted = conn.execute(
+    2:                 "SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(inserted, _IMPORTED)
+       
+       
+    2: class NormalizationTests(unittest.TestCase):
+    1:     """Phase 4 normalization rules: case, whitespace, dates, units."""
+       
+    1:     def test_commodity_normalization(self):
+    1:         from ingestion import validation
+    1:         self.assertEqual(validation.normalize_commodity(" rice ")[0], "rice")
+    1:         self.assertEqual(validation.normalize_commodity("Rice")[0], "rice")
+    1:         self.assertEqual(validation.normalize_commodity("RICE")[0], "rice")
+    1:         self.assertEqual(validation.normalize_commodity("wheataata")[0], "wheat")
+               # Unknown commodities warn but are never silently guessed.
+    1:         key, changed, warning = validation.normalize_commodity("unmapped-crop")
+    1:         self.assertEqual(key, "unmapped-crop")
+    1:         self.assertIsNotNone(warning)
+       
+    1:     def test_date_normalization_formats(self):
+    1:         from ingestion import validation
+    6:         for raw in ("2026-08-01", "2026/08/01", "01-08-2026", "01/08/2026",
+                           "1 Aug 2026"):
+    5:             self.assertEqual(validation.parse_date(raw), "2026-08-01", raw)
+    1:         self.assertIsNone(validation.parse_date("not-a-date"))
+       
+    1:     def test_numeric_normalization(self):
+    1:         from ingestion import validation
+    1:         self.assertEqual(validation.parse_number("1,200"), 1200.0)
+    1:         self.assertEqual(validation.parse_number("1200 kg"), 1200.0)
+    1:         self.assertIsNone(validation.parse_number("abc"))
+       
+       
+    2: class IndependentAnalyticsTests(unittest.TestCase):
+    1:     """Recompute analytics from raw rows; compare to the service."""
+       
+    1:     def setUp(self):
+    3:         self.db_path = _fresh_db()
+    3:         conn = db.open_db(self.db_path)
+    6:         src = db.insert_data_source(conn, name="Uploaded Dataset",
+    3:                                     source_type="MANUAL", description="t",
+    3:                                     status="ACTIVE")
+    6:         imp = db.insert_data_import(conn, data_source_id=src,
+    3:                                     dataset_name="audit", file_name="a.csv",
+    3:                                     file_type="CSV", record_count=4,
+    3:                                     status="COMPLETED")
+    6:         db.upsert_beneficiaries(conn, [
+    6:             {"external_reference": "B1", "state": "UP", "district": "Lucknow",
+    3:              "ration_category": "AAY", "family_size": 4, "status": "ACTIVE"},
+    6:             {"external_reference": "B2", "state": "UP", "district": "Kanpur",
+    3:              "ration_category": "PHH", "family_size": 3, "status": "ACTIVE"},
+               ])
+    3:         bm = db.beneficiary_ids(conn, ["B1", "B2"])
+    6:         db.upsert_fps_centers(conn, [
+    6:             {"fps_code": "F01", "name": "A", "district": "Lucknow",
+    3:              "state": "UP", "status": "ACTIVE"},
+    6:             {"fps_code": "F02", "name": "B", "district": "Kanpur",
+    3:              "state": "UP", "status": "ACTIVE"},
+               ])
+    3:         cm = db.fps_center_ids(conn, ["F01", "F02"])
+               # Known rows: rice 100+40 (COMPLETED) + wheat 20 (FAILED) + pulses 60.
+    6:         db.insert_transactions_batch(conn, [
+    6:             {"external_transaction_id": "A1", "beneficiary_id": bm["B1"],
+    3:              "fps_center_id": cm["F01"], "transaction_date": "2026-08-01",
+    3:              "commodity": "rice", "quantity": 100.0, "unit": "kg",
+    3:              "status": "COMPLETED", "source_import_id": imp,
+    3:              "latitude": 26.8, "longitude": 80.9},
+    6:             {"external_transaction_id": "A2", "beneficiary_id": bm["B1"],
+    3:              "fps_center_id": cm["F01"], "transaction_date": "2026-08-02",
+    3:              "commodity": "rice", "quantity": 40.0, "unit": "kg",
+    3:              "status": "COMPLETED", "source_import_id": imp,
+    3:              "latitude": 26.8, "longitude": 80.9},
+    6:             {"external_transaction_id": "A3", "beneficiary_id": bm["B2"],
+    3:              "fps_center_id": cm["F02"], "transaction_date": "2026-08-03",
+    3:              "commodity": "wheat", "quantity": 20.0, "unit": "kg",
+    3:              "status": "FAILED", "source_import_id": imp,
+    3:              "latitude": 26.4, "longitude": 80.3},
+    6:             {"external_transaction_id": "A4", "beneficiary_id": bm["B2"],
+    3:              "fps_center_id": cm["F02"], "transaction_date": "2026-08-04",
+    3:              "commodity": "pulses", "quantity": 60.0, "unit": "kg",
+    3:              "status": "COMPLETED", "source_import_id": imp,
+    3:              "latitude": 26.4, "longitude": 80.3},
+               ])
+    6:         db.insert_inventory_batch(conn, [
+    6:             {"fps_center_id": cm["F01"], "commodity": "rice",
+    3:              "current_stock": 500.0, "monthly_consumption": 300.0,
+    3:              "reorder_threshold": 200.0, "source_import_id": imp},
+               ])
+    3:         conn.commit()
+    3:         conn.close()
+    6:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def _raw_totals(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    7:             rows = [dict(r) for r in conn.execute(
+    1:                 "SELECT commodity, quantity, status FROM ration_transactions")]
+               finally:
+    1:             conn.close()
+    1:         return rows
+       
+    1:     def test_overview_matches_independent_recomputation(self):
+    1:         rows = self._raw_totals()
+    6:         expect_qty = round(sum(r["quantity"] for r in rows), 2)
+    1:         expect_n = len(rows)
+    6:         expect_completed = sum(1 for r in rows if r["status"] == "COMPLETED")
+    6:         expect_failed = sum(1 for r in rows if r["status"] == "FAILED")
+    6:         rice = sum(r["quantity"] for r in rows if r["commodity"] == "rice")
+       
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             ov = analytics.overview(conn)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(ov["ration_distributed_kg"], expect_qty)
+    1:         self.assertEqual(ov["total_transactions"], expect_n)
+    1:         self.assertEqual(ov["distribution_count"], expect_n)
+    1:         self.assertEqual(ov["by_status"]["COMPLETED"], expect_completed)
+    1:         self.assertEqual(ov["by_status"]["FAILED"], expect_failed)
+    5:         by_commodity = {c["commodity"]: c["quantity"] for c in ov["by_commodity"]}
+    1:         self.assertEqual(by_commodity["rice"], rice)
+    1:         self.assertEqual(ov["total_beneficiaries"], 2)
+       
+    1:     def test_distribution_granularity_totals_match(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             dist = analytics.distribution(conn, granularity="day")
+               finally:
+    1:             conn.close()
+    1:         trend = dist["trend"]
+    1:         labels = trend["labels"]
+    1:         self.assertEqual(len(labels), 4)  # one bucket per transaction day
+   20:         total = sum(sum(v for v in trend["series"][c]) for c in trend["series"])
+    1:         self.assertEqual(total, 220.0)
+               # Bucket for 2026-08-01 must be exactly the rice 100 row.
+    1:         idx = labels.index("2026-08-01")
+    1:         self.assertEqual(trend["series"]["rice"][idx], 100.0)
+       
+    1:     def test_inventory_coverage_independent(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             inv = analytics.inventory(conn)
+               finally:
+    1:             conn.close()
+               # F01 rice: stock 500, monthly consumption 300 -> ~50 days coverage.
+    2:         item = next(i for i in inv["by_commodity"] if i["commodity"] == "rice")
+    1:         self.assertEqual(item["current_stock"], 500.0)
+    1:         self.assertEqual(item["monthly_consumption"], 300.0)
+    1:         expect_days = round(500.0 / (300.0 / 30.0), 1)
+    1:         self.assertAlmostEqual(item["days_remaining"], expect_days, delta=0.2)
+               # The raw items array also exposes the same stock for traceability.
+    3:         raw = next(i for i in inv["items"] if i["fps_code"] == "F01"
+    1:                    and i["commodity"] == "rice")
+    1:         self.assertEqual(raw["current_stock"], 500.0)
+       
+       
+    2: class KpiChainTests(unittest.TestCase):
+    1:     """database -> analytics -> command center -> API must agree."""
+       
+    1:     def setUp(self):
+    3:         self.db_path = _fresh_db()
+    3:         _validated, summary = _import_csv(self.db_path)
+    3:         self.summary = summary
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.httpd = make_server(port=0, db_path=self.db_path)
+    3:         self.port = self.httpd.server_address[1]
+    3:         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+    3:         self.addCleanup(self.httpd.shutdown)
+    3:         self.addCleanup(self.httpd.server_close)
+    6:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def _get(self, path):
+    8:         with urllib.request.urlopen(
+    8:                 "%s:%d%s" % (BASE, self.port, path), timeout=20) as resp:
+    4:             return json.loads(resp.read())
+       
+    1:     def test_command_center_kpis_match_database(self):
+    1:         cc = self._get("/api/command-center")
+    1:         ov = self._get("/api/analytics/overview?range=all")
+   10:         kpis = {k["key"]: k["value"] for k in cc["kpis"]}
+       
+               # Imported quantity: 10+5+8+12 = 35 kg (valid rows only).
+    1:         self.assertEqual(kpis["distribution"], 35.0)
+    1:         self.assertEqual(kpis["distribution"], ov["ration_distributed_kg"])
+    1:         self.assertEqual(kpis["transactions"], ov["total_transactions"])
+    1:         self.assertEqual(kpis["transactions"], self.summary["imported"])
+       
+               # Database ground truth, independent of both services.
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             ground = conn.execute(
+    1:                 "SELECT COALESCE(SUM(quantity), 0) AS qty FROM ration_transactions"
+    1:             ).fetchone()["qty"]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(kpis["distribution"], round(ground, 2))
+       
+    1:     def test_filter_isolation_no_cross_scope_leak(self):
+    1:         cc = self._get("/api/command-center?commodity=rice")
+   10:         kpis = {k["key"]: k["value"] for k in cc["kpis"]}
+               # Only rice rows: 10 + 5 + 12 = 27 kg (TX101, TX102, TX107).
+    1:         self.assertEqual(kpis["distribution"], 27.0)
+               # Wheat must NOT appear in the scoped payload.
+    1:         trend = cc["trends"]
+    3:         wheat = [b for b in trend.get("by_commodity", []) if b.get("commodity") == "wheat"]
+    1:         self.assertFalse(wheat)
+       
+    1:     def test_district_filter(self):
+               # FPS rows carry no district on the upload path, so a district filter
+               # must not leak any other scope's rows into the KPIs.
+    1:         cc = self._get("/api/command-center?district=Lucknow")
+   10:         kpis = {k["key"]: k["value"] for k in cc["kpis"]}
+    9:         for key, value in kpis.items():
+    8:             if value is None:
+    2:                 continue
+    6:             self.assertEqual(value, 0, "KPI %r leaked non-zero value %r" % (key, value))
+       
+       
+    2: class HistoricalComparisonTests(unittest.TestCase):
+    1:     """change % math and the previous=0 / missing-previous guards."""
+       
+    1:     def test_change_pct_math(self):
+    1:         import command_center
+    1:         self.assertEqual(command_center._change_pct(120, 100), 20.0)
+    1:         self.assertEqual(command_center._change_pct(100, 120), -16.7)
+       
+    1:     def test_previous_zero_is_not_misleading(self):
+               # (120 - 0) / 0 is undefined; must not produce +inf or a fake %.
+    1:         import command_center
+    1:         self.assertIsNone(command_center._change_pct(120, 0))
+       
+    1:     def test_missing_previous(self):
+    1:         import command_center
+    1:         self.assertIsNone(command_center._change_pct(None, 100))
+       
+       
+    2: class DateBoundaryTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self.db_path = _fresh_db()
+    3:         _import_csv(self.db_path)
+    6:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def _count_between(self, from_date, to_date):
+    4:         conn = db.open_db(self.db_path)
+    4:         try:
+    8:             ov = analytics.overview(conn, range_key="custom",
+    4:                                     from_date=from_date, to_date=to_date)
+    8:             return ov["total_transactions"]
+               finally:
+    4:             conn.close()
+       
+    1:     def test_month_boundary(self):
+               # Imported TX dates: 08-01, 08-02, 08-01, 08-04 -> 4 rows (the exact
+               # duplicate TX104 was skipped at import).
+    1:         self.assertEqual(self._count_between("2026-08-01", "2026-08-31"), 4)
+    1:         self.assertEqual(self._count_between("2026-07-01", "2026-07-31"), 0)
+       
+    1:     def test_same_day_range(self):
+    1:         self.assertEqual(self._count_between("2026-08-01", "2026-08-01"), 2)
+       
+    1:     def test_year_boundary(self):
+    1:         self.assertEqual(self._count_between("2025-12-31", "2026-01-01"), 0)
+       
+       
+    2: class NullMissingDataTests(unittest.TestCase):
+    1:     def test_empty_database_never_crashes(self):
+    1:         db_path = _fresh_db()
+    1:         conn = db.open_db(db_path)
+    1:         conn.close()
+    1:         try:
+    1:             conn = db.open_db(db_path)
+    1:             ov = analytics.overview(conn)
+    1:             inv = analytics.inventory(conn)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(ov["total_transactions"], 0)
+    1:         self.assertEqual(ov["ration_distributed_kg"], 0)
+    1:         self.assertEqual(inv["items"], [])
+    1:         if os.path.exists(db_path):
+    1:             os.unlink(db_path)
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

@@ -1,0 +1,378 @@
+    1: """RationRight — Phase 2: database foundation tests.
+       
+       Covers the normalized schema, enumeration validation, CRUD for all seven
+       models, foreign-key integrity, the provenance chain (transaction -> import ->
+       source; insight -> import), the deterministic synthetic seed (including
+       idempotency), and the agent-contract export used later to feed real data to
+       the existing agents.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import sqlite3
+    1: import tempfile
+    1: import unittest
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+       
+       
+    2: class DatabaseTestCase(unittest.TestCase):
+    1:     def setUp(self):
+   30:         self._tmp = tempfile.TemporaryDirectory()
+   30:         self.db_path = Path(self._tmp.name) / "test_rationright.db"
+   30:         self.conn = db.open_db(self.db_path)
+   30:         self.addCleanup(self.conn.close)
+   30:         self.addCleanup(self._tmp.cleanup)
+       
+           # ---------------- schema ----------------
+       
+    1:     def test_schema_creates_all_tables(self):
+    2:         rows = self.conn.execute(
+    1:             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+               ).fetchall()
+   16:         names = {row["name"] for row in rows}
+    8:         for table in (
+                   "data_sources", "data_imports", "beneficiaries", "fps_centers",
+                   "ration_transactions", "inventory", "ai_insights",
+               ):
+    7:             self.assertIn(table, names, "missing table %s" % table)
+       
+    1:     def test_init_db_is_idempotent(self):
+    1:         db.init_db(self.conn)  # second run must not raise
+    1:         db.init_db(self.conn)
+       
+    1:     def test_foreign_keys_are_enforced(self):
+    1:         self.conn.execute("PRAGMA foreign_keys = ON")
+    1:         with self.assertRaises(sqlite3.IntegrityError):
+    2:             self.conn.execute(
+    1:                 "INSERT INTO data_imports (data_source_id, dataset_name, status, created_at) "
+                       "VALUES (999, 'ghost', 'PENDING', 'now')"
+                   )
+       
+           # ---------------- data source ----------------
+       
+    1:     def test_insert_and_get_data_source(self):
+    1:         sid = db.insert_data_source(self.conn, name="Gov API", source_type="GOVERNMENT_DATASET")
+    1:         src = db.get_data_source(self.conn, sid)
+    1:         self.assertEqual(src["name"], "Gov API")
+    1:         self.assertEqual(src["type"], "GOVERNMENT_DATASET")
+    1:         self.assertEqual(src["status"], "ACTIVE")
+    1:         self.assertEqual(db.get_data_source_by_name(self.conn, "Gov API")["id"], sid)
+       
+    1:     def test_data_source_enum_validation(self):
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_data_source(self.conn, name="x", source_type="DATABASE")
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_data_source(self.conn, name="x", source_type="CSV", status="SYNCED")
+       
+    1:     def test_data_source_name_unique(self):
+    1:         db.insert_data_source(self.conn, name="dup", source_type="MANUAL")
+    1:         with self.assertRaises(sqlite3.IntegrityError):
+    2:             db.insert_data_source(self.conn, name="dup", source_type="MANUAL")
+       
+    1:     def test_set_data_source_status(self):
+    1:         sid = db.insert_data_source(self.conn, name="s", source_type="API")
+    1:         db.set_data_source_status(self.conn, sid, "SYNCING")
+    1:         self.assertEqual(db.get_data_source(self.conn, sid)["status"], "SYNCING")
+    1:         with self.assertRaises(ValueError):
+    2:             db.set_data_source_status(self.conn, sid, "ON")
+       
+           # ---------------- data import ----------------
+       
+    1:     def test_insert_and_get_data_import(self):
+    1:         sid = db.insert_data_source(self.conn, name="src", source_type="JSON")
+    2:         iid = db.insert_data_import(
+    1:             self.conn, data_source_id=sid, dataset_name="d1", file_name="a.json",
+    1:             file_type="json", record_count=10, successful_records=8,
+    1:             failed_records=2, duplicate_records=1, status="PARTIAL",
+    1:             error_summary="2 rows failed", started_at="t0", completed_at="t1",
+               )
+    1:         imp = db.get_data_import(self.conn, iid)
+    1:         self.assertEqual(imp["data_source_id"], sid)
+    1:         self.assertEqual(imp["status"], "PARTIAL")
+    1:         self.assertEqual(imp["duplicate_records"], 1)
+       
+    1:     def test_data_import_enum_validation(self):
+    1:         sid = db.insert_data_source(self.conn, name="src2", source_type="CSV")
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_data_import(self.conn, data_source_id=sid, dataset_name="d", status="DONE")
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_data_import(self.conn, data_source_id=sid, dataset_name="d", record_count=-1)
+       
+    1:     def test_imports_for_source(self):
+    1:         sid = db.insert_data_source(self.conn, name="src3", source_type="JSON")
+    1:         i1 = db.insert_data_import(self.conn, data_source_id=sid, dataset_name="a")
+    1:         i2 = db.insert_data_import(self.conn, data_source_id=sid, dataset_name="b")
+    4:         ids = [r["id"] for r in db.get_imports_for_source(self.conn, sid)]
+    1:         self.assertEqual(ids, [i1, i2])
+       
+           # ---------------- beneficiary ----------------
+       
+    1:     def test_upsert_beneficiary(self):
+    2:         bid = db.upsert_beneficiary(
+    1:             self.conn, external_reference="BEN999", state="MH", district="Pune",
+    1:             ration_category="AAY", family_size=4,
+               )
+    1:         row = db.get_beneficiary_by_external_ref(self.conn, "BEN999")
+    1:         self.assertEqual(row["id"], bid)
+    1:         self.assertEqual(row["state"], "MH")
+    1:         self.assertEqual(row["ration_category"], "AAY")
+    1:         self.assertEqual(row["family_size"], 4)
+       
+    1:     def test_upsert_beneficiary_updates_in_place(self):
+    1:         db.upsert_beneficiary(self.conn, external_reference="BEN1", district="Pune")
+    1:         bid2 = db.upsert_beneficiary(self.conn, external_reference="BEN1", district="Nagpur", family_size=3)
+    1:         rows = self.conn.execute("SELECT COUNT(*) AS n FROM beneficiaries").fetchone()
+    1:         self.assertEqual(rows["n"], 1, "upsert must not create duplicates")
+    1:         self.assertEqual(db.get_beneficiary_by_external_ref(self.conn, "BEN1")["id"], bid2)
+    1:         self.assertEqual(db.get_beneficiary_by_external_ref(self.conn, "BEN1")["district"], "Nagpur")
+       
+    1:     def test_beneficiary_validation(self):
+    1:         with self.assertRaises(ValueError):
+    2:             db.upsert_beneficiary(self.conn, external_reference="", )
+    1:         with self.assertRaises(ValueError):
+    2:             db.upsert_beneficiary(self.conn, external_reference="B", family_size=0)
+    1:         with self.assertRaises(ValueError):
+    2:             db.upsert_beneficiary(self.conn, external_reference="B", status="BANNED")
+       
+           # ---------------- fps center ----------------
+       
+    1:     def test_insert_and_get_fps_center(self):
+    2:         cid = db.insert_fps_center(
+    1:             self.conn, fps_code="FPS001", name="Kanpur Center #04", state="UP",
+    1:             district="Kanpur", location="Sector 4", latitude=26.44, longitude=80.33,
+    1:             capacity=5000,
+               )
+    1:         row = db.get_fps_center_by_code(self.conn, "FPS001")
+    1:         self.assertEqual(row["id"], cid)
+    1:         self.assertEqual(row["capacity"], 5000)
+    1:         self.assertEqual(row["status"], "ACTIVE")
+       
+    1:     def test_fps_center_validation(self):
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_fps_center(self.conn, fps_code="", )
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_fps_center(self.conn, fps_code="F", latitude=95)
+       
+    1:     def test_fps_center_code_unique(self):
+    1:         db.insert_fps_center(self.conn, fps_code="FPS1")
+    1:         with self.assertRaises(sqlite3.IntegrityError):
+    2:             db.insert_fps_center(self.conn, fps_code="FPS1")
+       
+           # ---------------- transactions ----------------
+       
+    1:     def _seeded_transaction(self):
+    3:         source_id = db.insert_data_source(self.conn, name="src", source_type="JSON")
+    3:         import_id = db.insert_data_import(self.conn, data_source_id=source_id, dataset_name="d")
+    3:         ben_id = db.upsert_beneficiary(self.conn, external_reference="BEN001")
+    6:         tx_id = db.insert_transaction(
+    3:             self.conn, external_transaction_id="TX001", beneficiary_id=ben_id,
+    3:             transaction_date="2026-08-01T10:00:00", commodity="rice", quantity=10,
+    3:             latitude=19.0760, longitude=72.8777, source_import_id=import_id,
+               )
+    3:         return source_id, import_id, ben_id, tx_id
+       
+    1:     def test_insert_and_get_transaction(self):
+    1:         _, import_id, _, tx_id = self._seeded_transaction()
+    1:         row = db.get_transaction_by_external_id(self.conn, "TX001")
+    1:         self.assertEqual(row["id"], tx_id)
+    1:         self.assertEqual(row["beneficiary_external_reference"], "BEN001")
+    1:         self.assertEqual(row["source_import_id"], import_id)
+    1:         self.assertEqual(row["unit"], "kg")
+       
+    1:     def test_transaction_external_id_unique(self):
+    1:         self._seeded_transaction()
+    1:         with self.assertRaises(sqlite3.IntegrityError):
+    2:             self.conn.execute(
+    1:                 "INSERT INTO ration_transactions (external_transaction_id, transaction_date, commodity, quantity, status, created_at) "
+                       "VALUES ('TX001', '2026-08-01', 'rice', 5, 'COMPLETED', 'now')"
+                   )
+       
+    1:     def test_transaction_validation(self):
+    1:         ben_id = db.upsert_beneficiary(self.conn, external_reference="B1")
+    1:         with self.assertRaises(ValueError):
+    3:             db.insert_transaction(self.conn, external_transaction_id="T1", beneficiary_id=ben_id,
+    1:                                   transaction_date="2026-01-01", commodity="rice", quantity=0)
+    1:         with self.assertRaises(ValueError):
+    3:             db.insert_transaction(self.conn, external_transaction_id="T1", beneficiary_id=ben_id,
+    1:                                   transaction_date="2026-01-01", commodity="", quantity=1)
+    1:         with self.assertRaises(ValueError):
+    3:             db.insert_transaction(self.conn, external_transaction_id="T1", beneficiary_id=ben_id,
+    1:                                   transaction_date="2026-01-01", commodity="rice", quantity=1,
+    1:                                   status="REFUNDED")
+       
+    1:     def test_transaction_bad_foreign_keys_rejected(self):
+    1:         with self.assertRaises(sqlite3.IntegrityError):
+    3:             db.insert_transaction(
+    1:                 self.conn, external_transaction_id="T1", beneficiary_id=4242,
+    1:                 transaction_date="2026-01-01", commodity="rice", quantity=1,
+                   )
+       
+    1:     def test_agent_contract_export_matches_input(self):
+    1:         self._seeded_transaction()
+    1:         agent_rows = db.get_transactions_for_agent(self.conn)
+    1:         self.assertEqual(len(agent_rows), 1)
+    1:         expected = {
+    1:             "transaction_id": "TX001",
+    1:             "beneficiary_id": "BEN001",
+    1:             "timestamp": "2026-08-01T10:00:00",
+    1:             "latitude": 19.0760,
+    1:             "longitude": 72.8777,
+    1:             "ration_type": "rice",
+    1:             "quantity": 10,
+               }
+    1:         self.assertEqual(agent_rows[0], expected)
+    1:         self.assertEqual(set(agent_rows[0].keys()), set(expected.keys()))
+       
+           # ---------------- inventory ----------------
+       
+    1:     def test_insert_and_get_inventory(self):
+    1:         cid = db.insert_fps_center(self.conn, fps_code="F1")
+    2:         iid = db.insert_inventory(
+    1:             self.conn, fps_center_id=cid, commodity="wheat", current_stock=420.0,
+    1:             monthly_consumption=120.0, reorder_threshold=80.0,
+               )
+    1:         rows = db.get_inventory_for_center(self.conn, cid)
+    1:         self.assertEqual(len(rows), 1)
+    1:         self.assertEqual(rows[0]["id"], iid)
+    1:         self.assertEqual(rows[0]["current_stock"], 420.0)
+       
+    1:     def test_inventory_validation(self):
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_inventory(self.conn, commodity="wheat", current_stock=-1)
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_inventory(self.conn, commodity="", current_stock=1)
+       
+           # ---------------- ai insights ----------------
+       
+    1:     def test_insert_and_get_ai_insight(self):
+    1:         source_id = db.insert_data_source(self.conn, name="s", source_type="JSON")
+    1:         import_id = db.insert_data_import(self.conn, data_source_id=source_id, dataset_name="d")
+    2:         insight_id = db.insert_ai_insight(
+    1:             self.conn, insight_type="DISTRIBUTION_ANOMALY", severity="HIGH",
+    1:             title="Rapid geographic transaction", description="TX001 / TX002",
+    1:             entity_type="BENEFICIARY", entity_id="BEN001", confidence=0.9,
+    1:             recommendation="Human verification", source_import_id=import_id,
+               )
+    1:         rows = db.get_insights_for_import(self.conn, import_id)
+    1:         self.assertEqual(len(rows), 1)
+    1:         self.assertEqual(rows[0]["id"], insight_id)
+    1:         self.assertEqual(rows[0]["source_import_id"], import_id)
+       
+    1:     def test_ai_insight_enum_validation(self):
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_ai_insight(self.conn, insight_type="PREDICTION", severity="HIGH", title="t")
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_ai_insight(self.conn, insight_type="RECOMMENDATION", severity="SEVERE", title="t")
+    1:         with self.assertRaises(ValueError):
+    2:             db.insert_ai_insight(self.conn, insight_type="RECOMMENDATION", severity="HIGH", title="t", confidence=1.5)
+       
+    1:     def test_insights_for_entity(self):
+    1:         source_id = db.insert_data_source(self.conn, name="s2", source_type="JSON")
+    1:         import_id = db.insert_data_import(self.conn, data_source_id=source_id, dataset_name="d")
+    2:         db.insert_ai_insight(self.conn, insight_type="INVENTORY_RISK", severity="MEDIUM",
+    1:                              title="Low wheat", entity_type="FPS_CENTER", entity_id="F1",
+    1:                              source_import_id=import_id)
+    2:         db.insert_ai_insight(self.conn, insight_type="DEMAND_FORECAST", severity="LOW",
+    1:                              title="Rice demand up", entity_type="FPS_CENTER", entity_id="F2",
+    1:                              source_import_id=import_id)
+    1:         rows = db.get_insights_for_entity(self.conn, "FPS_CENTER", "F1")
+    1:         self.assertEqual(len(rows), 1)
+    1:         self.assertEqual(rows[0]["title"], "Low wheat")
+       
+           # ---------------- seed + traceability ----------------
+       
+    1:     def test_seed_synthetic_round_trip(self):
+    1:         summary = db.seed_synthetic(self.conn)
+    1:         self.assertEqual(summary["transactions"], 25)
+    1:         self.assertEqual(summary["beneficiaries"], 5)
+    1:         self.assertEqual(summary["fps_centers"], 0)
+    1:         self.assertEqual(summary["inventory"], 0)
+    1:         self.assertEqual(summary["ai_insights"], 0)
+       
+               # agent-contract export equals the source JSON exactly
+    1:         agent_rows = db.get_transactions_for_agent(self.conn)
+    1:         raw = load_dataset(DEFAULT_DATASET_PATH)["transactions"]
+    1:         self.assertEqual(len(agent_rows), len(raw))
+   26:         for got, expected in zip(agent_rows, raw):
+   25:             self.assertEqual(got["transaction_id"], expected["transaction_id"])
+   25:             self.assertEqual(got["beneficiary_id"], expected["beneficiary_id"])
+   25:             self.assertEqual(got["timestamp"], expected["timestamp"])
+   25:             self.assertEqual(got["latitude"], expected["latitude"])
+   25:             self.assertEqual(got["longitude"], expected["longitude"])
+   25:             self.assertEqual(got["ration_type"], expected["ration_type"])
+   25:             self.assertEqual(got["quantity"], expected["quantity"])
+       
+               # provenance chain: transaction -> import -> source
+    1:         tx = db.get_transaction_by_external_id(self.conn, "TX001")
+    1:         self.assertIsNotNone(tx)
+    1:         imp = db.get_data_import(self.conn, tx["source_import_id"])
+    1:         self.assertEqual(imp["dataset_name"], "rationright-synthetic-transactions")
+    1:         src = db.get_data_source(self.conn, imp["data_source_id"])
+    1:         self.assertEqual(src["name"], db.SYNTHETIC_SOURCE_NAME)
+    1:         self.assertEqual(src["type"], "JSON")
+    1:         self.assertEqual(imp["status"], "COMPLETED")
+    1:         self.assertEqual(imp["successful_records"], 25)
+       
+               # all 25 transactions point at the one import
+    3:         count = self.conn.execute(
+    1:             "SELECT COUNT(*) AS n FROM ration_transactions WHERE source_import_id = :iid",
+    1:             {"iid": imp["id"]},
+    1:         ).fetchone()["n"]
+    1:         self.assertEqual(count, 25)
+       
+               # beneficiaries exported are exactly BEN001..BEN005
+    7:         refs = sorted(b["external_reference"] for b in db.list_beneficiaries(self.conn))
+    1:         self.assertEqual(refs, ["BEN001", "BEN002", "BEN003", "BEN004", "BEN005"])
+       
+    1:     def test_seed_synthetic_is_idempotent(self):
+    1:         db.seed_synthetic(self.conn)
+    1:         db.seed_synthetic(self.conn)
+    1:         db.seed_synthetic(self.conn)
+    2:         self.assertEqual(
+    1:             self.conn.execute("SELECT COUNT(*) AS n FROM data_sources").fetchone()["n"], 1
+               )
+    2:         self.assertEqual(
+    1:             self.conn.execute("SELECT COUNT(*) AS n FROM data_imports").fetchone()["n"], 1
+               )
+    2:         self.assertEqual(
+    1:             self.conn.execute("SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"], 25
+               )
+    2:         self.assertEqual(
+    1:             self.conn.execute("SELECT COUNT(*) AS n FROM beneficiaries").fetchone()["n"], 5
+               )
+       
+    1:     def test_transactions_for_beneficiary(self):
+    1:         db.seed_synthetic(self.conn)
+    1:         rows = db.get_transactions_for_beneficiary(self.conn, "BEN001")
+    1:         self.assertEqual(len(rows), 6)  # TX001..TX005 + TX025
+    8:         self.assertTrue(all(r["beneficiary_external_reference"] == "BEN001" for r in rows))
+       
+    1:     def test_import_has_no_inventory_or_insights(self):
+    1:         summary = db.seed_synthetic(self.conn)
+    1:         self.assertEqual(db.get_inventory_for_import(self.conn, summary["data_import_id"]), [])
+    1:         self.assertEqual(db.get_insights_for_import(self.conn, summary["data_import_id"]), [])
+       
+       
+    2: class SeedDatabaseSmokeTest(unittest.TestCase):
+    1:     """End-to-end: seed via the public entry point on a temp file."""
+       
+    1:     def test_seed_database_entry_point(self):
+    1:         with tempfile.TemporaryDirectory() as tmp:
+    1:             db_path = Path(tmp) / "seed.db"
+    1:             summary = db.seed_database(db_path=db_path)
+    1:             self.assertEqual(summary["transactions"], 25)
+    1:             conn = db.connect(db_path)
+    1:             try:
+    1:                 n = conn.execute("SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"]
+    1:                 self.assertEqual(n, 25)
+                   finally:
+    1:                 conn.close()
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

@@ -1,0 +1,216 @@
+    1: """RationAI — connector abstractions (Phase 7).
+       
+       A ``DataConnector`` turns one external source into validated, mapped,
+       normalized records that the existing Phase 3/4 ingestion pipeline imports:
+       
+           DataSource -> Connector -> Fetcher -> Raw response -> Parser
+               -> Column mapper -> Validator -> Normalizer -> Database
+       
+       The four operations below map directly onto the existing pipeline pieces:
+       ``fetch`` (this package), ``parse`` (``ingestion.parsers``), ``map_columns``
+       (``ingestion.mapping``), ``validate`` (``ingestion.validation``). The sync
+       service (``connectors.service``) drives the DB/provenance/status side.
+       
+       No URL is ever user-supplied: connectors only fetch the ``base_url`` from
+       their registered profile, which lives server-side.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import hashlib
+    1: import json
+    1: import tempfile
+    1: from abc import ABC, abstractmethod
+    1: from pathlib import Path
+       
+    1: from connectors.errors import InvalidResponseError
+    1: from connectors.fetcher import MAX_PAGES
+    1: from ingestion import mapping as mapmod
+    1: from ingestion import parsers
+    1: from ingestion import validation
+    1: from ingestion.mapping import MappingError
+       
+       
+    1: def sha256_bytes(data: bytes) -> str:
+           """Stable content hash for idempotent re-import detection (Phase 4)."""
+    8:     return hashlib.sha256(data).hexdigest()
+       
+       
+    2: class DataConnector(ABC):
+    1:     """Base class for all external data connectors."""
+       
+    1:     def __init__(self, profile: dict):
+   14:         self.profile = profile
+       
+           # -- fetch --------------------------------------------------------------
+       
+    1:     @abstractmethod
+    1:     def fetch(self, fetcher, resolve_url) -> list:
+               """Fetch the source and return raw page bodies (list of bytes).
+       
+               ``resolve_url`` turns the profile's (possibly relative) base_url into
+               an absolute URL. ``fetcher`` is the HTTP fetch function (injectable
+               for tests). Returns a LIST so paginated JSON sources can yield
+               multiple pages; single-body sources return a one-element list.
+               """
+       
+           # -- parse --------------------------------------------------------------
+       
+    1:     @abstractmethod
+    1:     def parse(self, pages: list) -> tuple:
+               """Parse raw bodies into ``(headers, rows)``."""
+       
+           # -- map ----------------------------------------------------------------
+       
+    1:     def map_columns(self, headers: list) -> dict:
+               """Map external headers to internal fields.
+       
+               Profile mappings (explicit, source-specific) win; the generic alias
+               table (``ingestion.mapping.detect_mapping``) fills the rest. Returns
+               ``{external_header: internal_field}`` — the importer contract.
+               """
+    8:         detected = mapmod.detect_mapping(headers, self.profile["dataset_type"])
+    8:         mapping = mapmod.mapping_to_dict(detected["mapping"])
+    8:         mappable = set(mapmod.mappable_fields(self.profile["dataset_type"]))
+    8:         profile_mapping = self.profile.get("mapping") or {}
+   77:         for external, internal in profile_mapping.items():
+                   # Apply only when the column exists AND the target is a valid
+                   # internal field for this dataset type (a bad profile entry must
+                   # never break the required-field contract).
+   69:             if internal not in mappable:
+                       continue
+  336:             for header in headers:
+  336:                 if header.strip().lower() == external.strip().lower():
+   69:                     mapping[header] = internal
+   69:                     break
+    8:         required = mapmod.required_fields(self.profile["dataset_type"])
+   48:         missing = [f for f in required if f not in mapping.values()]
+    8:         if missing:
+                   raise MappingError(
+                       "Required field(s) not present or not mapped: %s" % ", ".join(missing)
+                   )
+    8:         return mapping
+       
+           # -- validate -----------------------------------------------------------
+       
+    1:     def validate(self, headers: list, rows: list, mapping: dict) -> dict:
+               """Run the Phase 4 validation pipeline; returns the summary."""
+               return validation.summarize(rows, self.profile["dataset_type"], headers, mapping)
+       
+       
+    2: class CsvUrlConnector(DataConnector):
+    1:     """Connector for a downloadable CSV file (reuses the Phase 3 CSV parser)."""
+       
+    1:     format = "csv"
+       
+    1:     def fetch(self, fetcher, resolve_url) -> list:
+   13:         return [fetcher(resolve_url(self.profile["base_url"]))]
+       
+    1:     def parse(self, pages: list) -> tuple:
+   10:         if not pages or not pages[0]:
+    1:             raise InvalidResponseError("The source returned an empty response.")
+    9:         data = pages[0]
+    9:         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+    9:             tmp.write(data)
+    9:             path = Path(tmp.name)
+    9:         try:
+    9:             parsed = parsers.parse_file(path, "csv")
+               finally:
+    9:             path.unlink(missing_ok=True)
+    7:         headers = parsed.get("headers") or []
+    7:         rows = parsed.get("rows") or []
+    7:         if not rows:
+                   raise InvalidResponseError("The source returned an empty dataset (no rows).")
+    7:         return headers, rows
+       
+       
+    2: class JsonUrlConnector(DataConnector):
+    1:     """Connector for a JSON API/dataset.
+       
+           Supports offset/limit pagination when the profile declares it (the OGD
+           India API pattern): pages are fetched until the declared total is reached
+           or a page yields no records, with a hard page cap so a broken source
+           cannot loop forever.
+           """
+       
+    1:     format = "json"
+       
+    1:     def fetch(self, fetcher, resolve_url) -> list:
+    1:         pagination = self.profile.get("pagination")
+    1:         if not pagination or pagination.get("type") != "offset":
+                   return [fetcher(resolve_url(self.profile["base_url"]))]
+    1:         offset_param = pagination.get("offset_param", "offset")
+    1:         limit_param = pagination.get("limit_param", "limit")
+    1:         page_size = int(pagination.get("page_size", 1000))
+    1:         base = resolve_url(self.profile["base_url"])
+    1:         sep = "&" if "?" in base else "?"
+    1:         pages = []
+    1:         offset = 0
+    2:         while offset // page_size < MAX_PAGES:
+    2:             url = "%s%s%s=%d&%s=%d" % (base, sep, offset_param, offset, limit_param, page_size)
+    2:             pages.append(fetcher(url))
+    2:             try:
+    2:                 payload = json.loads(pages[-1].decode("utf-8"))
+                   except (ValueError, UnicodeDecodeError):
+                       # One malformed page: fail the sync rather than guessing.
+                       raise InvalidResponseError("The source returned malformed JSON.")
+    2:             records = payload.get(pagination.get("records_key", "records")) or []
+    2:             total = payload.get(pagination.get("total_key"))
+    2:             offset += len(records)
+    2:             if not records:
+                       break
+    2:             if total is not None and offset >= int(total):
+    1:                 break
+    1:         return pages
+       
+    1:     def parse(self, pages: list) -> tuple:
+    1:         records = []
+    3:         for page in pages:
+    2:             if not page:
+                       raise InvalidResponseError("The source returned an empty response.")
+    2:             try:
+    2:                 payload = json.loads(page.decode("utf-8"))
+                   except (ValueError, UnicodeDecodeError):
+                       raise InvalidResponseError("The source returned malformed JSON.")
+    2:             pagination = self.profile.get("pagination")
+    2:             if pagination:
+    2:                 chunk = payload.get(pagination.get("records_key", "records")) or []
+                   elif isinstance(payload, list):
+                       chunk = payload
+                   else:
+                       # Wrapped formats handled by the Phase 3 JSON parser.
+                       chunk = None
+    2:             if chunk is not None:
+    2:                 records.extend(chunk)
+                   else:
+                       # Fall back to the shared JSON parser for wrapped objects.
+                       with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                           tmp.write(page)
+                           path = Path(tmp.name)
+                       try:
+                           parsed = parsers.parse_file(path, "json")
+                       finally:
+                           path.unlink(missing_ok=True)
+                       return parsed.get("headers") or [], parsed.get("rows") or []
+    1:         if not records:
+                   raise InvalidResponseError("The source returned an empty dataset (no records).")
+               # Reuse the Phase 3 JSON parser on the merged record list.
+    1:         merged = json.dumps(records).encode("utf-8")
+    1:         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+    1:             tmp.write(merged)
+    1:             path = Path(tmp.name)
+    1:         try:
+    1:             parsed = parsers.parse_file(path, "json")
+               finally:
+    1:             path.unlink(missing_ok=True)
+    1:         return parsed.get("headers") or [], parsed.get("rows") or []
+       
+       
+    1: def connector_for(profile: dict) -> DataConnector:
+           """Factory: build the right connector for a profile."""
+   14:     fmt = (profile.get("format") or "csv").lower()
+   14:     if fmt == "json":
+    1:         return JsonUrlConnector(profile)
+   13:     if fmt == "csv":
+   13:         return CsvUrlConnector(profile)
+           raise InvalidResponseError("Unsupported connector format %r" % fmt)

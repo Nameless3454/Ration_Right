@@ -1,0 +1,470 @@
+    1: """RationRight — Phase 7: external data connector tests.
+       
+       Covers the fetcher (timeout/retry/backoff/rate-limit), the connector sync
+       service (success, auth, malformed, empty, partial, duplicate, recovery), and
+       the data-source API. ALL external responses are MOCKED — no live government
+       API is claimed. The official OGD India source is documented in
+       ``connectors/profiles.py`` and verified to fail cleanly when no API key is
+       configured (honest, not fake).
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: from connectors import service as conn_service
+    1: from connectors import sync_source
+    1: from connectors.errors import HttpStatusError, RateLimitError
+    1: from connectors.fetcher import http_get_bytes
+       
+    1: SAMPLE_CSV = (Path(__file__).resolve().parent.parent / "data" / "sample" / "pds_sample.csv")
+       
+       
+    2: class FetcherRetryTests(unittest.TestCase):
+    1:     """Unit tests for the HTTP fetcher's retry/backoff policy."""
+       
+    1:     def _patch_urlopen(self, responses, sleep_log=None):
+    4:         import connectors.fetcher as fetcher_mod
+       
+    4:         calls = {"n": 0}
+       
+    8:         class FakeResp:
+    4:             def __init__(self, data):
+    2:                 self._data = data
+       
+    4:             def getcode(self):
+    2:                 return 200
+       
+    4:             def __enter__(self):
+    2:                 return self
+       
+    4:             def __exit__(self, *a):
+    2:                 return False
+       
+    4:             def read(self):
+    2:                 return self._data
+       
+    8:         class FakeURLError(urllib.error.URLError):
+    4:             pass
+       
+    4:         def fake_urlopen(request, timeout=None):
+    8:             calls["n"] += 1
+    8:             resp = responses[min(calls["n"] - 1, len(responses) - 1)]
+    8:             if isinstance(resp, Exception):
+                       raise resp
+    8:             if isinstance(resp, int):
+    6:                 raise urllib.error.HTTPError(request.full_url, resp, "err", {}, None)
+    2:             return FakeResp(resp)
+       
+    4:         self._orig = fetcher_mod.urllib.request.urlopen
+    4:         fetcher_mod.urllib.request.urlopen = fake_urlopen
+    4:         self._fetcher_mod = fetcher_mod
+    4:         self.addCleanup(setattr, fetcher_mod.urllib.request, "urlopen", self._orig)
+    4:         return calls
+       
+    1:     def test_success(self):
+    1:         calls = self._patch_urlopen([b"data"])
+    1:         self.assertEqual(http_get_bytes("http://x"), b"data")
+    1:         self.assertEqual(calls["n"], 1)
+       
+    1:     def test_404_no_retry(self):
+    1:         calls = self._patch_urlopen([404])
+    1:         with self.assertRaises(HttpStatusError) as cm:
+    2:             http_get_bytes("http://x")
+    1:         self.assertEqual(cm.exception.status, 404)
+    1:         self.assertFalse(cm.exception.retryable)
+    1:         self.assertEqual(calls["n"], 1)  # permanent error: exactly one attempt
+       
+    1:     def test_500_retries_then_succeeds(self):
+    1:         sleep_log = []
+    1:         calls = self._patch_urlopen([500, 500, b"ok"])
+    1:         self.assertEqual(http_get_bytes("http://x", sleep=sleep_log.append), b"ok")
+    1:         self.assertEqual(calls["n"], 3)
+    1:         self.assertEqual(len(sleep_log), 2)  # backoff between attempts
+       
+    1:     def test_500_exhausts_attempts(self):
+    1:         calls = self._patch_urlopen([500, 500, 500, 500])
+    1:         with self.assertRaises(HttpStatusError):
+    2:             http_get_bytes("http://x", max_attempts=3)
+    1:         self.assertEqual(calls["n"], 3)
+       
+    1:     def test_429_respects_retry_after(self):
+    1:         import connectors.fetcher as fetcher_mod
+    1:         import urllib.error as ue
+       
+    1:         calls = {"n": 0}
+    1:         sleep_log = []
+       
+    1:         def fake_urlopen(request, timeout=None):
+    2:             calls["n"] += 1
+    2:             if calls["n"] == 1:
+    1:                 e = ue.HTTPError(request.full_url, 429, "too many", {}, None)
+    1:                 e.headers = {"Retry-After": "2"}
+    1:                 raise e
+       
+    2:             class FakeResp:
+    1:                 def getcode(self):
+    1:                     return 200
+       
+    1:                 def __enter__(self):
+    1:                     return self
+       
+    1:                 def __exit__(self, *a):
+    1:                     return False
+       
+    1:                 def read(self):
+    1:                     return b"ok"
+       
+    1:             return FakeResp()
+       
+    1:         orig = fetcher_mod.urllib.request.urlopen
+    1:         fetcher_mod.urllib.request.urlopen = fake_urlopen
+    1:         self.addCleanup(setattr, fetcher_mod.urllib.request, "urlopen", orig)
+    1:         self.assertEqual(http_get_bytes("http://x", sleep=sleep_log.append), b"ok")
+    1:         self.assertEqual(sleep_log, [2.0])  # honoured Retry-After
+       
+    1:     def test_timeout_retries(self):
+    1:         import connectors.fetcher as fetcher_mod
+       
+    1:         calls = {"n": 0}
+    1:         sleep_log = []
+       
+    1:         def fake_urlopen(request, timeout=None):
+    2:             calls["n"] += 1
+    2:             raise urllib.error.URLError("timed out")
+       
+    1:         orig = fetcher_mod.urllib.request.urlopen
+    1:         fetcher_mod.urllib.request.urlopen = fake_urlopen
+    1:         self.addCleanup(setattr, fetcher_mod.urllib.request, "urlopen", orig)
+    1:         from connectors.errors import TimeoutError
+       
+    1:         with self.assertRaises(TimeoutError):
+    2:             http_get_bytes("http://x", max_attempts=2, sleep=sleep_log.append)
+    1:         self.assertEqual(calls["n"], 2)
+       
+       
+    2: class SyncServiceTests(unittest.TestCase):
+    1:     """Sync outcomes with an injected fake fetcher (no network)."""
+       
+    1:     def setUp(self):
+   11:         import tempfile
+       
+   11:         self._tmp = tempfile.TemporaryDirectory()
+   11:         self.db_path = Path(self._tmp.name) / "conn.db"
+   11:         self.addCleanup(self._tmp.cleanup)
+   11:         conn = db.open_db(self.db_path)
+   11:         conn_service.register_configured_sources(self.db_path)
+   11:         conn.close()
+   11:         self.sample_id = self._source_id("sample_open_pds")
+   11:         self.ogd_id = self._source_id("ogd_pds_resource")
+       
+    1:     def _source_id(self, name):
+   22:         conn = db.open_db(self.db_path)
+   22:         try:
+   22:             row = db.get_data_source_by_name(conn, name)
+   44:             return row["id"] if row else None
+               finally:
+   22:             conn.close()
+       
+    1:     def _source(self, source_id):
+    4:         conn = db.open_db(self.db_path)
+    4:         try:
+    8:             return db.get_data_source(conn, source_id)
+               finally:
+    4:             conn.close()
+       
+    1:     def _csv_fetcher(self, data=None):
+    4:         payload = data if data is not None else SAMPLE_CSV.read_bytes()
+    8:         return lambda url: payload
+       
+    1:     def _sync(self, source_id, fetcher):
+   24:         return sync_source(
+   12:             source_id, db_path=self.db_path, fetcher=fetcher,
+   12:             request_host="127.0.0.1:1",
+               )
+       
+    1:     def test_successful_csv_sync(self):
+    1:         summary = self._sync(self.sample_id, self._csv_fetcher())
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         self.assertEqual(summary["fetched"], 14)
+    1:         self.assertEqual(summary["imported"], 14)
+    1:         self.assertEqual(summary["failed"], 0)
+    1:         self.assertEqual(summary["duplicates"], 0)
+    1:         self.assertEqual(summary["quality"]["score"], 100.0)
+    1:         src = self._source(self.sample_id)
+    1:         self.assertEqual(src["status"], "ACTIVE")
+    1:         self.assertIsNotNone(src["last_successful_sync_at"])
+    1:         self.assertIsNone(src["last_error"])
+               # provenance: an import record exists for this source
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             n = conn.execute("SELECT COUNT(*) FROM data_imports WHERE data_source_id=?",
+    2:                              (self.sample_id,)).fetchone()[0]
+               finally:
+    1:             conn.close()
+    1:         self.assertGreaterEqual(n, 1)
+       
+    1:     def test_repeat_sync_is_idempotent(self):
+    1:         self._sync(self.sample_id, self._csv_fetcher())
+    1:         summary = self._sync(self.sample_id, self._csv_fetcher())
+    1:         self.assertEqual(summary["status"], "UP_TO_DATE")
+    1:         self.assertEqual(summary["imported"], 0)
+    1:         self.assertEqual(summary["duplicates"], 14)
+    1:         self.assertEqual(summary["duplicates_exact"], 14)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             n = conn.execute(
+    1:                 "SELECT COUNT(*) FROM ration_transactions t JOIN data_imports i "
+                       "ON i.id = t.source_import_id WHERE i.data_source_id=?",
+    1:                 (self.sample_id,),
+    1:             ).fetchone()[0]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(n, 14)  # NOT doubled
+       
+    1:     def test_auth_missing_never_fetches(self):
+    1:         calls = {"n": 0}
+       
+    1:         def fetcher(url):
+                   calls["n"] += 1
+                   return b""
+       
+    1:         summary = self._sync(self.ogd_id, fetcher)
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertIn("API key not configured", summary["error"])
+    1:         self.assertEqual(calls["n"], 0)  # no fetch attempted without a key
+    1:         src = self._source(self.ogd_id)
+    1:         self.assertEqual(src["status"], "ERROR")
+    1:         self.assertIn("GOVERNMENT_DATA_API_KEY", src["last_error"])
+       
+    1:     def test_http_404_error(self):
+    1:         def fetcher(url):
+    1:             raise HttpStatusError(404, "not found")
+       
+    1:         summary = self._sync(self.sample_id, fetcher)
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertFalse(summary["retryable"])
+    1:         self.assertIn("404", summary["error"])
+    1:         src = self._source(self.sample_id)
+    1:         self.assertEqual(src["status"], "ERROR")
+    1:         self.assertIsNone(src["last_successful_sync_at"])
+       
+    1:     def test_rate_limit_error(self):
+    1:         def fetcher(url):
+    1:             raise RateLimitError("rate limited", retry_after=1.0)
+       
+    1:         summary = self._sync(self.sample_id, fetcher)
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertTrue(summary["retryable"])
+       
+    1:     def test_malformed_response(self):
+               # Not a valid CSV structure -> mapping fails with a clear message.
+    2:         summary = self._sync(self.sample_id, lambda url: b"this is not a csv")
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertIn("no data rows", summary["error"])
+    1:         self.assertNotIn("Traceback", summary["error"])
+       
+    1:     def test_malformed_json(self):
+               # Valid CSV header but garbage data rows -> parse/mapping error.
+    2:         summary = self._sync(self.sample_id, lambda url: b"{\"broken\": true")
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertNotIn("Traceback", summary["error"])
+       
+    1:     def test_empty_response(self):
+    2:         summary = self._sync(self.sample_id, lambda url: b"")
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertIn("empty", summary["error"].lower())
+       
+    1:     def test_partial_import(self):
+               # Add one invalid row (bad quantity) -> PARTIAL, valid rows imported.
+    1:         lines = SAMPLE_CSV.read_text().strip().splitlines()
+    1:         bad = lines[1].replace("1200", "abc")  # first data row, quantity -> invalid
+    1:         payload = ("\n".join([lines[0], bad] + lines[2:])).encode()
+    2:         summary = self._sync(self.sample_id, lambda url: payload)
+    1:         self.assertEqual(summary["status"], "PARTIAL")
+    1:         self.assertEqual(summary["imported"], 13)
+    1:         self.assertEqual(summary["failed"], 1)
+       
+    1:     def test_source_recovery_after_failure(self):
+    1:         def failing(url):
+    1:             raise HttpStatusError(503, "unavailable")
+       
+    1:         summary = self._sync(self.sample_id, failing)
+    1:         self.assertEqual(summary["status"], "ERROR")
+               # now the source recovers
+    1:         summary = self._sync(self.sample_id, self._csv_fetcher())
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         src = self._source(self.sample_id)
+    1:         self.assertEqual(src["status"], "ACTIVE")
+    1:         self.assertIsNone(src["last_error"])
+    1:         self.assertIsNotNone(src["last_successful_sync_at"])
+       
+    1:     def test_json_pagination_merges_pages(self):
+    1:         profile = {
+    1:             "name": "paged", "label": "Paged", "type": "API",
+    1:             "base_url": "https://example.test/api", "format": "json",
+    1:             "dataset_type": "ration_transactions",
+    1:             "dataset_name": "paged_sync", "file_name": "p.json",
+    1:             "requires_auth": False,
+    2:             "pagination": {"type": "offset", "offset_param": "offset",
+    1:                            "limit_param": "limit", "page_size": 2,
+    1:                            "records_key": "records", "total_key": "total"},
+    1:             "mapping": {
+    1:                 "fps_id": "fps_center_id", "district_name": "district",
+    1:                 "commodity_name": "commodity", "distributed_qty": "quantity",
+    1:                 "date": "transaction_date", "transaction_id": "external_transaction_id",
+                   },
+               }
+    2:         page1 = {"total": 4, "records": [
+    2:             {"transaction_id": "P1", "fps_id": "F1", "district_name": "D1",
+    1:              "commodity_name": "Rice", "distributed_qty": 10, "date": "2026-08-01"},
+    2:             {"transaction_id": "P2", "fps_id": "F1", "district_name": "D1",
+    1:              "commodity_name": "Wheat", "distributed_qty": 20, "date": "2026-08-02"},
+               ]}
+    2:         page2 = {"total": 4, "records": [
+    2:             {"transaction_id": "P3", "fps_id": "F2", "district_name": "D2",
+    1:              "commodity_name": "Rice", "distributed_qty": 15, "date": "2026-08-03"},
+    2:             {"transaction_id": "P4", "fps_id": "F2", "district_name": "D2",
+    1:              "commodity_name": "Sugar", "distributed_qty": 5, "date": "2026-08-04"},
+               ]}
+    1:         urls = []
+       
+    1:         def fetcher(url):
+    2:             urls.append(url)
+    2:             return json.dumps(page1 if "offset=0" in url else page2).encode()
+       
+    1:         from connectors.base import connector_for
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    2:             src_id = db.insert_data_source(conn, name="paged", source_type="API",
+    1:                                            description="paged test", status="ACTIVE")
+    1:             conn.commit()
+               finally:
+    1:             conn.close()
+    1:         from connectors.service import run_sync_import
+       
+    1:         connector = connector_for(profile)
+    2:         pages = connector.fetch(fetcher, lambda b: b)
+    1:         headers, rows = connector.parse(pages)
+    1:         self.assertEqual(len(rows), 4)
+    1:         self.assertEqual(len(urls), 2)  # two pages fetched, stopped at total
+    1:         mapping = connector.map_columns(headers)
+    1:         import database as db2
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    2:             summary = run_sync_import(conn, {"id": src_id, "name": "paged"},
+    1:                                       profile, headers, rows, mapping, pages)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(summary["imported"], 4)
+       
+       
+    2: class DataSourceApiTests(unittest.TestCase):
+    1:     def setUp(self):
+    5:         import tempfile
+       
+    5:         self._tmp = tempfile.TemporaryDirectory()
+    5:         self.db_path = Path(self._tmp.name) / "api.db"
+    5:         self.addCleanup(self._tmp.cleanup)
+    5:         conn = db.open_db(self.db_path)
+    5:         conn_service.register_configured_sources(self.db_path)
+    5:         conn.close()
+    5:         from server import make_server
+       
+    5:         self.server = make_server("127.0.0.1", 0, db_path=str(self.db_path))
+    5:         self.port = self.server.server_address[1]
+    5:         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+    5:         self.thread.start()
+       
+    1:     def tearDown(self):
+    5:         self.server.shutdown()
+    5:         self.server.server_close()
+       
+    1:     def _get(self, path):
+    8:         try:
+    8:             with urllib.request.urlopen("http://127.0.0.1:%d%s" % (self.port, path), timeout=30) as r:
+    7:                 return r.status, json.loads(r.read().decode("utf-8"))
+    1:         except urllib.error.HTTPError as exc:
+    1:             return exc.code, json.loads(exc.read().decode("utf-8"))
+       
+    1:     def _post(self, path, body=None):
+    8:         req = urllib.request.Request(
+    4:             "http://127.0.0.1:%d%s" % (self.port, path),
+    4:             data=json.dumps(body or {}).encode("utf-8"),
+    4:             headers={"Content-Type": "application/json"},
+    4:             method="POST",
+               )
+    4:         try:
+    4:             with urllib.request.urlopen(req, timeout=60) as r:
+    2:                 return r.status, json.loads(r.read().decode("utf-8"))
+    2:         except urllib.error.HTTPError as exc:
+    2:             return exc.code, json.loads(exc.read().decode("utf-8"))
+       
+    1:     def test_list_and_detail(self):
+    1:         status, payload = self._get("/api/data-sources")
+    1:         self.assertEqual(status, 200)
+    4:         names = {s["name"] for s in payload["sources"]}
+    1:         self.assertIn("sample_open_pds", names)
+    1:         self.assertIn("ogd_pds_resource", names)
+    3:         sample = next(s for s in payload["sources"] if s["name"] == "sample_open_pds")
+    1:         status, detail = self._get("/api/data-sources/%d" % sample["data_source_id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(detail["name"], "sample_open_pds")
+       
+    1:     def test_unknown_source_404(self):
+    1:         self.assertEqual(self._get("/api/data-sources/9999")[0], 404)
+    1:         self.assertEqual(self._post("/api/data-sources/9999/sync")[0], 404)
+       
+    1:     def test_sync_via_api_with_bundled_sample(self):
+    1:         status, payload = self._get("/api/data-sources")
+    3:         sample = next(s for s in payload["sources"] if s["name"] == "sample_open_pds")
+    2:         status, summary = self._post(
+    1:             "/api/data-sources/%d/sync" % sample["data_source_id"]
+               )
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(summary["status"], "COMPLETED")
+    1:         self.assertEqual(summary["imported"], 14)
+    1:         status, imports = self._get("/api/data-sources/%d/imports" % sample["data_source_id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(len(imports["imports"]), 1)
+    1:         status, st = self._get("/api/data-sources/%d/status" % sample["data_source_id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(st["connection_status"], "CONNECTED")
+       
+    1:     def test_sync_ignores_user_supplied_url(self):
+               # SSRF guard: a crafted URL in the body must be ignored — the sync
+               # only ever fetches the registered base_url.
+    1:         status, payload = self._get("/api/data-sources")
+    3:         sample = next(s for s in payload["sources"] if s["name"] == "sample_open_pds")
+    2:         status, summary = self._post(
+    1:             "/api/data-sources/%d/sync" % sample["data_source_id"],
+    1:             {"url": "http://169.254.169.254/latest/meta-data"},
+               )
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(summary["status"], "COMPLETED")  # fetched registered sample URL
+       
+    1:     def test_ogd_source_honest_not_live(self):
+               """The official source is never presented as live: the connector is
+               implemented (CONNECTOR_READY), the API key is missing, and a sync
+               attempt fails cleanly without touching data (Phase 8 label)."""
+    1:         status, payload = self._get("/api/data-sources")
+    2:         ogd = next(s for s in payload["sources"] if s["name"] == "ogd_pds_resource")
+    1:         self.assertEqual(ogd["connection_status"], "CONNECTOR_READY")
+    1:         self.assertNotEqual(ogd["connection_status"], "CONNECTED")
+    1:         self.assertIn("GOVERNMENT_DATA_API_KEY", ogd["last_error"] or "")
+    1:         status, summary = self._post("/api/data-sources/%d/sync" % ogd["data_source_id"])
+    1:         self.assertEqual(status, 502)
+    1:         self.assertEqual(summary["status"], "ERROR")
+    1:         self.assertIn("API key not configured", summary["error"])
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

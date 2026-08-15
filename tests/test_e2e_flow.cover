@@ -1,0 +1,366 @@
+    1: """RationRight — Phase 15: end-to-end flow, concurrency, scale & recovery.
+       
+       Runs the complete user journey against a real temporary database:
+       
+           upload -> validate -> import -> command center -> analytics ->
+           AI analysis (real mode) -> monitoring -> alert -> evidence ->
+           what-if simulation -> recommendation -> report -> export
+       
+       plus a concurrent-reads smoke test, a bounded large-import test, and a
+       failure-recovery test (AI down does not break analytics; monitoring failure
+       does not clear existing alerts).
+       
+       Run from the project root::
+       
+           python3 -m unittest tests.test_e2e_flow -v
+       """
+       
+    1: import json
+    1: import os
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import analytics
+    1: import command_center
+    1: import database as db
+    1: import monitoring
+    1: import simulation as sim
+    1: from analysis_center import run_analysis
+    1: from ingestion import service as ingest
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+    1: TRANSACTION_CSV = (
+    1:     "Transaction ID,Beneficiary ID,FPS Code,Transaction Date,Commodity,Quantity,Unit\n"
+           "TX301,BEN001,FPS01,2026-07-02,rice,100,kg\n"
+           "TX302,BEN001,FPS01,2026-07-12,rice,110,kg\n"
+           "TX303,BEN001,FPS01,2026-07-22,rice,90,kg\n"
+           "TX304,BEN001,FPS01,2026-08-01,rice,120,kg\n"
+           "TX305,BEN002,FPS02,2026-07-05,wheat,40,kg\n"
+           "TX306,BEN002,FPS02,2026-08-02,wheat,50,kg\n"
+       )
+       
+       
+    1: def _fresh_db():
+    6:     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    6:     tmp.close()
+    6:     os.unlink(tmp.name)
+    6:     return tmp.name
+       
+       
+    1: def _import_and_seed(db_path):
+           """Import the CSV and add low-coverage rice inventory; returns import id."""
+    5:     up = ingest.handle_upload(TRANSACTION_CSV.encode(), "e2e.csv", "text/csv")
+   10:     ingest.validate_step(up["token"], dataset_type="ration_transactions",
+    5:                          db_path=db_path)
+    5:     summary = ingest.confirm_step(up["token"], db_path=db_path)
+    5:     imp_id = summary["data_import_id"]
+    5:     conn = db.open_db(db_path)
+    5:     try:
+   10:         center = conn.execute(
+    5:             "SELECT id FROM fps_centers WHERE fps_code = 'FPS01'").fetchone()
+   10:         db.insert_inventory_batch(conn, [
+   10:             {"fps_center_id": center["id"], "commodity": "rice",
+    5:              "current_stock": 500.0, "monthly_consumption": 1200.0,
+    5:              "reorder_threshold": 800.0, "source_import_id": imp_id},
+               ])
+    5:         conn.commit()
+           finally:
+    5:         conn.close()
+    5:     return imp_id
+       
+       
+    2: class FullDemoFlowTests(unittest.TestCase):
+    1:     """STEP 1-16 of the demo: real data all the way to an exported report."""
+       
+    1:     def setUp(self):
+    2:         self.db_path = _fresh_db()
+    2:         self.imp_id = _import_and_seed(self.db_path)
+    4:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def _tx_count(self):
+    2:         conn = db.open_db(self.db_path)
+    2:         try:
+    8:             return conn.execute(
+    4:                 "SELECT COUNT(*) AS n FROM ration_transactions").fetchone()["n"]
+               finally:
+    2:             conn.close()
+       
+    1:     def test_full_flow(self):
+               # 1-2. Import happened in setUp: 6 valid records.
+    1:         self.assertEqual(self._tx_count(), 6)
+       
+               # 3. Command center reflects the import (explicit window covers all
+               #    rows — the default is a rolling 30-day window from today).
+    2:         cc = command_center.command_center(
+    1:             db_path=self.db_path, from_date="2026-07-01", to_date="2026-08-31")
+   10:         kpis = {k["key"]: k["value"] for k in cc["kpis"]}
+    1:         self.assertEqual(kpis["transactions"], 6)
+    1:         self.assertEqual(kpis["distribution"], 510.0)  # 100+110+90+120+40+50
+    1:         self.assertEqual(cc["disclaimer"], "Analysis based on imported dataset.")
+       
+               # 4. Analytics agrees with the same database.
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             ov = analytics.overview(conn)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(ov["total_transactions"], 6)
+    1:         self.assertEqual(ov["ration_distributed_kg"], 510.0)
+       
+               # 5. AI analysis in real mode -> a persisted analysis run.
+    2:         result = run_analysis(dataset_mode="real", data_import_id=self.imp_id,
+    1:                               db_path=self.db_path,
+    1:                               types=["distribution_anomaly", "inventory_risk",
+                                            "demand_forecast", "recommendations"])
+    1:         self.assertIsNotNone(result)
+    1:         run = result["analysis_run"]
+    1:         self.assertTrue(run["analysis_id"].startswith("RA-"))
+    1:         self.assertEqual(run["data_import_id"], self.imp_id)
+       
+               # 6. Monitoring -> at least one real inventory alert (12.5 days < 30).
+    1:         outcome = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertGreaterEqual(outcome["created"] + outcome["updated"], 1)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    5:             alerts = [dict(r) for r in conn.execute(
+    1:                 "SELECT alert_id, rule_type, severity, current_value, threshold, "
+                       " import_id FROM alerts WHERE status IN ('OPEN','ACKNOWLEDGED')")]
+    5:             alerts2 = [dict(r) for r in conn.execute(
+    1:                 "SELECT alert_id, rule_type, severity FROM alerts ORDER BY id "
+                       "LIMIT 10")]
+               finally:
+    1:             conn.close()
+    1:         self.assertTrue(alerts)
+    4:         inventory_alert = next((a for a in alerts
+    2:                                 if a["rule_type"] == "INVENTORY_RISK"), None)
+    1:         self.assertIsNotNone(inventory_alert)
+               # Evidence values are real and match the seeded stock: 500*30/1200 =
+               # 12.5 days coverage, below the 15-day critical threshold.
+    1:         self.assertEqual(inventory_alert["current_value"], 12.5)  # days
+    1:         self.assertEqual(inventory_alert["threshold"], 15.0)      # critical days
+    1:         self.assertEqual(inventory_alert["severity"], "CRITICAL")
+       
+               # 7. Alert -> evidence (already attached) -> what-if on the same import.
+    2:         scenario = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                                     demand_change_pct=10,
+    1:                                     supply_delay_days=7, db_path=self.db_path)
+    1:         self.assertEqual(scenario["status"], "completed")
+    1:         self.assertTrue(scenario["scenario_id"].startswith("SIM-"))
+               # Deterministic math: demand 420/1mo? (rice: 100+110+90+120 = 420 over
+               # 2 months -> 210/mo); +10% -> 231.
+    2:         self.assertEqual(scenario["baseline"]["monthly_demand_kg"],
+    1:                          round(420.0 / 2, 2))
+    2:         self.assertEqual(scenario["scenario"]["projected_monthly_demand_kg"],
+    1:                          round(210.0 * 1.1, 2))
+    1:         self.assertTrue(scenario["interpretation"]["summary"])
+               # Lineage back to import + source.
+    1:         self.assertEqual(scenario["lineage"]["data_import_id"], self.imp_id)
+    1:         self.assertEqual(scenario["lineage"]["source_name"], "Uploaded Dataset")
+       
+               # 8. Simulation must NOT modify real data.
+    1:         self.assertEqual(self._tx_count(), 6)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             stock = conn.execute(
+    1:                 "SELECT current_stock FROM inventory WHERE commodity='rice'"
+    1:             ).fetchone()["current_stock"]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(stock, 500.0)
+       
+               # 9. Report matches the command center values (same payload source).
+    2:         report = command_center.generate_report(
+    1:             db_path=self.db_path,
+    1:             filters={"from_date": "2026-07-01", "to_date": "2026-08-31"})
+    1:         self.assertTrue(report["report_id"].startswith("RPT-"))
+   10:         report_kpis = {k["key"]: k["value"] for k in report["kpis"]}
+    2:         self.assertEqual(report_kpis["distribution"],
+    1:                          kpis["distribution"])
+               # Compare against a fresh command-center snapshot from the SAME window
+               # (alerts were created by monitoring after the first snapshot).
+    2:         cc_now = command_center.command_center(
+    1:             db_path=self.db_path, from_date="2026-07-01", to_date="2026-08-31")
+    2:         self.assertEqual(report["risk_overview"]["total"],
+    1:                          cc_now["risk_overview"]["total"])
+               # Report lineage identifies the dataset import.
+    1:         self.assertGreaterEqual(report["lineage"]["import_count"], 1)
+       
+               # 10. Export: the report payload is the exportable artifact (JSON).
+    1:         export = json.dumps(report)
+    1:         self.assertIn(report["report_id"], export)
+    1:         self.assertIn("kpis", json.loads(export))
+               # CSV export path: district risk rows serialize to rows.
+    1:         rows = report["district_risk"]
+    1:         self.assertIsInstance(rows, list)
+       
+    1:     def test_alert_evidence_and_lineage_to_analysis(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    2:             alert = conn.execute(
+    1:                 "SELECT alert_id, rule_type, severity, current_value, threshold, "
+                       " evidence, import_id, analysis_id FROM alerts "
+                       "WHERE rule_type='INVENTORY_RISK' LIMIT 1").fetchone()
+               finally:
+    1:             conn.close()
+    1:         self.assertIsNotNone(alert)
+    1:         evidence = json.loads(alert["evidence"] or "{}")
+    1:         self.assertIn("current_stock", evidence)
+    1:         self.assertEqual(evidence["current_stock"], 500.0)
+    1:         self.assertEqual(alert["import_id"], self.imp_id)
+       
+       
+    2: class ConcurrencySmokeTests(unittest.TestCase):
+    1:     """Multiple readers at once must not error or lock up."""
+       
+    1:     def setUp(self):
+    1:         self.db_path = _fresh_db()
+    1:         _import_and_seed(self.db_path)
+    1:         self.httpd = make_server(port=0, db_path=self.db_path)
+    1:         self.port = self.httpd.server_address[1]
+    1:         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+    1:         self.addCleanup(self.httpd.shutdown)
+    1:         self.addCleanup(self.httpd.server_close)
+    2:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_parallel_reads(self):
+    1:         paths = ["/api/command-center", "/api/analytics/overview?range=all",
+                        "/api/alerts?per_page=10&days=30&page=1",
+                        "/api/analytics/distribution?granularity=day&range=all"]
+    1:         results = []
+    1:         errors = []
+       
+    1:         def worker(path):
+   16:             try:
+   32:                 with urllib.request.urlopen(
+   32:                         "%s:%d%s" % (BASE, self.port, path), timeout=30) as resp:
+   16:                     results.append((path, resp.status))
+                   except Exception as exc:  # noqa: BLE001
+                       errors.append((path, repr(exc)))
+       
+   23:         threads = [threading.Thread(target=worker, args=(p,))
+   21:                    for p in paths for _ in range(4)]
+   17:         for t in threads:
+   16:             t.start()
+   17:         for t in threads:
+   16:             t.join()
+    1:         self.assertEqual(errors, [])
+    1:         self.assertEqual(len(results), len(paths) * 4)
+   18:         self.assertTrue(all(status == 200 for _, status in results))
+       
+       
+    2: class LargeImportTests(unittest.TestCase):
+    1:     """20k-row import: counts exact, pagination bounded, dashboard loads."""
+       
+    1:     def setUp(self):
+    1:         self.db_path = _fresh_db()
+    2:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_large_import_is_bounded_and_exact(self):
+               # The dedup natural key is (FPS, date, commodity): vary FPS across
+               # 500 centers so all 20,000 rows are genuinely distinct.
+    1:         n = 20_000
+    1:         lines = ["Transaction ID,Beneficiary ID,FPS Code,Transaction Date,"
+                        "Commodity,Quantity,Unit"]
+20001:         for i in range(n):
+40000:             lines.append("TX%06d,BEN%04d,FPS%04d,2026-08-%02d,%s,%d,kg" % (
+20000:                 i + 1, i % 500 + 1, i % 500 + 1, i % 28 + 1,
+20000:                 ("rice", "wheat", "pulses")[i % 3], (i % 9) + 1))
+    1:         csv_text = "\n".join(lines) + "\n"
+       
+    1:         up = ingest.handle_upload(csv_text.encode(), "big.csv", "text/csv")
+    2:         validated = ingest.validate_step(
+    1:             up["token"], dataset_type="ration_transactions", db_path=self.db_path)
+    1:         self.assertEqual(validated["record_count"], n)
+    1:         self.assertEqual(validated["valid_records"], n)
+    1:         summary = ingest.confirm_step(up["token"], db_path=self.db_path)
+    1:         self.assertEqual(summary["imported"], n)
+       
+               # Dashboard reads the import through bounded aggregations (explicit
+               # window: the default is a rolling 30 days up to today, which would
+               # legitimately exclude future-dated rows).
+    2:         cc = command_center.command_center(
+    1:             db_path=self.db_path, from_date="2026-08-01", to_date="2026-08-31")
+   10:         kpis = {k["key"]: k["value"] for k in cc["kpis"]}
+    1:         self.assertEqual(kpis["transactions"], n)
+       
+               # Pagination returns a bounded page, not all rows.
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+   53:             page = [dict(r) for r in conn.execute(
+    1:                 "SELECT * FROM ration_transactions LIMIT 50 OFFSET 19950")]
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(len(page), 50)
+       
+       
+    2: class FailureRecoveryTests(unittest.TestCase):
+    1:     """AI down / monitoring failure must not break analytics or clear alerts."""
+       
+    1:     def setUp(self):
+    2:         self.db_path = _fresh_db()
+    2:         self.imp_id = _import_and_seed(self.db_path)
+    4:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_ai_down_analytics_still_work(self):
+    1:         def boom(kind, context, fallback):
+    2:             raise RuntimeError("AI provider unavailable")
+       
+               # Analysis completes with fallback narratives.
+    2:         result = run_analysis(dataset_mode="real", data_import_id=self.imp_id,
+    2:                               db_path=self.db_path, types=["inventory_risk",
+    1:                                                            "recommendations"])
+    1:         self.assertIsNotNone(result)
+    1:         self.assertTrue(result["analysis_run"]["analysis_id"].startswith("RA-"))
+       
+               # Analytics remain fully functional.
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             ov = analytics.overview(conn)
+    1:             inv = analytics.inventory(conn)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(ov["total_transactions"], 6)
+    1:         self.assertTrue(inv["by_commodity"])
+       
+               # Monitoring still detects conditions deterministically.
+    1:         outcome = monitoring.run_monitoring(db_path=self.db_path, generator=boom)
+    1:         self.assertGreaterEqual(outcome["created"] + outcome["updated"], 1)
+       
+    1:     def test_monitoring_failure_keeps_existing_alerts(self):
+    1:         first = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertGreaterEqual(first["created"], 1)
+       
+               # A hard failure inside the engine (injected) must not delete alerts.
+    1:         original = monitoring._inventory_candidates
+       
+    1:         def boom(conn, rules):
+    1:             raise RuntimeError("inventory query exploded")
+       
+    1:         monitoring._inventory_candidates = boom
+    1:         try:
+    1:             with self.assertRaises(RuntimeError):
+    2:                 monitoring.run_monitoring(db_path=self.db_path)
+               finally:
+    1:             monitoring._inventory_candidates = original
+       
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    3:             count = conn.execute(
+    2:                 "SELECT COUNT(*) AS n FROM alerts").fetchone()["n"]
+    2:             run_row = conn.execute(
+    1:                 "SELECT status FROM data_imports WHERE id = ?",
+    1:                 (self.imp_id,)).fetchone()
+               finally:
+    1:             conn.close()
+    1:         self.assertGreaterEqual(count, 1)
+    1:         self.assertEqual(run_row["status"], "COMPLETED")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

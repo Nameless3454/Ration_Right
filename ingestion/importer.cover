@@ -1,0 +1,416 @@
+    1: """RationRight — database import (Phase 3 + Phase 4).
+       
+       Turns validated, normalized records into database rows with full provenance:
+       every inserted row points at the DataImport that produced it, which points at
+       its DataSource and records the SHA-256 hash of the uploaded file.
+       
+       Duplicate strategy (never blindly deleted; classified and counted):
+       - EXACT_DUPLICATE: the same external transaction id (or, for datasets without
+         an ID column, the identical composite content) recurs — in this file or
+         already in the database;
+       - POSSIBLE_DUPLICATE: a different external id shares the same composite
+         content (fps, date, commodity, quantity) — the same transaction recorded
+         twice under two ids;
+       - UNIQUE: everything else, which is imported.
+       
+       Records stream through ``executemany`` batches (default 500) inside one
+       transaction so large datasets do not build unbounded Python-side state.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: import time
+       
+    1: from database import (
+           DEFAULT_TRANSACTION_UNIT,
+           beneficiary_ids,
+           existing_beneficiary_refs,
+           existing_fps_codes,
+           existing_transaction_ids,
+           fps_center_ids,
+           get_data_import,
+           get_data_source_by_name,
+           insert_data_import,
+           insert_data_source,
+           insert_inventory_batch,
+           insert_transactions_batch,
+           upsert_beneficiaries,
+           upsert_fps_centers,
+       )
+    1: from ingestion import validation
+    1: from ingestion.validation import quality_report
+       
+    1: logger = logging.getLogger("rationright.ingestion")
+       
+    1: UPLOADED_SOURCE_NAME = "Uploaded Dataset"
+    1: BATCH_SIZE = 500
+    1: MAX_ERROR_SUMMARY_CHARS = 800
+    1: MAX_ERROR_EXAMPLES = 5
+       
+       
+    1: def _now_iso():
+   89:     from database import _now_iso as _now
+   89:     return _now()
+       
+       
+    1: def _composite_key(normalized: dict):
+30226:     return (
+30226:         (normalized.get("fps_center_id") or "").strip().lower(),
+30226:         (normalized.get("transaction_date") or "").strip(),
+30226:         (normalized.get("commodity") or "").strip().lower(),
+30226:         normalized.get("quantity"),
+           )
+       
+       
+    1: def _natural_key(dataset_type: str, normalized: dict):
+    6:     if dataset_type in ("beneficiaries", "fps_centers"):
+    4:         return (normalized.get("external_reference") or normalized.get("fps_code") or "").strip().lower()
+    2:     if dataset_type == "inventory":
+    2:         return (
+    2:             (normalized.get("fps_center_id") or "").strip().lower(),
+    2:             (normalized.get("commodity") or "").strip().lower(),
+               )
+           return _composite_key(normalized)
+       
+       
+    1: def run_import(
+           conn,
+           *,
+           file_name: str,
+           file_type: str,
+           dataset_name: str,
+           source_name: str,
+           dataset_type: str,
+           headers: list,
+           rows: list,
+           mapping: dict,
+    1:     file_hash: str = None,
+       ):
+           """Import validated, normalized records into the database.
+       
+           ``mapping`` maps external header -> internal field (from the user's
+           confirmed mapping). Returns the import summary, including duplicate
+           classification counts, a deterministic quality score, and provenance.
+           """
+   45:     started = time.perf_counter()
+   45:     source = get_data_source_by_name(conn, source_name)
+   45:     if source is None:
+   74:         source_id = insert_data_source(
+   37:             conn, name=source_name, source_type="MANUAL",
+   37:             description="Datasets uploaded by the user", status="ACTIVE",
+               )
+           else:
+    8:         source_id = source["id"]
+       
+   90:     import_id = insert_data_import(
+   45:         conn, data_source_id=source_id, dataset_name=dataset_name,
+   45:         file_name=file_name, file_type=file_type, file_hash=file_hash,
+   45:         record_count=len(rows), status="PROCESSING", started_at=_now_iso(),
+           )
+       
+           # Exact keys pre-seeded from the database (transactions with external ids
+           # already present are EXACT duplicates of the existing records).
+  129:     seen_exact = {("ext", i) for i in existing_transaction_ids(conn)}
+   45:     seen_composite = set()
+   45:     beneficiary_map = beneficiary_ids(conn, existing_beneficiary_refs(conn))
+   45:     center_map = fps_center_ids(conn, existing_fps_codes(conn))
+       
+   45:     pending_beneficiaries = []
+   45:     pending_centers = []
+   45:     pending_transactions = []
+   45:     pending_inventory = []
+   45:     counters = {
+   45:         "imported": 0, "failed": 0, "duplicates": 0,
+   45:         "duplicates_exact": 0, "duplicates_possible": 0, "warnings": 0,
+           }
+   45:     error_examples = []
+   45:     tx_seq = 0
+       
+   45:     def flush():
+  204:         if pending_beneficiaries:
+  153:             upsert_beneficiaries(conn, pending_beneficiaries)
+  306:             beneficiary_map.update(
+  306:                 beneficiary_ids(
+20498:                     conn, [r["external_reference"] for r in pending_beneficiaries]
+                       )
+                   )
+  153:             pending_beneficiaries.clear()
+  204:         if pending_centers:
+  200:             upsert_fps_centers(conn, pending_centers)
+  398:             center_map.update(
+30601:                 fps_center_ids(conn, [r["fps_code"] for r in pending_centers])
+                   )
+  199:             pending_centers.clear()
+  203:         if pending_transactions:
+  197:             resolved = []
+30396:             for transaction in pending_transactions:
+30199:                 row = dict(transaction)
+30199:                 ref = row.pop("_beneficiary_ref", None)
+30199:                 if ref:
+20187:                     row["beneficiary_id"] = beneficiary_map.get(ref)
+30199:                 code = row.pop("_fps_code", None)
+30199:                 if code:
+30199:                     row["fps_center_id"] = center_map.get(code)
+30199:                 resolved.append(row)
+  197:             insert_transactions_batch(conn, resolved)
+  197:             pending_transactions.clear()
+  203:         if pending_inventory:
+    1:             resolved = []
+    3:             for item in pending_inventory:
+    2:                 row = dict(item)
+    2:                 code = row.pop("_fps_code", None)
+    2:                 if code:
+    2:                     row["fps_center_id"] = center_map.get(code)
+    2:                 resolved.append(row)
+    1:             insert_inventory_batch(conn, resolved)
+    1:             pending_inventory.clear()
+       
+30297:     for row_number, row in enumerate(rows, start=2):
+30252:         record = _record_from_row(row, headers, mapping)
+30252:         normalized, errors, warnings = validation.validate_record(record, dataset_type)
+30252:         counters["warnings"] += len(warnings)
+30252:         if errors:
+   20:             counters["failed"] += 1
+   20:             if len(error_examples) < MAX_ERROR_EXAMPLES:
+   40:                 error_examples.append({
+   20:                     "row": row_number,
+   20:                     "errors": errors[:3],
+  176:                     "values": {k: v for k, v in record.items() if v not in (None, "")},
+                       })
+   20:             continue
+       
+               # --- duplicate classification (Phase 4) ---
+30232:         if dataset_type in ("ration_transactions", "combined"):
+30226:             external_id = (normalized.get("external_transaction_id") or "").strip()
+30226:             composite = _composite_key(normalized)
+30226:             if external_id:
+30223:                 exact_key = ("ext", external_id)
+30223:                 if exact_key in seen_exact:
+   15:                     counters["duplicates"] += 1
+   15:                     counters["duplicates_exact"] += 1
+   15:                     continue
+30208:                 if composite in seen_composite:
+    8:                     counters["duplicates"] += 1
+    8:                     counters["duplicates_possible"] += 1
+    8:                     continue
+30200:                 seen_exact.add(exact_key)
+30200:                 seen_composite.add(composite)
+                   else:
+    3:                 if composite in seen_composite:
+    1:                     counters["duplicates"] += 1
+    1:                     counters["duplicates_exact"] += 1
+    1:                     continue
+    2:                 seen_composite.add(composite)
+               else:
+    6:             key = _natural_key(dataset_type, normalized)
+    6:             if key in seen_exact:
+                       counters["duplicates"] += 1
+                       counters["duplicates_exact"] += 1
+                       continue
+    6:             seen_exact.add(key)
+       
+               # Transactions without an ID column get a deterministic generated id
+               # AFTER classification so the composite key still governs uniqueness.
+30208:         if dataset_type in ("ration_transactions", "combined"):
+30202:             if not (normalized.get("external_transaction_id") or "").strip():
+    2:                 tx_seq += 1
+    2:                 normalized["external_transaction_id"] = "IMP%04d-%06d" % (import_id, tx_seq)
+       
+60416:         _stage_record(
+30208:             dataset_type, normalized, import_id,
+30208:             pending_beneficiaries, pending_centers,
+30208:             pending_transactions, pending_inventory,
+               )
+30208:         counters["imported"] += 1
+30208:         if len(pending_transactions) + len(pending_inventory) + len(pending_beneficiaries) + len(pending_centers) >= BATCH_SIZE:
+  159:             flush()
+       
+   45:     flush()
+           # Phase 14: no mid-import commit. Everything (import row, upserts, batches)
+           # lands in ONE transaction so a critical failure rolls back cleanly instead
+           # of leaving a half-imported dataset behind.
+       
+   44:     elapsed = time.perf_counter() - started
+   44:     status = "COMPLETED"
+   44:     if counters["imported"] == 0:
+    2:         status = "FAILED"
+   42:     elif counters["failed"] > 0:
+   10:         status = "PARTIAL"
+       
+   44:     error_summary = _build_error_summary(error_examples)
+   88:     quality = quality_report(
+   44:         total=len(rows),
+   44:         invalid=counters["failed"],
+   44:         duplicates=counters["duplicates"],
+   44:         warnings=counters["warnings"],
+           )
+   44:     completed_at = _now_iso()
+   88:     conn.execute(
+   44:         "UPDATE data_imports SET status = :status, successful_records = :ok, "
+               "failed_records = :failed, duplicate_records = :dupes, "
+               "warnings_count = :warnings, error_summary = :summary, "
+               "completed_at = :completed_at "
+               "WHERE id = :import_id",
+   44:         {
+   44:             "status": status,
+   44:             "ok": counters["imported"],
+   44:             "failed": counters["failed"],
+   44:             "dupes": counters["duplicates"],
+   44:             "warnings": counters["warnings"],
+   44:             "summary": error_summary,
+   44:             "completed_at": completed_at,
+   44:             "import_id": import_id,
+               },
+           )
+   44:     conn.commit()
+       
+   44:     summary = {
+   44:         "status": status,
+   44:         "data_import_id": import_id,
+   44:         "data_source_id": source_id,
+   44:         "dataset_name": dataset_name,
+   44:         "source_name": source_name,
+   44:         "file_name": file_name,
+   44:         "file_type": file_type,
+   44:         "file_hash": file_hash,
+   44:         "dataset_type": dataset_type,
+   44:         "record_count": len(rows),
+   44:         "imported": counters["imported"],
+   44:         "failed": counters["failed"],
+   44:         "duplicates": counters["duplicates"],
+   44:         "duplicates_exact": counters["duplicates_exact"],
+   44:         "duplicates_possible": counters["duplicates_possible"],
+   44:         "warnings": counters["warnings"],
+   44:         "quality": quality,
+   44:         "error_summary": error_summary,
+   44:         "error_examples": error_examples,
+   44:         "processing_time_seconds": round(elapsed, 3),
+   44:         "started_at": get_data_import(conn, import_id)["started_at"],
+   44:         "completed_at": completed_at,
+           }
+   88:     logger.info(
+   44:         "[Ingestion] Import %s %s: %d imported, %d failed, %d duplicates "
+               "(exact=%d possible=%d), %d warnings, quality=%s%% (%.3fs)",
+   44:         import_id, status, counters["imported"], counters["failed"],
+   44:         counters["duplicates"], counters["duplicates_exact"],
+   44:         counters["duplicates_possible"], counters["warnings"],
+   44:         quality["score"], elapsed,
+           )
+   44:     return summary
+       
+       
+    1: def _stage_record(
+           dataset_type, normalized, import_id,
+           pending_beneficiaries, pending_centers, pending_transactions, pending_inventory,
+       ):
+           """Append a normalized record to the appropriate pending batch list."""
+30208:     if dataset_type == "beneficiaries":
+    4:         pending_beneficiaries.append({
+    2:             "external_reference": normalized.get("external_reference", ""),
+    2:             "state": normalized.get("state"),
+    2:             "district": normalized.get("district"),
+    2:             "block": normalized.get("block"),
+    2:             "ration_category": normalized.get("ration_category"),
+    2:             "family_size": normalized.get("family_size"),
+    2:             "status": normalized.get("status", "ACTIVE"),
+               })
+    2:         return
+       
+30206:     if dataset_type == "fps_centers":
+    4:         pending_centers.append({
+    2:             "fps_code": normalized.get("fps_code", ""),
+    2:             "name": normalized.get("name"),
+    2:             "state": normalized.get("state"),
+    2:             "district": normalized.get("district"),
+    2:             "block": normalized.get("block"),
+    2:             "location": normalized.get("location"),
+    2:             "latitude": normalized.get("latitude"),
+    2:             "longitude": normalized.get("longitude"),
+    2:             "capacity": normalized.get("capacity"),
+    2:             "status": normalized.get("status", "ACTIVE"),
+               })
+    2:         return
+       
+30204:     if dataset_type == "inventory":
+               # ``fps_center_id`` on the file is an external FPS code; ensure the
+               # center exists and resolve the code to its internal id at flush time.
+    2:         if normalized.get("fps_center_id"):
+    4:             pending_centers.append({
+    2:                 "fps_code": normalized["fps_center_id"],
+    2:                 "status": "ACTIVE",
+                   })
+    4:         pending_inventory.append({
+    2:             "fps_center_id": None,
+    2:             "_fps_code": normalized.get("fps_center_id"),
+    2:             "commodity": normalized.get("commodity", ""),
+    2:             "current_stock": normalized.get("current_stock", 0.0),
+    2:             "monthly_consumption": normalized.get("monthly_consumption"),
+    2:             "reorder_threshold": normalized.get("reorder_threshold"),
+    2:             "last_updated": normalized.get("last_updated"),
+    2:             "source_import_id": import_id,
+               })
+    2:         return
+       
+           # transactions / combined — also creates beneficiary/center records from
+           # any detail columns present (refs resolved to internal ids at flush time).
+30202:     if normalized.get("beneficiary_id"):
+40380:         pending_beneficiaries.append({
+20190:             "external_reference": normalized["beneficiary_id"],
+20190:             "state": normalized.get("state"),
+20190:             "district": normalized.get("district"),
+20190:             "block": normalized.get("block"),
+20190:             "ration_category": normalized.get("ration_category"),
+20190:             "family_size": normalized.get("family_size"),
+20190:             "status": "ACTIVE",
+               })
+30202:     if normalized.get("fps_center_id"):
+60404:         pending_centers.append({
+30202:             "fps_code": normalized["fps_center_id"],
+30202:             "name": normalized.get("name"),
+30202:             "state": normalized.get("state"),
+30202:             "district": normalized.get("district"),
+30202:             "block": normalized.get("block"),
+30202:             "location": normalized.get("location"),
+30202:             "latitude": normalized.get("latitude"),
+30202:             "longitude": normalized.get("longitude"),
+30202:             "status": "ACTIVE",
+               })
+       
+60404:     pending_transactions.append({
+30202:         "external_transaction_id": normalized.get("external_transaction_id", ""),
+30202:         "beneficiary_id": None,
+30202:         "fps_center_id": None,
+30202:         "_beneficiary_ref": normalized.get("beneficiary_id"),
+30202:         "_fps_code": normalized.get("fps_center_id"),
+30202:         "transaction_date": normalized.get("transaction_date", ""),
+30202:         "commodity": normalized.get("commodity", ""),
+30202:         "quantity": normalized.get("quantity", 0.0),
+30202:         "unit": normalized.get("unit") or DEFAULT_TRANSACTION_UNIT,
+30202:         "latitude": normalized.get("latitude"),
+30202:         "longitude": normalized.get("longitude"),
+30202:         "status": normalized.get("status", "COMPLETED"),
+30202:         "source_import_id": import_id,
+           })
+       
+       
+    1: def _record_from_row(row, headers, mapping: dict) -> dict:
+           """Build an internal-field record from a raw row using the mapping."""
+30252:     record = {}
+222170:     for index, header in enumerate(headers):
+191918:         field = mapping.get(header)
+191918:         if field:
+191918:             record[field] = row[index] if index < len(row) else ""
+30252:     return record
+       
+       
+    1: def _build_error_summary(examples: list) -> str:
+   44:     if not examples:
+   33:         return ""
+   11:     parts = []
+   31:     for example in examples:
+   20:         parts.append("Row %d: %s" % (example["row"], "; ".join(example["errors"])))
+   11:     text = " | ".join(parts)
+   11:     if len(text) > MAX_ERROR_SUMMARY_CHARS:
+               text = text[:MAX_ERROR_SUMMARY_CHARS].rstrip() + "..."
+   11:     return text

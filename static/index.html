@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RationAI — Intelligent Ration &amp; Food Security Platform</title>
+  <meta name="description" content="RationAI analyzes synthetic ration-distribution transactions with a deterministic four-agent workflow and surfaces potential anomalies for human review. Hackathon demo — synthetic data only.">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#view">Skip to content</a>
+
+  <div class="app">
+    <!-- ============ Sidebar ============ -->
+    <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+      <div class="sidebar-head">
+        <a class="brand" href="#/overview" aria-label="RationAI home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></svg>
+          </span>
+          <span class="brand-text">
+            <strong>RationAI</strong>
+            <small>Food Security Platform</small>
+          </span>
+        </a>
+        <button class="sidebar-collapse" id="sidebar-collapse" type="button" aria-label="Collapse sidebar" aria-expanded="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+      </div>
+
+      <nav class="nav" id="nav" aria-label="Sections">
+        <p class="nav-section" id="nav-sec-overview">Overview</p>
+        <ul>
+          <li><a href="#/command" data-route="command" title="Command Center"><span class="nav-icon" data-icon="grid"></span><span class="nav-label">Command Center</span></a></li>
+          <li><a href="#/overview" data-route="overview" title="Overview"><span class="nav-icon" data-icon="chart"></span><span class="nav-label">Overview</span></a></li>
+        </ul>
+        <p class="nav-section" id="nav-sec-data">Data</p>
+        <ul>
+          <li><a href="#/beneficiaries" data-route="beneficiaries" title="Beneficiaries"><span class="nav-icon" data-icon="users"></span><span class="nav-label">Beneficiaries</span></a></li>
+          <li><a href="#/distribution" data-route="distribution" title="Ration Distribution"><span class="nav-icon" data-icon="truck"></span><span class="nav-label">Ration Distribution</span></a></li>
+          <li><a href="#/inventory" data-route="inventory" title="Inventory"><span class="nav-icon" data-icon="warehouse"></span><span class="nav-label">Inventory</span></a></li>
+          <li><a href="#/upload" data-route="upload" title="Import Data"><span class="nav-icon" data-icon="upload"></span><span class="nav-label">Import Data</span></a></li>
+          <li><a href="#/sources" data-route="sources" title="Data Sources"><span class="nav-icon" data-icon="cloud"></span><span class="nav-label">Data Sources</span></a></li>
+          <li><a href="#/pipeline" data-route="pipeline" title="Data Pipeline"><span class="nav-icon" data-icon="layers"></span><span class="nav-label">Data Pipeline</span></a></li>
+        </ul>
+        <p class="nav-section" id="nav-sec-intelligence">Intelligence</p>
+        <ul>
+          <li><a href="#/analysis" data-route="analysis" title="AI Analysis"><span class="nav-icon" data-icon="activity"></span><span class="nav-label">AI Analysis</span></a></li>
+          <li><a href="#/analytics" data-route="analytics" title="Analytics"><span class="nav-icon" data-icon="chart"></span><span class="nav-label">Analytics</span></a></li>
+          <li><a href="#/insights" data-route="insights" title="AI Insights"><span class="nav-icon" data-icon="sparkles"></span><span class="nav-label">AI Insights</span></a></li>
+          <li><a href="#/alerts" data-route="alerts" title="Alerts"><span class="nav-icon" data-icon="bell"></span><span class="nav-label">Alerts</span><span class="nav-count" id="nav-alert-count" hidden></span></a></li>
+          <li><a href="#/simulation" data-route="simulation" title="Decision Support"><span class="nav-icon" data-icon="clipboard"></span><span class="nav-label">Decision Support</span></a></li>
+        </ul>
+        <p class="nav-section" id="nav-sec-reporting">Reporting</p>
+        <ul>
+          <li><a href="#/reports" data-route="reports" title="Reports"><span class="nav-icon" data-icon="file"></span><span class="nav-label">Reports</span></a></li>
+        </ul>
+        <p class="nav-section" id="nav-sec-system">System</p>
+        <ul>
+          <li><a href="#/settings" data-route="settings" title="Settings"><span class="nav-icon" data-icon="settings"></span><span class="nav-label">Settings</span></a></li>
+        </ul>
+      </nav>
+
+      <div class="sidebar-foot">
+        <a href="#/settings" class="foot-link" data-route="settings">
+          <span class="nav-icon" data-icon="help"></span><span class="nav-label">Help &amp; Support</span>
+        </a>
+        <div class="profile-mini">
+          <span class="avatar" aria-hidden="true">A</span>
+          <span class="profile-mini-text"><strong>Admin</strong><small>Operator</small></span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ============ Main column ============ -->
+    <div class="main">
+      <header class="topbar">
+        <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Open navigation">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <nav class="breadcrumb" aria-label="Breadcrumb"><span class="crumb-root">RationAI</span><span class="crumb-sep">/</span><span class="crumb-current" id="breadcrumb-current">Overview</span></nav>
+
+        <div class="topbar-actions">
+          <button class="search-trigger" id="search-trigger" type="button" aria-label="Search">
+            <span class="nav-icon" data-icon="search"></span>
+            <span class="search-text">Search…</span>
+            <kbd>⌘K</kbd>
+          </button>
+
+          <button class="data-status-chip" id="data-status-chip" type="button" aria-label="Data status" title="Data status — loading…">
+            <span class="status-dot neutral" id="data-status-dot" aria-hidden="true"></span>
+            <span id="data-status-label">Checking…</span>
+          </button>
+
+          <div class="menu-wrap">
+            <button class="icon-btn" id="notif-button" type="button" aria-label="Notifications" aria-haspopup="true" aria-expanded="false">
+              <span class="nav-icon" data-icon="bell"></span>
+              <span class="notif-dot" id="notif-dot" hidden></span>
+            </button>
+            <div class="dropdown notif-drop" id="notif-drop" role="menu" aria-label="Notifications" hidden></div>
+          </div>
+
+          <a class="icon-btn" href="#/settings" aria-label="Help" data-route="settings"><span class="nav-icon" data-icon="help"></span></a>
+
+          <div class="menu-wrap">
+            <button class="profile-btn" id="profile-button" type="button" aria-haspopup="true" aria-expanded="false">
+              <span class="avatar" aria-hidden="true">A</span>
+              <span class="profile-btn-text"><strong>Admin</strong><small>Operator</small></span>
+            </button>
+            <div class="dropdown profile-drop" id="profile-drop" role="menu" aria-label="User menu" hidden>
+              <div class="profile-drop-head"><span class="avatar lg" aria-hidden="true">A</span><div><strong>Admin</strong><small>Operator · Demo session</small></div></div>
+              <a href="#/settings" data-route="settings" role="menuitem">Settings</a>
+              <a href="#/reports" data-route="reports" role="menuitem">Reports</a>
+              <a href="#/pipeline" data-route="pipeline" role="menuitem">Data Pipeline</a>
+              <a href="#/sources" data-route="sources" role="menuitem">Data Sources</a>
+              <button type="button" role="menuitem" id="profile-logout" hidden>Log out</button>
+              <button type="button" role="menuitem" id="profile-reset">Reset demo state</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main id="view" tabindex="-1" class="view"></main>
+
+      <footer class="foot">
+        <p>RationAI uses synthetic demo data. A detected anomaly is not proof of fraud — every case is recommended for human verification.</p>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Bottom navigation (mobile) -->
+  <nav class="bottom-nav" id="bottom-nav" aria-label="Primary (mobile)">
+    <a href="#/command" data-route="command"><span class="nav-icon" data-icon="grid"></span><span>Command Center</span></a>
+    <a href="#/overview" data-route="overview"><span class="nav-icon" data-icon="chart"></span><span>Overview</span></a>
+    <a href="#/analysis" data-route="analysis"><span class="nav-icon" data-icon="activity"></span><span>Analysis</span></a>
+    <a href="#/beneficiaries" data-route="beneficiaries"><span class="nav-icon" data-icon="users"></span><span>People</span></a>
+    <a href="#/alerts" data-route="alerts"><span class="nav-icon" data-icon="bell"></span><span>Alerts</span></a>
+    <a href="#/settings" data-route="settings"><span class="nav-icon" data-icon="settings"></span><span>Settings</span></a>
+  </nav>
+
+  <!-- Command palette / search -->
+  <div class="search-overlay" id="search-overlay" hidden>
+    <div class="search-panel" role="dialog" aria-modal="true" aria-label="Search">
+      <div class="search-input-row">
+        <span class="nav-icon" data-icon="search"></span>
+        <input type="search" id="search-input" placeholder="Search beneficiaries, transactions, alerts…" autocomplete="off" aria-label="Search">
+        <kbd>ESC</kbd>
+      </div>
+      <div class="search-results" id="search-results" role="listbox"></div>
+    </div>
+  </div>
+
+  <!-- Authentication gate (Phase 14, shown only when the server requires it) -->
+  <div class="auth-overlay" id="auth-overlay" hidden>
+    <div class="auth-panel" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <div class="brand" style="justify-content:center;margin-bottom:6px">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></svg>
+        </span>
+      </div>
+      <h2 id="auth-title" class="auth-title">RationAI — sign in</h2>
+      <p class="auth-sub">This server requires an access token. Enter the token configured by the administrator.</p>
+      <form id="auth-form" class="auth-form">
+        <label for="auth-token">Access token</label>
+        <input type="password" id="auth-token" autocomplete="current-password" placeholder="••••••••••••" aria-label="Access token">
+        <p class="auth-error" id="auth-error" role="alert" hidden></p>
+        <button class="btn btn-primary" id="auth-submit" type="submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

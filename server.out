@@ -1,0 +1,2 @@
+INFO [rationright.server] RationRight server running at http://127.0.0.1:8000
+INFO [rationright.server] 127.0.0.1 - "GET /api/health HTTP/1.1" 200 -

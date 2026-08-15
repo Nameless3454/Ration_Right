@@ -1,0 +1,62 @@
+    1: """RationAI — connector error types (Phase 7).
+       
+       Every failure during an external sync is classified so the sync service can
+       decide whether to retry, mark the source ERROR, and surface a clear
+       user-facing reason — without ever deleting or fabricating data.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: from typing import Optional
+       
+       
+    2: class ConnectorError(Exception):
+    1:     """Base class for all connector failures."""
+       
+    1:     def __init__(self, message: str, *, retryable: bool = False):
+    9:         super().__init__(message)
+    9:         self.retryable = retryable
+       
+       
+    2: class AuthError(ConnectorError):
+    1:     """The source rejected our credentials (401/403) or credentials are
+           missing. Never retried — retrying would just hammer the source."""
+       
+       
+    2: class RateLimitError(ConnectorError):
+    1:     """The source returned 429. Retryable after ``retry_after`` seconds."""
+       
+    1:     def __init__(self, message: str, *, retry_after: Optional[float] = None):
+    1:         super().__init__(message, retryable=True)
+    1:         self.retry_after = retry_after
+       
+       
+    2: class HttpStatusError(ConnectorError):
+    1:     """The source returned an unexpected HTTP status."""
+       
+    1:     def __init__(self, status: int, message: str, *, retryable: bool = False):
+    4:         super().__init__("%s (HTTP %d)" % (message, status), retryable=retryable)
+    4:         self.status = status
+       
+       
+    2: class TimeoutError(ConnectorError):
+    1:     """The source did not answer within the configured timeout."""
+       
+       
+    2: class UnreachableError(ConnectorError):
+    1:     """DNS/connection-level failure. Retryable."""
+       
+       
+    2: class InvalidResponseError(ConnectorError):
+    1:     """The source answered but the payload could not be parsed (malformed
+           JSON/CSV, unexpected structure, or an empty dataset)."""
+       
+       
+    2: class SourceNotConfiguredError(ConnectorError):
+    1:     """The source exists but cannot sync yet (e.g. missing API key)."""
+       
+       
+    2: class SyncFailure(Exception):
+    1:     """Wraps any connector/import failure during a sync so the service can
+           record it on the DataSource and DataImport without aborting the request
+           in an unstructured way."""

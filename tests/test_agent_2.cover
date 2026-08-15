@@ -1,0 +1,294 @@
+    1: """RationRight — Phase 3: Agent 2 (Anomaly Investigator) tests.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import unittest
+       
+    1: from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, haversine_km, load_dataset
+       
+    1: FINDING_FIELDS = {
+           "finding_id",
+           "anomaly_id",
+           "status",
+           "transaction_ids",
+           "evidence",
+           "evidence_sources",
+           "explanation",
+       }
+       
+       
+    1: def make_tx(transaction_id, beneficiary_id, timestamp, latitude, longitude,
+                   ration_type="rice", quantity=10):
+           """Build a contract-compliant synthetic transaction record."""
+   23:     return {
+   23:         "transaction_id": transaction_id,
+   23:         "beneficiary_id": beneficiary_id,
+   23:         "timestamp": timestamp,
+   23:         "latitude": latitude,
+   23:         "longitude": longitude,
+   23:         "ration_type": ration_type,
+   23:         "quantity": quantity,
+           }
+       
+       
+    1: def candidate(anomaly_id="ANOM001", transaction_ids=("TX001", "TX002"),
+                     beneficiary_id="BEN001", severity="high",
+                     reason="Two transactions occurred within a short time interval at distant locations."):
+           """Build an Agent 1-style anomaly candidate."""
+   15:     return {
+   15:         "anomaly_id": anomaly_id,
+   15:         "anomaly_type": "rapid_geographic_transaction",
+   15:         "transaction_ids": list(transaction_ids),
+   15:         "beneficiary_id": beneficiary_id,
+   15:         "reason": reason,
+   15:         "severity": severity,
+           }
+       
+       
+    2: class TestAgent2ValidCandidate(unittest.TestCase):
+    1:     """TEST 1 — the real planted anomaly is verified with calculated evidence."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.transactions = load_dataset(DEFAULT_DATASET_PATH)["transactions"]
+    2:         cls.finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(),
+    1:             "transactions": cls.transactions,
+               })
+       
+    1:     def test_status_verified(self):
+    1:         self.assertEqual(self.finding["status"], "verified")
+       
+    1:     def test_evidence_contains_actual_calculations(self):
+    1:         self.assertEqual(self.finding["evidence"]["time_difference_minutes"], 12.0)
+    1:         self.assertAlmostEqual(self.finding["evidence"]["distance_km"], 1148.09, places=2)
+       
+    1:     def test_contract_fields(self):
+    1:         self.assertEqual(set(self.finding.keys()), FINDING_FIELDS)
+    1:         self.assertEqual(self.finding["anomaly_id"], "ANOM001")
+    1:         self.assertEqual(self.finding["transaction_ids"], ["TX001", "TX002"])
+    1:         self.assertEqual(self.finding["evidence_sources"], ["TX001", "TX002"])
+    1:         self.assertTrue(self.finding["explanation"])
+       
+    1:     def test_evidence_is_calculated_not_a_template(self):
+               """Different input data must produce different calculated evidence."""
+    1:         transactions = [
+    1:             make_tx("TX900", "BEN900", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX901", "BEN900", "2026-08-01T10:25:00", 23.0225, 72.5714),
+               ]
+    2:         anomaly = candidate(anomaly_id="ANOM900", transaction_ids=("TX900", "TX901"),
+    1:                             beneficiary_id="BEN900", reason="test")
+    1:         finding = Agent2AnomalyInvestigator().run({"anomaly": anomaly, "transactions": transactions})
+    1:         self.assertEqual(finding["status"], "verified")
+    1:         self.assertEqual(finding["evidence"]["time_difference_minutes"], 25.0)
+    1:         expected_distance = haversine_km(19.0760, 72.8777, 23.0225, 72.5714)
+    1:         self.assertAlmostEqual(finding["evidence"]["distance_km"], expected_distance, places=2)
+       
+    1:     def test_explanation_avoids_guilt_language(self):
+    1:         text = self.finding["explanation"].lower()
+    1:         self.assertNotIn("guilty", text)
+    1:         self.assertNotIn("fraud", text)
+    1:         self.assertNotIn("committed", text)
+    1:         self.assertIn("human verification", text)
+       
+       
+    2: class TestAgent2MissingTransaction(unittest.TestCase):
+    1:     """TEST 2 — a missing transaction cannot be verified and invents nothing."""
+       
+    1:     def test_one_transaction_missing(self):
+    1:         transactions = [make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(transaction_ids=("TX001", "TX999")),
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertEqual(finding["evidence"], {})
+    1:         self.assertEqual(finding["evidence_sources"], [])
+    1:         self.assertIn("TX999", finding["explanation"])
+       
+    1:     def test_empty_transaction_list(self):
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(),
+    1:             "transactions": [],
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertEqual(finding["evidence"], {})
+       
+       
+    2: class TestAgent2MissingData(unittest.TestCase):
+    1:     """TEST 3/4/5 — missing or invalid data prevents the relevant calculation."""
+       
+    1:     def _run_with(self, tx_a, tx_b):
+    8:         return Agent2AnomalyInvestigator().run({
+    4:             "anomaly": candidate(transaction_ids=("TX001", "TX002")),
+    4:             "transactions": [tx_a, tx_b],
+               })
+       
+    1:     def test_missing_timestamp(self):
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)
+    2:         tx_b = {"transaction_id": "TX002", "beneficiary_id": "BEN001",
+    1:                 "latitude": 28.6139, "longitude": 77.2090,
+    1:                 "ration_type": "rice", "quantity": 10}
+    1:         finding = self._run_with(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertEqual(finding["evidence"], {})
+    1:         self.assertIn("timestamp", finding["explanation"].lower())
+       
+    1:     def test_invalid_timestamp(self):
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)
+    1:         tx_b = make_tx("TX002", "BEN001", "not-a-timestamp", 28.6139, 77.2090)
+    1:         finding = self._run_with(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertIn("timestamp", finding["explanation"].lower())
+       
+    1:     def test_missing_coordinates(self):
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)
+    2:         tx_b = {"transaction_id": "TX002", "beneficiary_id": "BEN001",
+    1:                 "timestamp": "2026-08-01T10:12:00",
+    1:                 "ration_type": "rice", "quantity": 10}
+    1:         finding = self._run_with(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertEqual(finding["evidence"], {})
+    1:         self.assertIn("coordinate", finding["explanation"].lower())
+       
+    1:     def test_invalid_coordinates(self):
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777)
+    1:         tx_b = make_tx("TX002", "BEN001", "2026-08-01T10:12:00", 95.0, 77.2090)
+    1:         finding = self._run_with(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertIn("coordinate", finding["explanation"].lower())
+       
+       
+    2: class TestAgent2WrongBeneficiary(unittest.TestCase):
+    1:     """TEST 6 — a same-beneficiary anomaly must never be force-verified."""
+       
+    1:     def test_referenced_transactions_belong_to_different_beneficiaries(self):
+    1:         transactions = [
+    1:             make_tx("TX001", "BEN900", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX002", "BEN901", "2026-08-01T10:12:00", 28.6139, 77.2090),
+               ]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(),
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertIn("beneficiar", finding["explanation"].lower())
+       
+    1:     def test_beneficiary_mismatch_with_expected(self):
+    1:         transactions = [
+    1:             make_tx("TX001", "BEN901", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX002", "BEN901", "2026-08-01T10:12:00", 28.6139, 77.2090),
+               ]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(beneficiary_id="BEN900"),
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertIn("BEN901", finding["explanation"])
+       
+       
+    2: class TestAgent2NormalTransactions(unittest.TestCase):
+    1:     """TEST 7 — transactions that do not satisfy the thresholds stay unverified."""
+       
+    1:     def test_distance_below_threshold(self):
+    1:         transactions = [
+    1:             make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX002", "BEN001", "2026-08-01T10:12:00", 19.0800, 72.8800),
+               ]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(),
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertEqual(finding["evidence"], {})
+    1:         self.assertIn("threshold", finding["explanation"].lower())
+       
+    1:     def test_interval_above_threshold(self):
+    1:         transactions = [
+    1:             make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    1:             make_tx("TX002", "BEN001", "2026-08-03T09:00:00", 28.6139, 77.2090),
+               ]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": candidate(),
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "unverified")
+    1:         self.assertIn("threshold", finding["explanation"].lower())
+       
+       
+    2: class TestAgent2Boundary(unittest.TestCase):
+    1:     """TEST 8 — behavior around the configured thresholds is deterministic."""
+       
+    1:     def _verify(self, tx_a, tx_b):
+    6:         return Agent2AnomalyInvestigator().run({
+    3:             "anomaly": candidate(transaction_ids=("TX001", "TX002")),
+    3:             "transactions": [tx_a, tx_b],
+               })
+       
+    1:     def test_interval_at_threshold_and_distance_just_above(self):
+               # Exactly 60 minutes and ~100.08 km: both inclusive bounds hold.
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 0.0, 0.0)
+    1:         tx_b = make_tx("TX002", "BEN001", "2026-08-01T11:00:00", 0.9, 0.0)
+    1:         finding = self._verify(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "verified")
+       
+    1:     def test_distance_just_below_threshold(self):
+               # ~99.96 km: just under the 100 km inclusive bound.
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 0.0, 0.0)
+    1:         tx_b = make_tx("TX002", "BEN001", "2026-08-01T11:00:00", 0.899, 0.0)
+    1:         finding = self._verify(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+       
+    1:     def test_interval_just_above_threshold(self):
+               # 60.02 minutes: just over the 60 min inclusive bound.
+    1:         tx_a = make_tx("TX001", "BEN001", "2026-08-01T10:00:00", 0.0, 0.0)
+    1:         tx_b = make_tx("TX002", "BEN001", "2026-08-01T11:00:01", 2.0, 0.0)
+    1:         finding = self._verify(tx_a, tx_b)
+    1:         self.assertEqual(finding["status"], "unverified")
+       
+       
+    2: class TestAgent2Agent1Compatibility(unittest.TestCase):
+    1:     """TEST 9 — Agent 2 consumes real Agent 1 output without rewriting."""
+       
+    1:     def test_consumes_actual_agent_1_output(self):
+    1:         dataset = load_dataset(DEFAULT_DATASET_PATH)
+    1:         transactions = dataset["transactions"]
+    1:         agent1_result = Agent1TransactionAnalyst().run(transactions)
+    1:         self.assertGreaterEqual(len(agent1_result["anomalies"]), 1)
+       
+    1:         anomaly = agent1_result["anomalies"][0]
+    2:         finding = Agent2AnomalyInvestigator().run({
+    1:             "anomaly": anomaly,
+    1:             "transactions": transactions,
+               })
+    1:         self.assertEqual(finding["status"], "verified")
+    1:         self.assertEqual(finding["anomaly_id"], anomaly["anomaly_id"])
+    1:         self.assertEqual(finding["transaction_ids"], anomaly["transaction_ids"])
+    1:         self.assertEqual(finding["evidence"]["time_difference_minutes"], 12.0)
+    1:         self.assertAlmostEqual(finding["evidence"]["distance_km"], 1148.09, places=2)
+       
+       
+    2: class TestAgent2InvalidCandidate(unittest.TestCase):
+    1:     """Malformed candidates and payloads are rejected safely."""
+       
+    1:     def test_malformed_candidate_raises(self):
+    1:         investigator = Agent2AnomalyInvestigator()
+    1:         with self.assertRaises(ValueError):
+    2:             investigator.run({"anomaly": {"transaction_ids": ["TX001"]}, "transactions": []})
+    1:         with self.assertRaises(ValueError):
+    2:             investigator.run({"anomaly": {"anomaly_id": "ANOM001", "transaction_ids": "TX001"}, "transactions": []})
+    1:         with self.assertRaises(ValueError):
+    2:             investigator.run({"anomaly": {"anomaly_id": "ANOM001", "transaction_ids": ["TX001", 42]}, "transactions": []})
+    1:         with self.assertRaises(ValueError):
+    2:             investigator.run({"anomaly": "not-a-dict", "transactions": []})
+    1:         with self.assertRaises(ValueError):
+    2:             investigator.run("not-a-payload")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

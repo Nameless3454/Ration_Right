@@ -1,0 +1,467 @@
+    1: """RationRight — Phase 15: AI evaluation & accuracy.
+       
+       Evaluates the LLM narrative layer WITHOUT calling any model: injected
+       generators record exactly what the agents send and return scripted text, so
+       every assertion is deterministic. The scorecard at the bottom of this module
+       is the Phase 15 AI evaluation table; the tests below are its evidence.
+       
+       What is verified:
+       
+       - Number accuracy: the context handed to the LLM contains the exact
+         calculated values, and the structured result is never altered by the LLM.
+       - Hallucination refusal: an LLM that invents numbers cannot contaminate the
+         structured output; the deterministic path never invents missing values.
+       - Source accuracy: imported data is attributed to the real source, never
+         claimed as a live government API.
+       - Recommendation evidence: recommendations are produced only from supplied
+         evidence, and are labelled as AI recommendation / decision support.
+       - Confidence provenance: confidence is a deterministic code constant, not an
+         LLM number.
+       - Failure modes: timeout / 429 / 500 / malformed response / missing key all
+         degrade to the deterministic fallback without raising.
+       - No infinite retry: a failing generator is called exactly once.
+       - Context hygiene: no secrets or unrelated rows are sent to the model.
+       
+       Run from the project root::
+       
+           python3 -m unittest tests.test_ai_evaluation -v
+       """
+       
+    1: import os
+    1: import tempfile
+    1: import unittest
+    1: import urllib.error
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import simulation as sim
+    1: from agents import llm
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+    1: from agents.agent_4_alert_generator import Agent4AlertGenerator
+    1: from ingestion import service as ingest
+    1: from scripts.validate_dataset import load_dataset
+       
+    1: TX = load_dataset("data/synthetic/transactions.json")["transactions"]
+       
+    1: A2_PAYLOAD = {
+    1:     "anomaly": {
+    1:         "anomaly_id": "ANOM001",
+    1:         "anomaly_type": "rapid_geographic_transaction",
+    1:         "transaction_ids": ["TX001", "TX002"],
+    1:         "beneficiary_id": "BEN001",
+    1:         "reason": "Two transactions occurred within a short time interval at distant locations.",
+    1:         "severity": "high",
+           },
+    1:     "transactions": TX,
+       }
+       
+    1: TRANSACTION_CSV = (
+    1:     "Transaction ID,Beneficiary ID,FPS Code,Transaction Date,Commodity,Quantity,Unit\n"
+           "TX201,BEN001,FPS01,2026-08-01,rice,100,kg\n"
+           "TX202,BEN001,FPS01,2026-08-02,rice,40,kg\n"
+           "TX203,BEN002,FPS02,2026-08-03,wheat,20,kg\n"
+           "TX204,BEN002,FPS02,2026-08-04,pulses,60,kg\n"
+       )
+       
+       
+    1: def _fresh_db():
+   10:     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+   10:     tmp.close()
+   10:     os.unlink(tmp.name)
+   10:     return tmp.name
+       
+       
+    1: def _seed_import_with_inventory(db_path):
+           """Import the CSV above and add rice inventory; returns the import id."""
+    7:     upload = ingest.handle_upload(TRANSACTION_CSV.encode(), "eval.csv", "text/csv")
+   14:     ingest.validate_step(upload["token"], dataset_type="ration_transactions",
+    7:                          db_path=db_path)
+    7:     summary = ingest.confirm_step(upload["token"], db_path=db_path)
+    7:     imp_id = summary["data_import_id"]
+    7:     conn = db.open_db(db_path)
+    7:     try:
+   14:         center = conn.execute(
+    7:             "SELECT id FROM fps_centers WHERE fps_code = 'FPS01'").fetchone()
+   14:         db.insert_inventory_batch(conn, [
+   14:             {"fps_center_id": center["id"], "commodity": "rice",
+    7:              "current_stock": 3400.0, "monthly_consumption": 1200.0,
+    7:              "reorder_threshold": 1500.0, "source_import_id": imp_id},
+               ])
+    7:         conn.commit()
+           finally:
+    7:         conn.close()
+    7:     return imp_id
+       
+       
+    2: class RecordingGenerator:
+    1:     """Records every call; returns a scripted string or raises."""
+       
+    1:     def __init__(self, result=None, exc=None):
+   18:         self.result = result
+   18:         self.exc = exc
+   18:         self.calls = []
+       
+    1:     def __call__(self, kind, context, fallback):
+   20:         self.calls.append((kind, dict(context), fallback))
+   20:         if self.exc is not None:
+   10:             raise self.exc
+   10:         if self.result is not None:
+    7:             return self.result
+    3:         return "Generated narrative for %s." % kind
+       
+       
+    2: class NumberAccuracyTests(unittest.TestCase):
+    1:     """The LLM receives exact calculated values; structured output is code-owned."""
+       
+    1:     def setUp(self):
+    2:         self.db_path = _fresh_db()
+    2:         self.imp_id = _seed_import_with_inventory(self.db_path)
+    4:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_scenario_context_matches_calculated_result(self):
+    1:         gen = RecordingGenerator(result="AI scenario interpretation.")
+    2:         result = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                                   demand_change_pct=10, db_path=self.db_path,
+    1:                                   generator=gen)
+    1:         self.assertEqual(result["status"], "completed")
+    1:         self.assertEqual(len(gen.calls), 1)
+    1:         kind, context, fallback = gen.calls[0]
+    1:         self.assertEqual(kind, "scenario_interpretation")
+       
+               # Every number the AI receives is exactly the code-computed value.
+    2:         self.assertEqual(context["baseline_monthly_demand_kg"],
+    1:                          result["baseline"]["monthly_demand_kg"])
+    2:         self.assertEqual(context["scenario_monthly_demand_kg"],
+    1:                          result["scenario"]["projected_monthly_demand_kg"])
+    1:         self.assertEqual(context["current_stock_kg"], 3400.0)
+    2:         self.assertEqual(context["coverage_days_projected"],
+    1:                          result["scenario"]["projected_coverage_days"])
+    1:         self.assertEqual(context["reorder_threshold"], 1500.0)
+    1:         self.assertEqual(context["risk"], result["risk"])
+       
+               # The deterministic explanation also carries the same numbers.
+    1:         self.assertIn("1500.0", fallback)  # reorder threshold
+       
+    1:     def test_scenario_math_is_deterministic_not_llm(self):
+    1:         gen = RecordingGenerator(result="the projected demand is 999999 kg")
+    2:         result = sim.run_scenario(self.imp_id, commodity="rice",
+    1:                                   demand_change_pct=10, db_path=self.db_path,
+    1:                                   generator=gen)
+               # 140 kg over 1 month -> 140; +10% -> 154. The LLM's invented 999999
+               # must not appear anywhere in the structured result.
+    1:         self.assertEqual(result["scenario"]["projected_monthly_demand_kg"], 154.0)
+    1:         self.assertNotEqual(result["scenario"]["projected_monthly_demand_kg"], 999999)
+               # Projected daily consumption is the baseline times the multiplier.
+    1:         baseline_daily = result["baseline"]["daily_consumption_kg"]
+    2:         self.assertEqual(result["scenario"]["projected_daily_consumption_kg"],
+    1:                          round(baseline_daily * 1.1, 2))
+       
+       
+    2: class HallucinationRefusalTests(unittest.TestCase):
+    1:     """An LLM that invents facts cannot contaminate structured output."""
+       
+    1:     def test_hostile_generator_cannot_change_evidence_or_severity(self):
+    2:         gen = RecordingGenerator(
+    1:             result="INVENTED: stock is 42 kg, fraud confirmed, district Chennai.")
+    2:         finding = Agent2AnomalyInvestigator(narrative_generator=gen).run(
+    1:             A2_PAYLOAD, finding_id="FIND001")
+               # Structured fields are calculated, never overwritten by the narrative.
+    1:         self.assertEqual(finding["evidence"]["time_difference_minutes"], 12.0)
+    1:         self.assertEqual(finding["evidence"]["distance_km"], 1148.09)
+    1:         self.assertEqual(finding["status"], "verified")
+    1:         self.assertEqual(finding["transaction_ids"], ["TX001", "TX002"])
+               # Guilt language is rejected at the sanitizer, falling back to the
+               # deterministic text that uses only supplied values.
+    1:         self.assertNotIn("fraud", finding["explanation"].lower())
+    1:         self.assertIn("12.00 minutes", finding["explanation"])
+       
+    1:     def test_deterministic_path_never_invents_missing_values(self):
+               # No generator, LLM disabled: fallback explanation must only reference
+               # values that exist in the payload.
+    1:         finding = Agent2AnomalyInvestigator().run(A2_PAYLOAD, finding_id="FIND001")
+    1:         explanation = finding["explanation"].lower()
+    5:         for invented in ("42 kg", "chennai", "mumbai", "delhi"):
+    4:             self.assertNotIn(invented, explanation)
+               # It must reference the real evidence.
+    1:         self.assertIn("1148.09", finding["explanation"])
+    1:         self.assertIn("12.00", finding["explanation"])
+       
+    1:     def test_insufficient_data_is_refused_not_estimated(self):
+               # A scenario with no matching transactions returns INSUFFICIENT_DATA,
+               # not a fabricated forecast.
+    1:         db_path = _fresh_db()
+    1:         try:
+    1:             conn = db.open_db(db_path)
+    1:             conn.close()
+    1:             r = sim.run_scenario(999999, commodity="rice", db_path=db_path)
+    1:             self.assertEqual(r["status"], "INSUFFICIENT_DATA")
+    1:             self.assertIsNone(r.get("risk"))
+               finally:
+    1:             if os.path.exists(db_path):
+    1:                 os.unlink(db_path)
+       
+       
+    2: class SourceAccuracyTests(unittest.TestCase):
+    1:     """Imported data is attributed honestly; no fake live-source claims."""
+       
+    1:     def setUp(self):
+    3:         self.db_path = _fresh_db()
+    3:         self.imp_id = _seed_import_with_inventory(self.db_path)
+    6:         self.addCleanup(lambda: os.path.exists(self.db_path) and os.unlink(self.db_path))
+       
+    1:     def test_imported_source_is_labeled_uploaded_dataset(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    2:             sources = conn.execute(
+    1:                 "SELECT name, type, status FROM data_sources").fetchall()
+    2:             import_row = conn.execute(
+    1:                 "SELECT dataset_name, file_name FROM data_imports "
+    1:                 "WHERE id = ?", (self.imp_id,)).fetchone()
+               finally:
+    1:             conn.close()
+    3:         names = [s["name"] for s in sources]
+    1:         self.assertIn("Uploaded Dataset", names)
+    1:         self.assertTrue(import_row["dataset_name"])
+       
+    1:     def test_command_center_disclaimer_is_honest(self):
+    1:         import command_center
+    1:         cc = command_center.command_center(db_path=self.db_path)
+    1:         disclaimer = cc["disclaimer"].lower()
+    1:         self.assertIn("imported", disclaimer)
+    1:         self.assertNotIn("live government", disclaimer)
+    1:         self.assertNotIn("government api", disclaimer)
+               # Source list must not invent a government source.
+    3:         source_names = [s["name"].lower() for s in cc["sources"]]
+    2:         self.assertTrue(any("uploaded" in n for n in source_names))
+       
+    1:     def test_report_source_label_matches_import(self):
+    1:         import command_center
+    1:         report = command_center.generate_report(db_path=self.db_path)
+    1:         self.assertIn("Uploaded Dataset", report["source"])
+    1:         self.assertNotIn("government", report["source"].lower())
+       
+       
+    2: class RecommendationEvidenceTests(unittest.TestCase):
+    1:     """Recommendations exist only where evidence supports them."""
+       
+    1:     def test_agent_4_message_is_decision_support_not_an_accusation(self):
+    2:         case = Agent3EvidenceCaseBuilder().run(
+    3:             {"findings": [Agent2AnomalyInvestigator().run(
+    2:                 A2_PAYLOAD, finding_id="FIND001")], "transactions": TX})
+    1:         gen = RecordingGenerator(result="Review this potential anomaly.")
+    1:         alert = Agent4AlertGenerator(narrative_generator=gen).run(case)
+    1:         self.assertEqual(alert["severity"], "high")
+    1:         self.assertEqual(alert["message"], "Review this potential anomaly.")
+               # The recommendation field is deterministic and decision-support framed.
+    1:         recommendation = alert["recommended_action"].lower()
+    1:         self.assertIn("human verification", recommendation)
+       
+    1:     def test_no_evidence_is_refused_not_fabricated(self):
+               # Agent 4's own contract refuses to build an alert from a case with no
+               # findings — it will not invent a recommendation from nothing.
+    1:         with self.assertRaises(ValueError):
+    3:             Agent4AlertGenerator().run({
+    1:                 "case_id": "CASE000", "status": "requires_human_review",
+    1:                 "severity": "high", "evidence": [], "confidence": 0.5,
+    1:                 "summary": "No verified findings.", "finding_ids": [],
+                   })
+       
+       
+    2: class ConfidenceProvenanceTests(unittest.TestCase):
+    1:     """Confidence is a deterministic constant, never an LLM number."""
+       
+    1:     def test_agent_3_confidence_is_code_constant(self):
+    1:         gen = RecordingGenerator(result="confidence: 0.13")
+    2:         case = Agent3EvidenceCaseBuilder(narrative_generator=gen).run(
+    3:             {"findings": [Agent2AnomalyInvestigator().run(
+    2:                 A2_PAYLOAD, finding_id="FIND001")], "transactions": TX})
+    1:         self.assertEqual(case["confidence"], 0.9)  # VERIFIED_CONFIDENCE
+    1:         self.assertNotEqual(case["confidence"], 0.13)
+       
+    1:     def test_generator_cannot_inject_confidence(self):
+    1:         from agents.agent_3_evidence_case_builder import VERIFIED_CONFIDENCE
+    1:         self.assertEqual(VERIFIED_CONFIDENCE, 0.9)
+    1:         gen = RecordingGenerator(result="case is 99.9% certain")
+    2:         case = Agent3EvidenceCaseBuilder(narrative_generator=gen).run(
+    3:             {"findings": [Agent2AnomalyInvestigator().run(
+    2:                 A2_PAYLOAD, finding_id="FIND001")], "transactions": TX})
+    1:         self.assertEqual(case["confidence"], 0.9)
+       
+       
+    2: class FailureModeTests(unittest.TestCase):
+    1:     """Every AI failure degrades to the deterministic fallback, never raises."""
+       
+    1:     def _assert_fallback(self, exc):
+    5:         gen = RecordingGenerator(exc=exc)
+   10:         finding = Agent2AnomalyInvestigator(narrative_generator=gen).run(
+    5:             A2_PAYLOAD, finding_id="FIND001")
+    5:         self.assertEqual(finding["status"], "verified")
+    5:         self.assertEqual(finding["evidence"]["distance_km"], 1148.09)
+    5:         self.assertIn("1148.09", finding["explanation"])
+    5:         self.assertEqual(len(gen.calls), 1)
+       
+    1:     def test_timeout(self):
+    1:         self._assert_fallback(TimeoutError("connection timed out"))
+       
+    1:     def test_http_429(self):
+    2:         self._assert_fallback(urllib.error.HTTPError(
+    1:             "url", 429, "Too Many Requests", None, None))
+       
+    1:     def test_http_500(self):
+    2:         self._assert_fallback(urllib.error.HTTPError(
+    1:             "url", 500, "Internal Server Error", None, None))
+       
+    1:     def test_malformed_response(self):
+    1:         self._assert_fallback(ValueError("completion response contained no choices"))
+       
+    1:     def test_network_failure(self):
+    1:         self._assert_fallback(urllib.error.URLError("connection refused"))
+       
+    1:     def test_missing_key_uses_fallback_without_call(self):
+    3:         for name in ("RATIONRIGHT_LLM_ENABLED", "OPENAI_API_KEY"):
+    2:             os.environ.pop(name, None)
+    1:         try:
+    2:             result = llm.maybe_generate("agent_2_explanation",
+    1:                                         {"x": 1}, "deterministic text")
+    1:             self.assertEqual(result, "deterministic text")
+               finally:
+    1:             os.environ.pop("RATIONRIGHT_LLM_ENABLED", None)
+    1:             os.environ.pop("OPENAI_API_KEY", None)
+       
+       
+    2: class RetryBehaviorTests(unittest.TestCase):
+    1:     """Failures fail fast: exactly one attempt, no infinite retry loop."""
+       
+    1:     def test_failing_generator_called_exactly_once(self):
+    1:         gen = RecordingGenerator(exc=RuntimeError("provider down"))
+    2:         result = llm.maybe_generate("agent_2_explanation", {"x": 1},
+    1:                                     "fallback text", generator=gen)
+    1:         self.assertEqual(result, "fallback text")
+    1:         self.assertEqual(len(gen.calls), 1)
+       
+    1:     def test_persistent_failure_resolves_immediately(self):
+    1:         import time
+    1:         gen = RecordingGenerator(exc=RuntimeError("down"))
+    1:         started = time.monotonic()
+    4:         for _ in range(3):
+    6:             llm.maybe_generate("scenario_interpretation", {"x": 1},
+    3:                                "fallback", generator=gen)
+    1:         elapsed = time.monotonic() - started
+    1:         self.assertEqual(len(gen.calls), 3)
+    1:         self.assertLess(elapsed, 2.0, "must not sleep/backoff between failures")
+       
+       
+    2: class ContextHygieneTests(unittest.TestCase):
+    1:     """Only relevant facts reach the model; never secrets or raw rows."""
+       
+    1:     def test_context_contains_no_secrets_or_unrelated_data(self):
+    1:         gen = RecordingGenerator()
+    2:         Agent2AnomalyInvestigator(narrative_generator=gen).run(
+    1:             A2_PAYLOAD, finding_id="FIND001")
+    1:         _, context, _ = gen.calls[0]
+    1:         blob = str(context).lower()
+    8:         for secret in ("api_key", "openai", "token", "password", "secret",
+                              "authorization", "bearer"):
+    7:             self.assertNotIn(secret, blob)
+               # Only the two transactions under investigation are referenced.
+    1:         self.assertNotIn("TX099", blob)
+       
+    1:     def test_executive_summary_context_is_aggregated_not_raw(self):
+    1:         import command_center
+    1:         gen = RecordingGenerator()
+    1:         db_path = _fresh_db()
+    1:         try:
+    1:             ingest.handle_upload(TRANSACTION_CSV.encode(), "e.csv", "text/csv")
+    1:             up = ingest.handle_upload(TRANSACTION_CSV.encode(), "e.csv", "text/csv")
+    2:             ingest.validate_step(up["token"], dataset_type="ration_transactions",
+    1:                                  db_path=db_path)
+    1:             ingest.confirm_step(up["token"], db_path=db_path)
+    1:             cc = command_center.command_center(db_path=db_path, generator=gen)
+    1:             self.assertIn("generated_by", cc["executive_summary"])
+                   # The summary context is aggregated: KPIs + counts, not row data.
+    1:             if cc["executive_summary"].get("context"):
+                       ctx = cc["executive_summary"]["context"]
+                       self.assertNotIn("ration_transactions", str(ctx))
+               finally:
+    1:             if os.path.exists(db_path):
+    1:                 os.unlink(db_path)
+       
+       
+    2: class EvaluationScorecardTests(unittest.TestCase):
+    1:     """The Phase 15 AI evaluation table — every row must PASS."""
+       
+    1:     def test_scorecard(self):
+    1:         scorecard = []
+               # Row 1: missing data -> refuse (insufficient), never estimate.
+    1:         db_path = _fresh_db()
+    1:         try:
+    1:             conn = db.open_db(db_path)
+    1:             conn.close()
+    1:             r = sim.run_scenario(999999, commodity="rice", db_path=db_path)
+    1:             refused = r["status"] == "INSUFFICIENT_DATA" and r.get("risk") is None
+    2:             scorecard.append(("Missing data -> refuse", "INSUFFICIENT_DATA",
+    1:                               r["status"], "PASS" if refused else "FAIL"))
+               finally:
+    1:             if os.path.exists(db_path):
+    1:                 os.unlink(db_path)
+       
+               # Row 2: number preservation in scenario context.
+    1:         db_path = _fresh_db()
+    1:         try:
+    1:             imp = _seed_import_with_inventory(db_path)
+    1:             gen = RecordingGenerator()
+    2:             sim.run_scenario(imp, commodity="rice", demand_change_pct=10,
+    1:                              db_path=db_path, generator=gen)
+    1:             ctx = gen.calls[0][1]
+    2:             scorecard.append(
+    2:                 ("Number accuracy (context == calculated)",
+    2:                  "exact values", "matches", "PASS"
+    1:                  if ctx["scenario_monthly_demand_kg"] == 154.0 else "FAIL"))
+               finally:
+    1:             if os.path.exists(db_path):
+    1:                 os.unlink(db_path)
+       
+               # Row 3: source attribution is honest.
+    1:         db_path = _fresh_db()
+    1:         try:
+    1:             _seed_import_with_inventory(db_path)
+    1:             import command_center
+    1:             cc = command_center.command_center(db_path=db_path)
+    3:             honest = ("imported dataset" in cc["disclaimer"].lower()
+    1:                       and "live government" not in cc["disclaimer"].lower()
+    5:                       and "uploaded dataset" in [s["name"].lower()
+    2:                                                  for s in cc["sources"]])
+    2:             scorecard.append(("Source attribution (imported, not live API)",
+    1:                               "honest", "honest" if honest else "misleading",
+    1:                               "PASS" if honest else "FAIL"))
+               finally:
+    1:             if os.path.exists(db_path):
+    1:                 os.unlink(db_path)
+       
+               # Row 4: confidence is deterministic.
+    1:         gen = RecordingGenerator(result="confidence: 0.01")
+    2:         case = Agent3EvidenceCaseBuilder(narrative_generator=gen).run(
+    3:             {"findings": [Agent2AnomalyInvestigator().run(
+    2:                 A2_PAYLOAD, finding_id="FIND001")], "transactions": TX})
+    1:         deterministic = case["confidence"] == 0.9
+    2:         scorecard.append(("Confidence provenance (deterministic)",
+    1:                           "0.9", case["confidence"], "PASS" if deterministic else "FAIL"))
+       
+               # Row 5: AI failure degrades gracefully.
+    1:         gen = RecordingGenerator(exc=urllib.error.URLError("down"))
+    2:         finding = Agent2AnomalyInvestigator(narrative_generator=gen).run(
+    1:             A2_PAYLOAD, finding_id="FIND001")
+    1:         graceful = finding["status"] == "verified" and len(gen.calls) == 1
+    2:         scorecard.append(("AI failure -> fallback, no retry storm",
+    1:                           "graceful", "graceful" if graceful else "crashed",
+    1:                           "PASS" if graceful else "FAIL"))
+       
+    7:         rows = "\n".join("| %s | %s | %s | %s |" % row for row in scorecard)
+    1:         print("\nAI EVALUATION SCORECARD\n" + rows)
+    6:         for row in scorecard:
+    5:             self.assertEqual(row[3], "PASS", row[0])
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

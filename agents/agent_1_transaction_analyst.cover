@@ -1,0 +1,231 @@
+    1: """RationRight — Agent 1: Transaction Analyst (Phase 2).
+       
+       Detects the configured MVP suspicious pattern (``rapid_geographic_transaction``)
+       in synthetic ration-transaction records: the same beneficiary has two
+       transactions within a short time interval at geographically distant locations.
+       
+       This agent is fully deterministic and uses **no LLM**: timestamp parsing, time
+       differences, geographic distance, grouping, filtering, threshold checks, and
+       validation are all performed by code/tools. The deterministic helpers are shared
+       with Phase 1 (``scripts.validate_dataset``) so the same definitions of the
+       pattern are used everywhere. The anomaly explanation is generated from the
+       actual computed values, never guessed.
+       
+       MVP thresholds (configurable, documented; inclusive bounds):
+           max_interval_minutes = 60  (interval <= threshold counts as "short")
+           min_distance_km      = 100 (distance >= threshold counts as "far")
+       
+       The values are defined centrally in ``agents.pattern_config`` (shared with
+       Agent 2 and the Phase 1 dataset validator), so the planted pattern
+       (12 minutes / ~1148 km) is detected and no control case trips.
+       
+       Output follows ``RationRight_complete_docs/data_contract.md``:
+       
+           {"anomalies": [{"anomaly_id", "anomaly_type", "transaction_ids",
+                           "beneficiary_id", "reason", "severity"}, ...]}
+       
+       Missing/invalid data (timestamp, coordinates, beneficiary ID, malformed
+       records) is never guessed: the affected record is excluded from comparison and
+       a warning is logged. An empty dataset or a dataset with no matching pair
+       returns ``{"anomalies": []}``.
+       
+       Run standalone::
+       
+           python3 scripts/run_agent_1.py
+       
+       Import::
+       
+           from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime
+       
+    1: from agents.pattern_config import (
+           RAPID_GEOGRAPHIC_ANOMALY_TYPE,
+           RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES,
+           RAPID_GEOGRAPHIC_MIN_DISTANCE_KM,
+           RAPID_GEOGRAPHIC_SEVERITY,
+       )
+    1: from scripts.validate_dataset import (
+           find_suspicious_pairs,
+           validate_transactions,
+       )
+       
+    1: logger = logging.getLogger("rationright.agent_1")
+       
+       # Threshold values live in ``agents.pattern_config`` (single source of truth).
+    1: ANOMALY_TYPE = RAPID_GEOGRAPHIC_ANOMALY_TYPE
+    1: DEFAULT_MAX_INTERVAL_MINUTES = RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES
+    1: DEFAULT_MIN_DISTANCE_KM = RAPID_GEOGRAPHIC_MIN_DISTANCE_KM
+    1: DEFAULT_SEVERITY = RAPID_GEOGRAPHIC_SEVERITY
+       
+       # Fields required by the documented anomaly-candidate contract.
+    1: CANDIDATE_FIELDS = (
+           "anomaly_id",
+           "anomaly_type",
+           "transaction_ids",
+           "beneficiary_id",
+           "reason",
+           "severity",
+       )
+       
+       
+    2: class Agent1TransactionAnalyst:
+    1:     """Transaction Analyst: turns transaction records into anomaly candidates.
+       
+           The agent discovers patterns from the supplied data; no specific
+           transaction IDs or anomaly results are hard-coded.
+           """
+       
+    1:     def __init__(
+               self,
+    1:         max_interval_minutes: float = DEFAULT_MAX_INTERVAL_MINUTES,
+    1:         min_distance_km: float = DEFAULT_MIN_DISTANCE_KM,
+    1:         anomaly_type: str = ANOMALY_TYPE,
+    1:         severity: str = DEFAULT_SEVERITY,
+           ):
+   67:         if max_interval_minutes <= 0:
+                   raise ValueError("max_interval_minutes must be positive")
+   67:         if min_distance_km <= 0:
+                   raise ValueError("min_distance_km must be positive")
+   67:         self.max_interval_minutes = max_interval_minutes
+   67:         self.min_distance_km = min_distance_km
+   67:         self.anomaly_type = anomaly_type
+   67:         self.severity = severity
+       
+    1:     @staticmethod
+    1:     def _record_issue(tx: dict):
+               """Return a description of missing/invalid data that prevents safe
+               comparison, or ``None`` if the record can be compared."""
+  909:         beneficiary_id = tx.get("beneficiary_id")
+  909:         if not isinstance(beneficiary_id, str) or not beneficiary_id:
+    1:             return "missing/invalid beneficiary_id"
+  908:         raw_timestamp = tx.get("timestamp")
+  908:         if not isinstance(raw_timestamp, str) or not raw_timestamp:
+    2:             return "missing/invalid timestamp"
+  906:         try:
+  906:             datetime.fromisoformat(raw_timestamp)
+    1:         except ValueError:
+    1:             return "invalid timestamp"
+ 2687:         for field, low, high in (("latitude", -90.0, 90.0), ("longitude", -180.0, 180.0)):
+ 1796:             value = tx.get(field)
+ 1796:             if not isinstance(value, (int, float)) or isinstance(value, bool) or not (low <= value <= high):
+   14:                 return f"missing/invalid {field}"
+  891:         return None
+       
+    1:     def run(self, transactions) -> dict:
+               """Analyze transaction records and return structured anomaly candidates."""
+   63:         if not isinstance(transactions, list):
+    5:             raise ValueError("transactions must be a list of transaction objects")
+       
+   58:         if not transactions:
+    1:             logger.info("Empty dataset: no transactions to analyze.")
+    1:             return {"anomalies": []}
+       
+   57:         validation_errors = validate_transactions(transactions)
+   57:         if validation_errors:
+    9:             logger.warning("Input validation found %d issue(s):", len(validation_errors))
+   46:             for error in validation_errors:
+   37:                 logger.warning("  %s", error)
+       
+   57:         comparable = []
+   57:         skipped = []
+  967:         for tx in transactions:
+  910:             if not isinstance(tx, dict):
+    1:                 skipped.append(("<malformed>", "record is not an object"))
+    1:                 continue
+  909:             issue = self._record_issue(tx)
+  909:             if issue is not None:
+   18:                 skipped.append((tx.get("transaction_id", "<unknown>"), issue))
+   18:                 continue
+  891:             comparable.append(tx)
+       
+   57:         if skipped:
+   18:             logger.warning(
+    9:                 "Skipped %d record(s) that cannot be compared safely: %s",
+    9:                 len(skipped),
+   37:                 ", ".join(f"{tx_id} ({issue})" for tx_id, issue in skipped),
+                   )
+       
+   57:         if not comparable:
+    2:             logger.warning("No comparable records remain; returning no candidates.")
+    2:             return {"anomalies": []}
+       
+   55:         by_beneficiary = {}
+  946:         for tx in comparable:
+  891:             by_beneficiary.setdefault(tx["beneficiary_id"], []).append(tx)
+  305:         comparison_count = sum(len(records) * (len(records) - 1) // 2 for records in by_beneficiary.values())
+  110:         logger.info(
+   55:             "Evaluated %d same-beneficiary pair comparison(s) across %d beneficiary group(s) (%d record(s))",
+   55:             comparison_count,
+   55:             len(by_beneficiary),
+   55:             len(comparable),
+               )
+       
+  110:         pairs = find_suspicious_pairs(
+   55:             comparable,
+   55:             short_interval_minutes=self.max_interval_minutes,
+   55:             large_distance_km=self.min_distance_km,
+               )
+  110:         logger.info(
+   55:             "Rule '%s' (interval <= %g min, distance >= %g km) matched %d pair(s)",
+   55:             self.anomaly_type,
+   55:             self.max_interval_minutes,
+   55:             self.min_distance_km,
+   55:             len(pairs),
+               )
+   96:         for pair in pairs:
+   82:             logger.info(
+   41:                 "  Triggered for %s (beneficiary %s): %s minutes, %s km",
+   41:                 pair["transaction_ids"],
+   41:                 pair["beneficiary_id"],
+   41:                 pair["time_difference_minutes"],
+   41:                 pair["distance_km"],
+                   )
+       
+   55:         candidates = self._build_candidates(pairs)
+   55:         self._validate_candidates(candidates)
+  110:         logger.info(
+   55:             "Generated %d anomaly candidate(s): %s",
+   55:             len(candidates),
+  151:             [candidate["anomaly_id"] for candidate in candidates],
+               )
+   55:         return {"anomalies": candidates}
+       
+    1:     def _build_candidates(self, pairs: list) -> list:
+               """Convert matched pairs into contract-compliant anomaly candidates."""
+   55:         candidates = []
+   96:         for index, pair in enumerate(pairs, start=1):
+   82:             candidates.append(
+   41:                 {
+   41:                     "anomaly_id": f"ANOM{index:03d}",
+   41:                     "anomaly_type": self.anomaly_type,
+   41:                     "transaction_ids": list(pair["transaction_ids"]),
+   41:                     "beneficiary_id": pair["beneficiary_id"],
+                           "reason": (
+  205:                         f"Two transactions for beneficiary {pair['beneficiary_id']} occurred "
+   41:                         f"{pair['time_difference_minutes']:.1f} minutes apart at locations "
+   41:                         f"{pair['distance_km']:.2f} km apart, meeting the "
+                               f"rapid-geographic-transaction rule (interval <= "
+   41:                         f"{self.max_interval_minutes:g} min, distance >= "
+   41:                         f"{self.min_distance_km:g} km)."
+                           ),
+   41:                     "severity": self.severity,
+                       }
+                   )
+   55:         return candidates
+       
+    1:     @staticmethod
+    1:     def _validate_candidates(candidates: list) -> None:
+               """Self-check that every candidate satisfies the output contract."""
+   55:         required = set(CANDIDATE_FIELDS)
+   96:         for candidate in candidates:
+   41:             if not isinstance(candidate, dict) or not required.issubset(candidate):
+                       raise ValueError(f"Invalid anomaly candidate: {candidate!r}")
+   41:             if not candidate["transaction_ids"]:
+                       raise ValueError(f"Anomaly candidate has empty transaction_ids: {candidate!r}")
+   41:             if not isinstance(candidate["reason"], str) or not candidate["reason"]:
+                       raise ValueError(f"Anomaly candidate has empty reason: {candidate!r}")

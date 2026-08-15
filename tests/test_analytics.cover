@@ -1,0 +1,392 @@
+    1: """RationRight — Phase 5: database analytics tests.
+       
+       Covers the analytics service (``analytics.py``) and its HTTP endpoints:
+       overview KPIs, distribution aggregation, inventory risk, beneficiary
+       search/filter/pagination/sort, FPS analytics, deterministic operational
+       alerts, date-range filtering, empty databases, and API validation.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import analytics
+    1: import database as db
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+    1: def _seed(conn, with_inventory=True):
+           """Seed a deterministic, known dataset into a temp database."""
+   13:     db.seed_synthetic(conn)
+   13:     src_id = db.get_data_source_by_name(conn, "Uploaded Dataset")
+   13:     if src_id is None:
+   26:         src_id = db.insert_data_source(
+   13:             conn, name="Uploaded Dataset", source_type="MANUAL",
+   13:             description="test", status="ACTIVE",
+               )
+   26:     imp_id = db.insert_data_import(
+   13:         conn, data_source_id=src_id, dataset_name="test_up",
+   13:         file_name="t.csv", file_type="CSV", record_count=5,
+   13:         status="COMPLETED",
+           )
+   26:     db.upsert_beneficiaries(conn, [
+   26:         {"external_reference": "REAL001", "state": "UP", "district": "Lucknow",
+   13:          "ration_category": "AAY", "family_size": 4, "status": "ACTIVE"},
+   26:         {"external_reference": "REAL002", "state": "UP", "district": "Kanpur",
+   13:          "ration_category": "PHH", "family_size": 3, "status": "ACTIVE"},
+   26:         {"external_reference": "REAL003", "state": "MH", "district": "Pune",
+   13:          "ration_category": "PHH", "family_size": 5, "status": "INACTIVE"},
+           ])
+   13:     ben_map = db.beneficiary_ids(conn, ["REAL001", "REAL002", "REAL003"])
+   26:     db.upsert_fps_centers(conn, [
+   26:         {"fps_code": "FPS10", "name": "Lucknow Center", "district": "Lucknow",
+   13:          "state": "UP", "status": "ACTIVE"},
+   26:         {"fps_code": "FPS11", "name": "Kanpur Center", "district": "Kanpur",
+   13:          "state": "UP", "status": "ACTIVE"},
+   26:         {"fps_code": "FPS12", "name": "Pune Center", "district": "Pune",
+   13:          "state": "MH", "status": "ACTIVE"},
+           ])
+   13:     center_map = db.fps_center_ids(conn, ["FPS10", "FPS11", "FPS12"])
+   39:     db.insert_transactions_batch(conn, [
+   26:         {"external_transaction_id": "R1", "beneficiary_id": ben_map["REAL001"],
+   13:          "fps_center_id": center_map["FPS10"], "transaction_date": "2026-08-01",
+   13:          "commodity": "rice", "quantity": 100.0, "unit": "kg", "status": "COMPLETED",
+   13:          "source_import_id": imp_id, "latitude": 26.8, "longitude": 80.9},
+   26:         {"external_transaction_id": "R2", "beneficiary_id": ben_map["REAL001"],
+   13:          "fps_center_id": center_map["FPS10"], "transaction_date": "2026-08-03",
+   13:          "commodity": "wheat", "quantity": 50.0, "unit": "kg", "status": "COMPLETED",
+   13:          "source_import_id": imp_id, "latitude": 26.8, "longitude": 80.9},
+   26:         {"external_transaction_id": "R3", "beneficiary_id": ben_map["REAL002"],
+   13:          "fps_center_id": center_map["FPS11"], "transaction_date": "2026-08-05",
+   13:          "commodity": "rice", "quantity": 40.0, "unit": "kg", "status": "FAILED",
+   13:          "source_import_id": imp_id, "latitude": 26.4, "longitude": 80.3},
+   26:         {"external_transaction_id": "R4", "beneficiary_id": ben_map["REAL003"],
+   13:          "fps_center_id": center_map["FPS12"], "transaction_date": "2026-08-07",
+   13:          "commodity": "pulses", "quantity": 25.0, "unit": "kg", "status": "COMPLETED",
+   13:          "source_import_id": imp_id, "latitude": 18.5, "longitude": 73.8},
+   91:     ] + [
+               # Four more failures at FPS11 so HIGH_FAILURE_RATE triggers (5 tx, all failed).
+  104:         {"external_transaction_id": "R%d" % n, "beneficiary_id": ben_map["REAL002"],
+   52:          "fps_center_id": center_map["FPS11"], "transaction_date": "2026-08-%02d" % n,
+   52:          "commodity": "wheat", "quantity": 1.0, "unit": "kg", "status": "FAILED",
+   52:          "source_import_id": imp_id, "latitude": 26.4, "longitude": 80.3}
+   65:         for n in (5, 6, 7, 8)
+           ])
+   13:     if with_inventory:
+   26:         db.insert_inventory_batch(conn, [
+   26:             {"fps_center_id": center_map["FPS10"], "commodity": "rice",
+   13:              "current_stock": 500.0, "monthly_consumption": 300.0,
+   13:              "reorder_threshold": 200.0, "source_import_id": imp_id},
+   26:             {"fps_center_id": center_map["FPS10"], "commodity": "wheat",
+   13:              "current_stock": 100.0, "monthly_consumption": 400.0,
+   13:              "reorder_threshold": 150.0, "source_import_id": imp_id},
+               ])
+   13:     conn.commit()
+   13:     return imp_id
+       
+       
+    2: class AnalyticsServiceTests(unittest.TestCase):
+    1:     def setUp(self):
+   12:         self._tmp = tempfile.TemporaryDirectory()
+   12:         self.db_path = Path(self._tmp.name) / "an.db"
+   12:         self.addCleanup(self._tmp.cleanup)
+   12:         self.conn = db.open_db(self.db_path)
+   12:         _seed(self.conn)
+       
+    1:     def tearDown(self):
+   12:         self.conn.close()
+       
+           # ---- overview ----
+    1:     def test_overview_kpis(self):
+    1:         ov = analytics.overview(self.conn)
+    1:         self.assertEqual(ov["total_beneficiaries"], 5 + 3)  # synthetic 5 + real 3
+    1:         self.assertEqual(ov["active_beneficiaries"], 5 + 2)
+    1:         self.assertEqual(ov["total_fps_centers"], 3)  # synthetic seed creates none
+    1:         self.assertEqual(ov["total_transactions"], 25 + 8)
+    1:         self.assertEqual(ov["ration_distributed_kg"], 184.0 + 219.0)  # synthetic + real rows
+    1:         self.assertEqual(ov["by_status"]["COMPLETED"], 25 + 3)
+    1:         self.assertEqual(ov["by_status"]["FAILED"], 5)
+    1:         self.assertEqual(ov["districts_covered"], 3)
+    1:         self.assertIn("rice", ov["commodities_distributed"])
+       
+    1:     def test_overview_provenance(self):
+    1:         ov = analytics.overview(self.conn)
+    4:         names = {s["name"]: s["transaction_count"] for s in ov["data_sources"]}
+    1:         self.assertEqual(names.get("Synthetic Demo Dataset"), 25)
+    1:         self.assertEqual(names.get("Uploaded Dataset"), 8)
+    1:         self.assertIsNotNone(ov["last_import"])
+       
+    1:     def test_overview_range_filter(self):
+    1:         ov7 = analytics.overview(self.conn, range_key="7d")  # last 7 days from today
+    1:         self.assertLessEqual(ov7["total_transactions"], 25 + 4)
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.overview(self.conn, range_key="bogus")
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.overview(self.conn, range_key="custom")  # missing from/to
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.overview(self.conn, range_key="custom", from_date="2026-09-01", to_date="2026-08-01")
+    2:         ov_custom = analytics.overview(self.conn, range_key="custom",
+    1:                                        from_date="2026-08-01", to_date="2026-08-05")
+               # matches the raw SQL over the same window (consistency check)
+    2:         raw = self.conn.execute(
+    1:             "SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM ration_transactions "
+                   "WHERE substr(transaction_date, 1, 10) BETWEEN '2026-08-01' AND '2026-08-05'"
+               ).fetchone()
+    1:         self.assertEqual(ov_custom["total_transactions"], raw[0])
+    1:         self.assertEqual(ov_custom["ration_distributed_kg"], raw[1])
+       
+           # ---- distribution ----
+    1:     def test_distribution_aggregates(self):
+    1:         d = analytics.distribution(self.conn, granularity="day")
+    1:         self.assertEqual(d["total_quantity"], 403.0)
+    7:         by = {c["commodity"]: c["quantity"] for c in d["by_commodity"]}
+               # totals must equal the raw SQL (aggregation correctness)
+    6:         for commodity in ("rice", "wheat", "pulses", "kerosene", "sugar"):
+   15:             raw = self.conn.execute(
+    5:                 "SELECT COALESCE(SUM(quantity), 0) FROM ration_transactions WHERE commodity = ?",
+    5:                 (commodity,),
+    5:             ).fetchone()[0]
+    5:             self.assertEqual(by.get(commodity, 0.0), raw, commodity)
+    6:         districts = {r["district"]: r["quantity"] for r in d["by_district"]}
+    1:         self.assertEqual(districts["Lucknow"], 150.0)
+    1:         self.assertEqual(districts["Kanpur"], 44.0)
+    6:         centers = {r["fps_code"]: r["quantity"] for r in d["by_center"]}
+    1:         self.assertEqual(centers["FPS10"], 150.0)
+    4:         statuses = {r["status"]: r["count"] for r in d["by_status"]}
+    1:         self.assertEqual(statuses["FAILED"], 5)
+       
+    1:     def test_distribution_trend_backfills(self):
+    1:         d = analytics.distribution(self.conn, granularity="day")
+    1:         self.assertEqual(d["trend"]["granularity"], "day")
+    1:         self.assertGreater(len(d["trend"]["labels"]), 0)
+    6:         for commodity in d["trend"]["series"]:
+    5:             self.assertEqual(len(d["trend"]["series"][commodity]), len(d["trend"]["labels"]))
+               # sum of a commodity's trend must equal its by_commodity total (consistency)
+    7:         by = {c["commodity"]: c["quantity"] for c in d["by_commodity"]}
+    6:         for commodity, values in d["trend"]["series"].items():
+    5:             self.assertAlmostEqual(sum(values), by.get(commodity, 0.0), places=2)
+    1:         m = analytics.distribution(self.conn, granularity="month")
+    4:         self.assertTrue(all(len(b) == 7 for b in m["trend"]["labels"]))
+    1:         w = analytics.distribution(self.conn, granularity="week")
+    8:         self.assertTrue(all("W" in b for b in w["trend"]["labels"]))
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.distribution(self.conn, granularity="year")
+       
+           # ---- inventory ----
+    1:     def test_inventory_risk(self):
+    1:         inv = analytics.inventory(self.conn)
+    1:         self.assertEqual(inv["total_stock_kg"], 600.0)
+    4:         by = {c["commodity"]: c for c in inv["by_commodity"]}
+               # rice: 500 * 30 / 300 = 50 days -> HEALTHY
+    1:         self.assertEqual(by["rice"]["days_remaining"], 50.0)
+    1:         self.assertEqual(by["rice"]["status"], "HEALTHY")
+               # wheat: 100 * 30 / 400 = 7.5 days -> CRITICAL
+    1:         self.assertEqual(by["wheat"]["days_remaining"], 7.5)
+    1:         self.assertEqual(by["wheat"]["status"], "CRITICAL")
+    1:         self.assertEqual(len(inv["low_stock_items"]), 1)  # wheat below threshold
+    1:         self.assertEqual(inv["low_stock_items"][0]["commodity"], "wheat")
+    1:         self.assertIn("critical_days", inv["thresholds"])
+       
+           # ---- beneficiaries ----
+    1:     def test_beneficiaries_pagination_and_filters(self):
+    1:         p1 = analytics.beneficiaries(self.conn, page=1, per_page=5)
+    1:         self.assertEqual(p1["total"], 8)
+    1:         self.assertEqual(len(p1["rows"]), 5)
+    1:         self.assertEqual(p1["active"], 7)
+    1:         p2 = analytics.beneficiaries(self.conn, page=2, per_page=5)
+    1:         self.assertEqual(len(p2["rows"]), 3)
+               # filter by district
+    1:         lko = analytics.beneficiaries(self.conn, district="Lucknow")
+    1:         self.assertEqual(lko["total"], 1)
+    1:         self.assertEqual(lko["rows"][0]["external_reference"], "REAL001")
+               # filter by status
+    1:         inact = analytics.beneficiaries(self.conn, status="INACTIVE")
+    1:         self.assertEqual(inact["total"], 1)
+    1:         self.assertEqual(inact["rows"][0]["external_reference"], "REAL003")
+               # search
+    1:         q = analytics.beneficiaries(self.conn, q="REAL")
+    1:         self.assertEqual(q["total"], 3)
+    1:         q2 = analytics.beneficiaries(self.conn, q="real002")
+    1:         self.assertEqual(q2["total"], 1)
+               # sort
+    1:         by_qty = analytics.beneficiaries(self.conn, sort="total_quantity", per_page=1)
+    1:         self.assertEqual(by_qty["rows"][0]["external_reference"], "REAL001")
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.beneficiaries(self.conn, sort="evil; DROP TABLE")
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.beneficiaries(self.conn, page=0)
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.beneficiaries(self.conn, per_page=99999)
+       
+    1:     def test_beneficiary_detail(self):
+    1:         detail = analytics.beneficiary_detail(self.conn, "REAL001")
+    1:         self.assertEqual(detail["beneficiary"]["district"], "Lucknow")
+    1:         self.assertEqual(len(detail["transactions"]), 2)
+    1:         self.assertEqual(detail["transactions"][0]["ration_type"], "rice")
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.beneficiary_detail(self.conn, "NOPE")
+       
+           # ---- fps ----
+    1:     def test_fps_analytics(self):
+    1:         fps = analytics.fps(self.conn)
+    1:         self.assertEqual(fps["total"], 3)
+    1:         self.assertEqual(fps["active"], 3)
+    5:         by_code = {c["fps_code"]: c for c in fps["centers"]}
+    1:         self.assertEqual(by_code["FPS10"]["transaction_count"], 2)
+    1:         self.assertEqual(by_code["FPS10"]["quantity_distributed"], 150.0)
+    1:         self.assertEqual(by_code["FPS10"]["inventory_count"], 2)
+    1:         self.assertEqual(by_code["FPS11"]["transaction_count"], 5)
+       
+           # ---- operational alerts ----
+    1:     def test_operational_alerts(self):
+    1:         alerts = analytics.operational_alerts(self.conn)
+    5:         cats = {a["category"] for a in alerts["alerts"]}
+    1:         self.assertIn("LOW_INVENTORY", cats)          # wheat below threshold
+    1:         self.assertIn("HIGH_FAILURE_RATE", cats)      # FPS11: 1 of 1 failed
+               # deterministic ids and order (high first)
+    5:         severities = [a["severity"] for a in alerts["alerts"]]
+    4:         self.assertEqual(severities, sorted(severities, key=lambda s: {"high": 0, "medium": 1, "low": 2}[s]))
+    5:         low_inv = [a for a in alerts["alerts"] if a["category"] == "LOW_INVENTORY"][0]
+    1:         self.assertEqual(low_inv["entity_id"], "FPS10")
+    1:         self.assertEqual(low_inv["commodity"], "wheat")
+       
+           # ---- transactions feed ----
+    1:     def test_transactions_feed(self):
+    1:         t = analytics.transactions(self.conn, page=1, per_page=10)
+    1:         self.assertEqual(t["total"], 33)
+    1:         self.assertEqual(len(t["rows"]), 10)
+    1:         t2 = analytics.transactions(self.conn, page=4, per_page=10)
+    1:         self.assertEqual(len(t2["rows"]), 3)
+    1:         failed = analytics.transactions(self.conn, status="FAILED")
+    1:         self.assertEqual(failed["total"], 5)
+    1:         with self.assertRaises(analytics.AnalyticsError):
+    2:             analytics.transactions(self.conn, status="REFUNDED")
+       
+    1:     def test_consistency_overview_vs_distribution(self):
+    1:         ov = analytics.overview(self.conn)
+    1:         d = analytics.distribution(self.conn)
+    1:         self.assertEqual(ov["ration_distributed_kg"], d["total_quantity"])
+    4:         self.assertEqual(ov["total_transactions"], d["by_status"] and sum(x["count"] for x in d["by_status"]))
+       
+       
+    2: class EmptyDatabaseTests(unittest.TestCase):
+    1:     def setUp(self):
+    1:         self._tmp = tempfile.TemporaryDirectory()
+    1:         self.db_path = Path(self._tmp.name) / "empty.db"
+    1:         self.addCleanup(self._tmp.cleanup)
+    1:         self.conn = db.open_db(self.db_path)
+       
+    1:     def tearDown(self):
+    1:         self.conn.close()
+       
+    1:     def test_empty_database_returns_zeros(self):
+    1:         ov = analytics.overview(self.conn)
+    1:         self.assertEqual(ov["total_beneficiaries"], 0)
+    1:         self.assertEqual(ov["total_transactions"], 0)
+    1:         self.assertEqual(ov["ration_distributed_kg"], 0.0)
+    1:         d = analytics.distribution(self.conn)
+    1:         self.assertEqual(d["total_quantity"], 0.0)
+    1:         self.assertEqual(d["trend"]["labels"], [])
+    1:         self.assertEqual(d["trend"]["series"], {})
+    1:         inv = analytics.inventory(self.conn)
+    1:         self.assertEqual(inv["total_stock_kg"], 0.0)
+    1:         self.assertEqual(inv["items"], [])
+    1:         b = analytics.beneficiaries(self.conn)
+    1:         self.assertEqual(b["total"], 0)
+    1:         self.assertEqual(b["rows"], [])
+    1:         fps = analytics.fps(self.conn)
+    1:         self.assertEqual(fps["total"], 0)
+    1:         alerts = analytics.operational_alerts(self.conn)
+    1:         self.assertEqual(alerts["count"], 0)
+       
+       
+    2: class AnalyticsAPITests(unittest.TestCase):
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls._tmp = tempfile.TemporaryDirectory()
+    1:         cls.db_path = Path(cls._tmp.name) / "api.db"
+    1:         conn = db.open_db(cls.db_path)
+    1:         _seed(conn)
+    1:         conn.close()
+    1:         cls.server = make_server("127.0.0.1", 0, db_path=cls.db_path)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = "%s:%d" % (BASE, cls.port)
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+       
+    1:     def _get(self, path):
+    9:         req = urllib.request.Request(self.base + path)
+    9:         try:
+    9:             with urllib.request.urlopen(req, timeout=30) as response:
+    4:                 return response.status, response.read().decode("utf-8")
+    5:         except urllib.error.HTTPError as exc:
+    5:             return exc.code, exc.read().decode("utf-8")
+       
+    1:     def test_overview_endpoint(self):
+    1:         status, raw = self._get("/api/analytics/overview")
+    1:         self.assertEqual(status, 200)
+    1:         import json
+    1:         data = json.loads(raw)
+    1:         self.assertEqual(data["total_transactions"], 33)
+    1:         self.assertEqual(data["ration_distributed_kg"], 403.0)
+       
+    1:     def test_distribution_endpoint_with_granularity(self):
+    1:         import json
+    1:         status, raw = self._get("/api/analytics/distribution?granularity=month")
+    1:         self.assertEqual(status, 200)
+    1:         data = json.loads(raw)
+    1:         self.assertEqual(data["granularity"], "month")
+    1:         self.assertIn("series", data["trend"])
+       
+    1:     def test_beneficiaries_endpoint_pagination(self):
+    1:         import json
+    1:         status, raw = self._get("/api/analytics/beneficiaries?page=2&per_page=5&sort=total_quantity")
+    1:         self.assertEqual(status, 200)
+    1:         data = json.loads(raw)
+    1:         self.assertEqual(data["page"], 2)
+    1:         self.assertEqual(len(data["rows"]), 3)
+       
+    1:     def test_invalid_range_rejected_400(self):
+    1:         status, raw = self._get("/api/analytics/overview?range=nonsense")
+    1:         self.assertEqual(status, 400)
+    1:         self.assertIn("Invalid range", raw)
+       
+    1:     def test_custom_range_validation(self):
+    1:         status, _ = self._get("/api/analytics/overview?range=custom&from=2026-08-01")
+    1:         self.assertEqual(status, 400)
+    1:         status, raw = self._get("/api/analytics/overview?range=custom&from=2026-08-09&to=2026-08-01")
+    1:         self.assertEqual(status, 400)
+       
+    1:     def test_unknown_endpoint_400(self):
+    1:         status, _ = self._get("/api/analytics/bogus")
+    1:         self.assertEqual(status, 400)
+       
+    1:     def test_alerts_endpoint(self):
+    1:         import json
+    1:         status, raw = self._get("/api/analytics/alerts")
+    1:         self.assertEqual(status, 200)
+    1:         data = json.loads(raw)
+    5:         cats = {a["category"] for a in data["alerts"]}
+    1:         self.assertIn("LOW_INVENTORY", cats)
+       
+    1:     def test_missing_beneficiary_400(self):
+    1:         status, _ = self._get("/api/analytics/beneficiaries/NOBODY")
+    1:         self.assertEqual(status, 400)
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

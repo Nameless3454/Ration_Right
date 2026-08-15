@@ -1,0 +1,521 @@
+    1: """RationRight — Phase 11: Early Warning, Alerts & Monitoring Center tests.
+       
+       Covers ``monitoring.py`` + the alerts database layer: rule seeding, every
+       deterministic detector (inventory risk, operational risk, demand spike/drop,
+       data freshness, source failure, data quality, analysis-insight conversion),
+       deduplication, auto-resolution, the alert lifecycle (acknowledge / resolve /
+       dismiss with reason), dismissed-condition persistence, filters/search/
+       pagination, trend, the no-source-data-mutation guarantee, and the AI
+       explanation with its deterministic fallback. API surface is exercised
+       through the real server (like test_api.py).
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import os
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from datetime import datetime, timedelta, timezone
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import monitoring
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+    1: _SEED_COUNTER = [0]
+       
+       
+    1: def _now_iso_ago(days=0, hours=0):
+  108:     return (datetime.now(timezone.utc) - timedelta(days=days, hours=hours)
+   54:             ).isoformat(timespec="seconds")
+       
+       
+    2: def _seed(conn, *, stale_source=False, failed_source=False, low_quality=True,
+    1:           low_inventory=True, with_transactions=True):
+           """Deterministic fixture exercising every detector."""
+   18:     _SEED_COUNTER[0] += 1
+   18:     seed_n = _SEED_COUNTER[0]
+       
+           # Sources
+   18:     upload = db.get_data_source_by_name(conn, "Uploaded Dataset")
+   54:     src_id = db.insert_data_source(
+   18:         conn, name="Uploaded Dataset", source_type="MANUAL", description="t",
+   18:         status="ACTIVE",
+   18:     ) if upload is None else upload["id"]
+   18:     if stale_source:
+   36:         db.insert_data_source(
+   18:             conn, name="external_pds_%d" % seed_n, source_type="API",
+   18:             description="external source", status="ACTIVE",
+   18:             last_sync_at=_now_iso_ago(hours=50),
+               )
+   36:         conn.execute(
+   18:             "UPDATE data_sources SET last_successful_sync_at = :ts "
+                   "WHERE name = :name",
+   18:             {"ts": _now_iso_ago(hours=50), "name": "external_pds_%d" % seed_n})
+   18:     if failed_source:
+   36:         db.insert_data_source(
+   18:             conn, name="broken_source_%d" % seed_n, source_type="API",
+   18:             description="broken", status="ERROR", last_sync_at=_now_iso_ago(hours=1),
+               )
+   36:         conn.execute(
+   18:             "UPDATE data_sources SET last_error = 'Connection refused' "
+   18:             "WHERE name = :name", {"name": "broken_source_%d" % seed_n})
+       
+           # Import — optionally low quality (DATA_QUALITY detector).
+   36:     imp_id = db.insert_data_import(
+   18:         conn, data_source_id=src_id, dataset_name="pds_fixture_%d" % seed_n,
+   18:         file_name="fixture.csv", file_type="CSV",
+   18:         record_count=10, successful_records=(8 if low_quality else 10),
+   18:         failed_records=(2 if low_quality else 0), duplicate_records=0,
+   18:         status="PARTIAL" if low_quality else "COMPLETED")
+       
+   36:     db.upsert_beneficiaries(conn, [{"external_reference": "RB1",
+   18:                                     "district": "Lucknow",
+   18:                                     "ration_category": "AAY",
+   18:                                     "family_size": 4, "status": "ACTIVE"}])
+   18:     ben = db.beneficiary_ids(conn, ["RB1"])
+   36:     db.upsert_fps_centers(conn, [
+   36:         {"fps_code": "FPS1", "name": "One", "district": "Lucknow",
+   18:          "state": "UP", "status": "ACTIVE"},
+   36:         {"fps_code": "FPS2", "name": "Two", "district": "Kanpur",
+   18:          "state": "UP", "status": "ACTIVE"},
+           ])
+   18:     fps = db.fps_center_ids(conn, ["FPS1", "FPS2"])
+       
+           # Inventory: FPS1 critical coverage + below reorder; FPS2 healthy.
+   54:     db.insert_inventory_batch(conn, [
+   36:         {"fps_center_id": fps["FPS1"], "commodity": "rice",
+   18:          "current_stock": 100.0, "monthly_consumption": 1200.0,
+   18:          "reorder_threshold": 500.0, "source_import_id": imp_id},
+   36:         {"fps_center_id": fps["FPS2"], "commodity": "rice",
+   18:          "current_stock": 2000.0, "monthly_consumption": 1200.0,
+   18:          "reorder_threshold": 500.0, "source_import_id": imp_id},
+   18:     ]) if low_inventory else None
+       
+   18:     if with_transactions:
+               # Monthly rice demand per FPS1: May 120, Jun 140, Jul 160, Aug 60
+               # (>= 3 tx in Aug) -> DEMAND_DROP, and 3 of 6+ FPS1 tx FAILED
+               # (>= 5 tx, >= 10%) -> high failure rate. FPS2 stays silent -> no
+               # recent distribution.
+   18:         rows = []
+   18:         seq = 0
+   18:         months = [("2026-05", 2, 60.0), ("2026-06", 2, 70.0),
+                         ("2026-07", 2, 80.0), ("2026-08", 3, 20.0)]
+   90:         for month, count, qty in months:
+  234:             for i in range(count):
+  162:                 seq += 1
+  162:                 failed = month in ("2026-05",) and i == 0
+  324:                 rows.append({
+  162:                     "external_transaction_id": "MTX%03d-%04d" % (seed_n, seq),
+  162:                     "beneficiary_id": ben["RB1"], "fps_center_id": fps["FPS1"],
+  162:                     "transaction_date": "%s-%02d" % (month, i + 1),
+  162:                     "commodity": "rice", "quantity": qty, "unit": "kg",
+  162:                     "latitude": 26.8, "longitude": 80.9,
+  162:                     "status": "FAILED" if failed else "COMPLETED",
+  162:                     "source_import_id": imp_id,
+                       })
+   18:         db.insert_transactions_batch(conn, rows)
+       
+           # A persisted Phase 9 anomaly insight -> DISTRIBUTION_ANOMALY alert,
+           # with its analysis run so the alert lineage resolves end to end.
+   36:     db.insert_analysis_run(conn, analysis_id="RA-2026-9001",
+   18:                            data_import_id=imp_id, dataset_mode="real",
+   18:                            status="COMPLETED", insight_count=1)
+   36:     db.insert_ai_insight(
+   18:         conn, insight_type="DISTRIBUTION_ANOMALY", severity="HIGH",
+   18:         title="Unusual distribution pattern",
+   18:         description="Verified against transaction data; requires human review.",
+   18:         entity_type="beneficiary", entity_id="RB1",
+   18:         evidence={"time_difference_minutes": 12, "distance_km": 5.2},
+   18:         confidence=0.9, analysis_id="RA-2026-9001",
+   18:         source_import_id=imp_id)
+   18:     conn.commit()
+   18:     return imp_id
+       
+       
+    2: class DetectorTests(unittest.TestCase):
+    1:     def setUp(self):
+    6:         self._tmp = tempfile.TemporaryDirectory()
+    6:         self.db_path = Path(self._tmp.name) / "mon.db"
+    6:         self.addCleanup(self._tmp.cleanup)
+   18:         for name in ("RATIONRIGHT_LLM_ENABLED", "OPENAI_API_KEY"):
+   12:             os.environ.pop(name, None)
+    6:         self.conn = db.open_db(self.db_path)
+    6:         self.imp_id = _seed(self.conn, stale_source=True, failed_source=True)
+    6:         self.conn.close()
+       
+    1:     def _conditions(self):
+    5:         conn = db.open_db(self.db_path)
+    5:         try:
+    5:             rules = monitoring._rule_map(conn)
+   10:             return {
+    5:                 "inventory": monitoring._inventory_candidates(conn, rules),
+    5:                 "operational": monitoring._operational_candidates(conn, rules),
+    5:                 "demand": monitoring._demand_candidates(conn, rules),
+    5:                 "freshness": monitoring._freshness_candidates(conn, rules),
+    5:                 "source": monitoring._source_failure_candidates(conn, rules),
+    5:                 "quality": monitoring._quality_candidates(conn, rules),
+    5:                 "insight": monitoring._insight_candidates(conn, rules),
+                   }
+               finally:
+    5:             conn.close()
+       
+    1:     def test_rules_seeded_idempotently(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         n1 = len(monitoring.alert_rules_view(db_path=self.db_path)["rules"])
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         n2 = len(monitoring.alert_rules_view(db_path=self.db_path)["rules"])
+    1:         self.assertEqual(n1, n2)
+    1:         self.assertGreaterEqual(n1, 11)
+       
+    1:     def test_inventory_detectors(self):
+    1:         inv = self._conditions()["inventory"]
+    1:         by_cond = {}
+    3:         for c in inv:
+    2:             by_cond.setdefault(c["condition"], []).append(c)
+    1:         self.assertEqual(len(by_cond.get("coverage_critical", [])), 1)
+    1:         crit = by_cond["coverage_critical"][0]
+    1:         self.assertEqual(crit["entity_id"], "FPS1")
+    1:         self.assertEqual(crit["severity"], "CRITICAL")
+    1:         self.assertEqual(by_cond.get("below_reorder", [])[0]["entity_id"], "FPS1")
+               # FPS2 healthy -> no coverage_warning/critical for it
+    2:         self.assertFalse([c for c in by_cond.get("coverage_warning", [])
+                                 if c["entity_id"] == "FPS2"])
+       
+    1:     def test_operational_detectors(self):
+    1:         op = self._conditions()["operational"]
+    1:         by_cond = {}
+    3:         for c in op:
+    2:             by_cond.setdefault(c["condition"], []).append(c)
+    4:         failure = [c for c in by_cond.get("high_failure_rate", [])
+    1:                    if c["entity_id"] == "FPS1"]
+    1:         self.assertEqual(len(failure), 1)
+    1:         self.assertGreaterEqual(failure[0]["current_value"], 10.0)
+    4:         quiet = [c for c in by_cond.get("no_recent_distribution", [])
+    1:                  if c["entity_id"] == "FPS2"]
+    1:         self.assertEqual(len(quiet), 1)
+       
+    1:     def test_demand_drop_detector(self):
+    1:         demand = self._conditions()["demand"]
+    4:         drops = [c for c in demand if c["condition"] == "demand_drop"
+    1:                  and c["commodity"] == "rice"]
+    1:         self.assertEqual(len(drops), 1)
+    1:         self.assertLessEqual(drops[0]["current_value"], -20.0)
+    1:         self.assertEqual(drops[0]["severity"], "HIGH")  # deviation <= -2x
+    3:         self.assertFalse([c for c in demand if c["condition"] == "demand_spike"])
+       
+    1:     def test_freshness_source_quality_detectors(self):
+    1:         conds = self._conditions()
+    1:         self.assertEqual(len(conds["freshness"]), 1)
+    1:         self.assertEqual(conds["freshness"][0]["condition"], "stale")
+    1:         self.assertGreater(conds["freshness"][0]["current_value"], 24.0)
+    1:         self.assertEqual(len(conds["source"]), 1)
+    1:         self.assertEqual(conds["source"][0]["condition"], "sync_failed")
+    1:         self.assertEqual(conds["source"][0]["severity"], "CRITICAL")
+    3:         quality = [c for c in conds["quality"] if c["condition"] == "low_quality"]
+    1:         self.assertEqual(len(quality), 1)
+    1:         self.assertEqual(quality[0]["current_value"], 80.0)
+    1:         self.assertEqual(quality[0]["import_id"], self.imp_id)
+       
+    1:     def test_insight_conversion_detector(self):
+    1:         insights = self._conditions()["insight"]
+    1:         self.assertEqual(len(insights), 1)
+    1:         self.assertEqual(insights[0]["analysis_id"], "RA-2026-9001")
+    1:         self.assertEqual(insights[0]["entity_id"], "RB1")
+       
+       
+    2: class MonitoringEngineTests(unittest.TestCase):
+    1:     def setUp(self):
+   11:         self._tmp = tempfile.TemporaryDirectory()
+   11:         self.db_path = Path(self._tmp.name) / "mon2.db"
+   11:         self.addCleanup(self._tmp.cleanup)
+   33:         for name in ("RATIONRIGHT_LLM_ENABLED", "OPENAI_API_KEY"):
+   22:             os.environ.pop(name, None)
+   11:         self.conn = db.open_db(self.db_path)
+   11:         self.imp_id = _seed(self.conn, stale_source=True, failed_source=True)
+   11:         self.conn.close()
+       
+    1:     def _alerts(self, **filters):
+   50:         return monitoring.list_alerts_view(db_path=self.db_path, per_page=100,
+   25:                                            **filters)
+       
+    1:     def test_run_creates_deduped_alerts(self):
+    1:         r1 = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertGreaterEqual(r1["created"], 6)  # inv x2 + failure + quiet +
+               # drop + freshness + source + quality + insight
+    1:         self.assertEqual(r1["resolved"], 0)
+    1:         total1 = self._alerts()["total"]
+               # second run: nothing new, everything refreshed
+    1:         r2 = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertEqual(r2["created"], 0)
+    1:         self.assertEqual(r2["updated"], total1)
+    1:         self.assertEqual(self._alerts()["total"], total1)
+       
+    1:     def test_ai_explanation_deterministic_fallback(self):
+               # No LLM configured -> every alert carries a deterministic explanation.
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         alerts = self._alerts()["alerts"]
+   21:         self.assertTrue(all(a["ai_explanation"] and
+    9:                             a["ai_explanation"]["generated_by"] == "deterministic_fallback"
+   10:                             for a in alerts))
+   11:         self.assertTrue(all(a["ai_explanation"]["summary"] for a in alerts))
+       
+    1:     def test_ai_explanation_injected_generator_and_failure(self):
+    1:         calls = []
+    1:         def fake_gen(kind, context, fallback):
+    9:             calls.append(kind)
+    9:             return "AI explanation for %s." % context["alert_type"]
+    1:         monitoring.run_monitoring(db_path=self.db_path, generator=fake_gen)
+    1:         self.assertIn("alert_explanation", calls)
+    1:         alerts = self._alerts()["alerts"]
+   21:         self.assertTrue(all(a["ai_explanation"]["generated_by"] == "llm"
+   10:                             for a in alerts))
+               # a throwing generator must not break monitoring
+    2:         r = monitoring.run_monitoring(
+    1:             db_path=self.db_path,
+    1:             generator=lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    1:         self.assertIn("created", r)
+       
+    1:     def test_auto_resolution_when_condition_clears(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+                   # fix the inventory: FPS1 gets plenty of stock
+    2:             conn.execute(
+    1:                 "UPDATE inventory SET current_stock = 9000, "
+                       "reorder_threshold = 500 WHERE commodity = 'rice' "
+                       "AND fps_center_id = (SELECT id FROM fps_centers WHERE fps_code='FPS1')")
+                   # fix the source failure + freshness
+    2:             conn.execute(
+    1:                 "UPDATE data_sources SET status = 'ACTIVE', last_error = NULL, "
+                       "last_successful_sync_at = :now",
+    1:                 {"now": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+    1:             conn.commit()
+               finally:
+    1:             conn.close()
+    1:         r = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertGreaterEqual(r["resolved"], 3)  # critical + below_reorder + sync
+    6:         resolved = [a for a in self._alerts(status="RESOLVED")["alerts"]]
+    6:         self.assertTrue(all(a["resolved_at"] for a in resolved))
+       
+    1:     def test_lifecycle_acknowledge_resolve_dismiss(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         alert = self._alerts(status="OPEN")["alerts"][0]
+    1:         aid = alert["alert_id"]
+    2:         self.assertTrue(monitoring.set_alert_status_view(
+    1:             aid, "ACKNOWLEDGED", db_path=self.db_path))
+    1:         detail = monitoring.alert_detail_view(aid, db_path=self.db_path)
+    1:         self.assertEqual(detail["status"], "ACKNOWLEDGED")
+    1:         self.assertTrue(detail["acknowledged_at"])
+    2:         self.assertTrue(monitoring.set_alert_status_view(
+    1:             aid, "RESOLVED", db_path=self.db_path))
+    1:         detail = monitoring.alert_detail_view(aid, db_path=self.db_path)
+    1:         self.assertEqual(detail["status"], "RESOLVED")
+    1:         self.assertTrue(detail["resolved_at"])
+               # dismiss with reason preserves the row
+    1:         alert2 = self._alerts(status="OPEN")["alerts"][0]
+    2:         self.assertTrue(monitoring.set_alert_status_view(
+    1:             alert2["alert_id"], "DISMISSED", dismissed_reason="False positive",
+    1:             db_path=self.db_path))
+    1:         detail = monitoring.alert_detail_view(alert2["alert_id"], db_path=self.db_path)
+    1:         self.assertEqual(detail["status"], "DISMISSED")
+    1:         self.assertEqual(detail["dismissed_reason"], "False positive")
+    1:         self.assertEqual(self._alerts()["total"], 9)  # nothing deleted
+       
+    1:     def test_dismissed_condition_is_not_recreated_while_persistent(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         total = self._alerts()["total"]
+    1:         open_alert = self._alerts(status="OPEN")["alerts"][0]
+    2:         monitoring.set_alert_status_view(open_alert["alert_id"], "DISMISSED",
+    1:                                          db_path=self.db_path)
+               # same condition persists -> monitoring must NOT recreate it
+    1:         r = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertEqual(r["created"], 0)
+    1:         self.assertEqual(self._alerts()["total"], total)
+    3:         self.assertIsNone(monitoring.alert_detail_view(
+    2:             open_alert["alert_id"], db_path=self.db_path).get("resolved_at"))
+       
+    1:     def test_resolved_condition_recurs_creates_new_alert(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         open_alert = self._alerts(status="OPEN")["alerts"][0]
+    2:         monitoring.set_alert_status_view(open_alert["alert_id"], "RESOLVED",
+    1:                                          db_path=self.db_path)
+    1:         r = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertEqual(r["created"], 1)  # the resolved condition is active again
+    1:         self.assertEqual(self._alerts(status="OPEN")["total"], 9)
+    1:         self.assertEqual(self._alerts(status="RESOLVED")["total"], 1)
+       
+    1:     def test_no_source_data_mutation(self):
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             before = {
+    1:                 "tx": conn.execute("SELECT COUNT(*), SUM(quantity) FROM "
+                                          "ration_transactions").fetchone(),
+    1:                 "inv": conn.execute("SELECT COUNT(*), SUM(current_stock) FROM "
+                                           "inventory").fetchone(),
+    1:                 "ben": conn.execute("SELECT COUNT(*) FROM beneficiaries").fetchone(),
+    1:                 "imp": conn.execute("SELECT COUNT(*), SUM(successful_records) FROM "
+                                           "data_imports").fetchone(),
+    1:                 "src": conn.execute("SELECT COUNT(*) FROM data_sources").fetchone(),
+                   }
+               finally:
+    1:             conn.close()
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             after = {
+    1:                 "tx": conn.execute("SELECT COUNT(*), SUM(quantity) FROM "
+                                          "ration_transactions").fetchone(),
+    1:                 "inv": conn.execute("SELECT COUNT(*), SUM(current_stock) FROM "
+                                           "inventory").fetchone(),
+    1:                 "ben": conn.execute("SELECT COUNT(*) FROM beneficiaries").fetchone(),
+    1:                 "imp": conn.execute("SELECT COUNT(*), SUM(successful_records) FROM "
+                                           "data_imports").fetchone(),
+    1:                 "src": conn.execute("SELECT COUNT(*) FROM data_sources").fetchone(),
+                   }
+               finally:
+    1:             conn.close()
+    6:         for key in before:
+   10:             self.assertEqual(tuple(before[key]), tuple(after[key]),
+    5:                              "%s mutated by monitoring" % key)
+       
+    1:     def test_filters_search_pagination_trend(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertEqual(self._alerts(severity="CRITICAL")["total"], 2)  # sync failure + critical coverage
+    1:         self.assertEqual(self._alerts(rule_type="SOURCE_FAILURE")["total"], 1)
+    2:         self.assertEqual(self._alerts(status="OPEN")["total"],
+    1:                          self._alerts()["total"])
+    1:         q = self._alerts(q="FPS1")["total"]
+    1:         self.assertGreaterEqual(q, 2)  # inventory alerts reference FPS1
+    1:         self.assertEqual(self._alerts(rule_type="DEMAND_DROP")["total"], 1)
+    1:         self.assertGreaterEqual(self._alerts(q="rice")["total"], 1)
+    1:         page = monitoring.list_alerts_view(db_path=self.db_path, page=1, per_page=2)
+    1:         self.assertEqual(len(page["alerts"]), 2)
+    1:         self.assertGreater(page["pages"], 1)
+    1:         trend = monitoring.alert_trend(db_path=self.db_path, days=7)
+    1:         self.assertGreaterEqual(trend["total"], 9)
+    1:         self.assertEqual(len(trend["series"]), 7)
+       
+    1:     def test_detail_lineage(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         quality = self._alerts(rule_type="DATA_QUALITY")["alerts"][0]
+    1:         detail = monitoring.alert_detail_view(quality["alert_id"], db_path=self.db_path)
+    1:         self.assertIn("import", detail["lineage"])
+    2:         self.assertEqual(detail["lineage"]["import"]["dataset_name"],
+    1:                          "pds_fixture_%d" % (_SEED_COUNTER[0],))
+    1:         anomaly = self._alerts(rule_type="DISTRIBUTION_ANOMALY")["alerts"][0]
+    1:         detail2 = monitoring.alert_detail_view(anomaly["alert_id"], db_path=self.db_path)
+    1:         self.assertIn("analysis", detail2["lineage"])
+    2:         self.assertEqual(detail2["lineage"]["analysis"]["analysis_id"],
+    1:                          "RA-2026-9001")
+       
+    1:     def test_rule_configuration_changes_behavior(self):
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         rules = monitoring.alert_rules_view(db_path=self.db_path)["rules"]
+   12:         quality_rule = next(r for r in rules
+   10:                             if r["condition"] == "low_quality")
+               # raise the quality threshold above the fixture's 80% -> still alert
+    2:         monitoring.update_rule_view(quality_rule["id"], threshold=75.0,
+    1:                                     db_path=self.db_path)
+    1:         monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertEqual(self._alerts(rule_type="DATA_QUALITY")["total"], 1)
+               # disable the rule -> next run resolves the existing alert
+    2:         monitoring.update_rule_view(quality_rule["id"], enabled=False,
+    1:                                     db_path=self.db_path)
+    1:         r = monitoring.run_monitoring(db_path=self.db_path)
+    1:         self.assertGreaterEqual(r["resolved"], 1)
+    4:         self.assertEqual(self._alerts(rule_type="DATA_QUALITY",
+    3:                                       status="OPEN")["total"], 0)
+       
+       
+    2: class AlertApiTests(unittest.TestCase):
+    1:     """API tests run against a THROWAWAY database so they never pollute the
+           demo database (``data/rationright.db``)."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    3:         for name in ("RATIONRIGHT_LLM_ENABLED", "OPENAI_API_KEY"):
+    2:             os.environ.pop(name, None)
+    1:         cls._tmp = tempfile.TemporaryDirectory()
+    1:         cls.db_path = Path(cls._tmp.name) / "api.db"
+    1:         conn = db.open_db(cls.db_path)
+    1:         _seed(conn, stale_source=True, failed_source=True)
+    1:         conn.close()
+    1:         cls.server = make_server("127.0.0.1", 0, db_path=cls.db_path)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = f"{BASE}:{cls.port}"
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+    1:         cls._tmp.cleanup()
+       
+    1:     def request(self, method, path, body=None):
+   11:         data = json.dumps(body).encode("utf-8") if body is not None else None
+   11:         headers = {"Content-Type": "application/json"} if data else {}
+   22:         req = urllib.request.Request(self.base + path, data=data, method=method,
+   11:                                      headers=headers)
+   11:         try:
+   11:             with urllib.request.urlopen(req, timeout=15) as resp:
+    9:                 return resp.status, json.loads(resp.read().decode())
+    2:         except urllib.error.HTTPError as exc:
+    2:             return exc.code, json.loads(exc.read().decode() or "{}")
+       
+    1:     def test_alert_endpoints(self):
+    1:         status, payload = self.request("POST", "/api/monitoring/run", {})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("created", payload)
+    1:         status, summary = self.request("GET", "/api/alerts/summary")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("total_active", summary)
+    1:         status, trend = self.request("GET", "/api/alerts/trend?days=7")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(len(trend["series"]), 7)
+    1:         status, rules = self.request("GET", "/api/alerts/rules")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertGreaterEqual(len(rules["rules"]), 11)
+    1:         status, listing = self.request("GET", "/api/alerts?per_page=3")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertGreaterEqual(listing["total"], 1)
+    1:         alert = listing["alerts"][0]
+    1:         status, detail = self.request("GET", "/api/alerts/" + alert["alert_id"])
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn("lineage", detail)
+               # lifecycle through the API
+    2:         status, ack = self.request(
+    1:             "POST", "/api/alerts/" + alert["alert_id"] + "/acknowledge", {})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(ack["status"], "ACKNOWLEDGED")
+    2:         status, dis = self.request(
+    1:             "POST", "/api/alerts/" + alert["alert_id"] + "/dismiss",
+    1:             {"reason": "False positive"})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertEqual(dis["status"], "DISMISSED")
+               # unknown alert -> 404
+    1:         status, _ = self.request("GET", "/api/alerts/ALT-0000-0000")
+    1:         self.assertEqual(status, 404)
+               # invalid body -> 400
+    1:         status, _ = self.request("POST", "/api/alerts/" + alert["alert_id"] + "/resolve", "not-json")
+    1:         self.assertEqual(status, 400)
+               # rule update
+    1:         rule_id = rules["rules"][0]["id"]
+    2:         status, updated = self.request("POST", "/api/alerts/rules/" + str(rule_id),
+    1:                                        {"enabled": True})
+    1:         self.assertEqual(status, 200)
+    1:         self.assertTrue(updated["enabled"])
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

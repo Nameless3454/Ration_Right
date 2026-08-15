@@ -1,0 +1,459 @@
+    1: """RationRight — ingestion service (Phase 3 + Phase 4).
+       
+       Coordinates the multi-step import flow behind the API:
+       
+           handle_upload  -> save temp file, sniff type, parse, auto-map, preview
+           validate_step  -> apply user mapping/dataset type/sheet, validate, dedup,
+                             quality score, duplicate classification, normalized preview
+           confirm_step   -> idempotency check (file hash), import into the database,
+                             clean up the temp file
+           import_history / import_status -> DataImport provenance queries
+       
+       Phase 4 additions
+       -----------------
+       - The uploaded bytes are hashed (SHA-256) at upload time. If the exact same
+         file has already been imported, validation reports it and confirm refuses
+         to import again — the user is pointed at the existing DataImport instead.
+       - The validate response now includes the deterministic quality score, the
+         EXACT/POSSIBLE duplicate classification, warning examples, and a
+         normalized preview (original vs normalized values).
+       
+       Security model
+       --------------
+       - The user-supplied filename is used ONLY for extension detection — never as
+         a filesystem path (no path traversal possible).
+       - Uploaded bytes go to a private temp directory via ``tempfile`` with a
+         random token name; the file is deleted after the import (or when the
+         pending entry expires), never served publicly, and never executed.
+       - Size is capped (``RATIONRIGHT_MAX_UPLOAD_MB``, default 10 MB).
+       - No secrets, environment variables, or raw file contents are logged.
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import hashlib
+    1: import logging
+    1: import secrets
+    1: import tempfile
+    1: import threading
+    1: import time
+    1: from pathlib import Path
+       
+    1: from database import DEFAULT_DB_PATH, get_import_by_hash, open_db
+    1: from ingestion import mapping as mapmod
+    1: from ingestion import validation
+    1: from ingestion.importer import UPLOADED_SOURCE_NAME, run_import
+    1: from ingestion.mapping import MappingError
+    1: from ingestion.parsers import (
+           FileTooLargeError,
+           ParseError,
+           get_max_rows,
+           get_max_upload_bytes,
+           parse_file,
+           sniff_file_type,
+           verify_magic_bytes,
+       )
+       
+    1: logger = logging.getLogger("rationright.ingestion")
+       
+    1: PENDING_TTL_SECONDS = 30 * 60  # stale pending uploads expire after 30 minutes
+    1: PREVIEW_ROWS = 20
+       
+    1: _PENDING = {}          # token -> entry dict
+    1: _PENDING_LOCK = threading.Lock()
+       
+       
+    2: class NotFoundError(Exception):
+    1:     """Raised when a pending upload token or import id does not exist."""
+       
+       
+    2: class _Entry:
+    1:     def __init__(self, token, temp_path, file_name, file_type, dataset_name,
+                        headers, rows, sheets, warnings, dataset_type, mapping,
+                        file_hash, created_at):
+   43:         self.token = token
+   43:         self.temp_path = temp_path
+   43:         self.file_name = file_name
+   43:         self.file_type = file_type
+   43:         self.dataset_name = dataset_name
+   43:         self.headers = headers
+   43:         self.rows = rows
+   43:         self.sheets = sheets
+   43:         self.warnings = warnings
+   43:         self.dataset_type = dataset_type
+   43:         self.mapping = mapping          # list of {"external", "internal"}
+   43:         self.sheet = None
+   43:         self.file_hash = file_hash      # SHA-256 of the uploaded bytes
+   43:         self.created_at = created_at
+       
+       
+       # ---------------------------------------------------------------------------
+       # Upload
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def handle_upload(data: bytes, filename: str, content_type: str = "") -> dict:
+           """Accept an uploaded file, store it safely, and prepare the import flow.
+       
+           Returns the detected file info, inferred dataset type, auto mapping,
+           sheet list, preview rows, and warnings. No database writes happen here.
+           """
+   52:     if len(data) > get_max_upload_bytes():
+    2:         raise FileTooLargeError(
+    2:             "File too large. Maximum upload size is %d MB."
+    1:             % (get_max_upload_bytes() // (1024 * 1024))
+               )
+   51:     file_type = sniff_file_type(filename, content_type)
+   47:     verify_magic_bytes(file_type, data)
+       
+   46:     token = secrets.token_hex(8)
+   46:     file_hash = hashlib.sha256(data).hexdigest()
+   46:     upload_dir = _upload_dir()
+   46:     temp_path = upload_dir / ("up_%s.%s" % (token, file_type))
+   46:     with open(temp_path, "wb") as fh:
+   46:         fh.write(data)
+       
+   46:     try:
+   46:         parsed = parse_file(temp_path, file_type)
+    3:     except ParseError:
+    3:         _safe_unlink(temp_path)
+    3:         raise
+       
+   43:     headers = parsed["headers"]
+   43:     rows = parsed["rows"]
+   43:     sheets = parsed["sheets"]
+   43:     warnings = list(parsed.get("warnings", []))
+   43:     dataset_type = mapmod.infer_dataset_type(headers)
+   43:     auto = mapmod.detect_mapping(headers, dataset_type)
+   43:     warnings.extend(auto["warnings"])
+       
+   43:     dataset_name = _default_dataset_name(filename)
+   86:     entry = _Entry(
+   43:         token=token, temp_path=temp_path, file_name=filename,
+   43:         file_type=file_type, dataset_name=dataset_name, headers=headers,
+   43:         rows=rows, sheets=sheets, warnings=warnings,
+   43:         dataset_type=dataset_type, mapping=auto["mapping"],
+   43:         file_hash=file_hash, created_at=time.time(),
+           )
+   43:     with _PENDING_LOCK:
+   43:         _purge_stale_locked()
+   43:         _PENDING[token] = entry
+       
+   86:     logger.info(
+   43:         "[Ingestion] Upload %s: %s (%s), %d record(s), type=%s",
+   43:         token, filename, file_type, len(rows), dataset_type,
+           )
+   43:     return {
+   43:         "token": token,
+   43:         "file_name": filename,
+   43:         "file_type": file_type,
+   43:         "dataset_name": dataset_name,
+   43:         "record_count": len(rows),
+   43:         "detected_columns": headers,
+   43:         "sheets": sheets,
+   43:         "dataset_type": dataset_type,
+   43:         "dataset_type_label": mapmod.DATASET_TYPE_LABELS[dataset_type],
+   43:         "mapping": auto["mapping"],
+   43:         "missing_required": auto["missing_required"],
+   43:         "warnings": warnings,
+   43:         "preview": _preview(headers, rows),
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Validate (mapping + validation + duplicates + preview)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def validate_step(
+           token: str,
+           *,
+    1:     dataset_type: str = None,
+    1:     mapping: dict = None,
+    1:     sheet: str = None,
+    1:     db_path=DEFAULT_DB_PATH,
+       ) -> dict:
+           """Apply the user's mapping/dataset type/sheet and validate every record.
+       
+           ``mapping`` is an optional dict of ``external header -> internal field``
+           overrides; when omitted the stored auto mapping is used. Stores the
+           confirmed choices on the pending entry so confirm_step uses them.
+           Returns a full validation report (counts, errors, duplicates, preview).
+           """
+   42:     entry = _get_entry(token)
+   41:     if len(entry.rows) > get_max_rows():
+               raise FileTooLargeError(
+                   "The file contains %d rows, exceeding the configured limit of %d. "
+                   "Set RATIONRIGHT_MAX_ROWS to raise the limit."
+                   % (len(entry.rows), get_max_rows())
+               )
+   41:     if dataset_type:
+   41:         if dataset_type not in mapmod.DATASET_TYPES:
+                   raise MappingError(
+                       "Unknown dataset type %r. Supported: %s"
+                       % (dataset_type, ", ".join(mapmod.DATASET_TYPES))
+                   )
+   41:         entry.dataset_type = dataset_type
+   41:     if sheet is not None and entry.sheet != sheet:
+               parsed = parse_file(entry.temp_path, entry.file_type, sheet=sheet)
+               entry.headers = parsed["headers"]
+               entry.rows = parsed["rows"]
+               entry.sheets = parsed.get("sheets", entry.sheets)
+               entry.sheet = sheet
+               entry.warnings = list(parsed.get("warnings", []))
+       
+   41:     mapping_list = _apply_mapping_overrides(entry, mapping)
+   41:     missing = mapmod.validate_mapping(mapping_list, entry.dataset_type)
+   40:     if missing:
+    1:         raise MappingError(" ".join(missing))
+       
+   39:     mapping_dict = mapmod.mapping_to_dict(mapping_list)
+   78:     summary = validation.summarize(
+   39:         entry.rows, entry.dataset_type, entry.headers, mapping_dict
+           )
+   78:     duplicates = validation.classify_duplicates(
+   39:         entry.rows, entry.dataset_type, entry.headers, mapping_dict
+           )
+   78:     quality = validation.quality_report(
+   39:         total=len(entry.rows),
+   39:         invalid=summary["invalid_records"],
+   39:         duplicates=duplicates["exact"] + duplicates["possible"],
+   39:         warnings=summary["warning_count"],
+           )
+  368:     mapped_columns = [
+  251:         {"external": m["external"], "internal": m["internal"]}
+  290:         for m in mapping_list
+           ]
+   39:     already = _already_imported(entry, db_path)
+   39:     return {
+   39:         "token": token,
+   39:         "file_name": entry.file_name,
+   39:         "file_type": entry.file_type,
+   39:         "dataset_name": entry.dataset_name,
+   39:         "dataset_type": entry.dataset_type,
+   39:         "dataset_type_label": mapmod.DATASET_TYPE_LABELS[entry.dataset_type],
+   39:         "sheets": entry.sheets,
+   39:         "sheet": entry.sheet,
+   39:         "detected_columns": entry.headers,
+   39:         "mapped_columns": mapped_columns,
+  270:         "required_fields": [
+  153:             {"field": f, "label": mapmod.field_label(f)}
+  192:             for f in mapmod.required_fields(entry.dataset_type)
+               ],
+   39:         "record_count": summary["total_records"],
+   39:         "valid_records": summary["valid_records"],
+   39:         "invalid_records": summary["invalid_records"],
+   39:         "duplicate_records": duplicates["exact"] + duplicates["possible"],
+   39:         "duplicates": duplicates,
+   39:         "warning_count": summary["warning_count"],
+   39:         "errors": summary["errors"],
+   39:         "warnings": entry.warnings,
+   39:         "warning_examples": summary["warnings"],
+   39:         "preview": _preview(entry.headers, entry.rows),
+   39:         "preview_normalized": summary["preview_normalized"],
+   39:         "quality": quality,
+   39:         "already_imported": already,
+           }
+       
+       
+       # ---------------------------------------------------------------------------
+       # Confirm (import)
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def confirm_step(token: str, *, db_path=DEFAULT_DB_PATH) -> dict:
+           """Run the confirmed import and clean up the temporary file.
+       
+           Idempotency: if the exact same file (SHA-256) has already been imported,
+           no new records are written — the existing DataImport is returned instead.
+           """
+   40:     entry = _get_entry(token)
+   39:     mapping_list = entry.mapping
+   39:     missing = mapmod.validate_mapping(mapping_list, entry.dataset_type)
+   39:     if missing:
+               raise MappingError(" ".join(missing))
+   39:     mapping_dict = mapmod.mapping_to_dict(mapping_list)
+       
+   39:     already = _already_imported(entry, db_path)
+   39:     if already:
+    2:         _drop_entry(token)
+    2:         return {
+    2:             "status": "ALREADY_IMPORTED",
+    2:             "message": "This dataset appears to have already been imported.",
+    2:             "existing_import": already,
+               }
+       
+   37:     conn = open_db(db_path)
+   37:     try:
+   74:         summary = run_import(
+   37:             conn,
+   37:             file_name=entry.file_name,
+   37:             file_type=entry.file_type,
+   37:             dataset_name=entry.dataset_name,
+   37:             source_name=UPLOADED_SOURCE_NAME,
+   37:             dataset_type=entry.dataset_type,
+   37:             headers=entry.headers,
+   37:             rows=entry.rows,
+   37:             mapping=mapping_dict,
+   37:             file_hash=entry.file_hash,
+               )
+    1:     except Exception:
+               # Phase 14: a critical failure must not leave a half-imported dataset.
+               # Everything (import row, beneficiaries, FPS, transactions, inventory)
+               # is written in one transaction, so roll back and surface a clean error.
+    1:         try:
+    1:             conn.rollback()
+               except Exception:  # noqa: BLE001
+                   pass
+    1:         raise
+           finally:
+   36:         conn.close()
+       
+   36:     _drop_entry(token)
+   36:     return summary
+       
+       
+       # ---------------------------------------------------------------------------
+       # History / status
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def import_history(db_path=DEFAULT_DB_PATH) -> list:
+    2:     conn = open_db(db_path)
+    2:     try:
+    4:         rows = conn.execute(
+    2:             "SELECT i.id, i.dataset_name, i.file_name, i.file_type, i.record_count, "
+                   " i.successful_records, i.failed_records, i.duplicate_records, i.status, "
+                   " i.error_summary, i.started_at, i.completed_at, i.created_at, "
+                   " s.name AS source_name, s.type AS source_type "
+                   "FROM data_imports i JOIN data_sources s ON s.id = i.data_source_id "
+                   "ORDER BY i.id DESC"
+               ).fetchall()
+    8:         return [dict(row) for row in rows]
+           finally:
+    2:         conn.close()
+       
+       
+    1: def import_status(import_id: int, *, db_path=DEFAULT_DB_PATH) -> dict:
+    2:     conn = open_db(db_path)
+    2:     try:
+    4:         row = conn.execute(
+    2:             "SELECT i.id, i.dataset_name, i.file_name, i.file_type, i.record_count, "
+                   " i.successful_records, i.failed_records, i.duplicate_records, i.status, "
+                   " i.error_summary, i.started_at, i.completed_at, i.created_at, "
+                   " s.name AS source_name, s.type AS source_type "
+                   "FROM data_imports i JOIN data_sources s ON s.id = i.data_source_id "
+                   "WHERE i.id = :id",
+    2:             {"id": import_id},
+               ).fetchone()
+           finally:
+    2:         conn.close()
+    2:     if row is None:
+               raise NotFoundError("Import %s was not found." % import_id)
+    2:     return dict(row)
+       
+       
+       # ---------------------------------------------------------------------------
+       # Internals
+       # ---------------------------------------------------------------------------
+       
+       
+    1: def _upload_dir() -> Path:
+   46:     base = Path(tempfile.gettempdir()) / "rationright_uploads"
+   46:     base.mkdir(parents=True, exist_ok=True)
+   46:     return base
+       
+       
+    1: def _safe_unlink(path) -> None:
+   44:     try:
+   44:         Path(path).unlink(missing_ok=True)
+           except OSError:
+               logger.warning("Could not remove temp file %s", path)
+       
+       
+    1: def _default_dataset_name(filename: str) -> str:
+   43:     stem = Path(filename).stem.strip() or "uploaded_dataset"
+   43:     return stem[:120]
+       
+       
+    1: def _get_entry(token: str) -> _Entry:
+   82:     with _PENDING_LOCK:
+   82:         _purge_stale_locked()
+   82:         entry = _PENDING.get(token)
+   82:     if entry is None:
+    4:         raise NotFoundError(
+    2:             "This upload session has expired or does not exist. Please upload the file again."
+               )
+   80:     return entry
+       
+       
+    1: def _drop_entry(token: str) -> None:
+   55:     with _PENDING_LOCK:
+   55:         entry = _PENDING.pop(token, None)
+   55:     if entry is not None:
+   41:         _safe_unlink(entry.temp_path)
+       
+       
+    1: def _purge_stale_locked() -> None:
+  125:     now = time.time()
+  579:     stale = [
+  329:         token for token, entry in _PENDING.items()
+  204:         if now - entry.created_at > PENDING_TTL_SECONDS
+           ]
+  125:     for token in stale:
+               entry = _PENDING.pop(token, None)
+               if entry is not None:
+                   _safe_unlink(entry.temp_path)
+       
+       
+    1: def _apply_mapping_overrides(entry: _Entry, overrides: dict) -> list:
+           """Merge user overrides ({external header -> internal field}) into the
+           stored mapping list. Returns the resulting list (also stored)."""
+   41:     mapping_list = []
+  302:     for item in entry.mapping:
+  261:         external = item["external"]
+  261:         internal = item["internal"]
+  261:         if isinstance(overrides, dict) and external in overrides:
+                   value = overrides[external]
+                   internal = None if value in (None, "", "ignore") else value
+  261:         mapping_list.append({"external": external, "internal": internal})
+   41:     entry.mapping = mapping_list
+   41:     return mapping_list
+       
+       
+    1: def _preview(headers: list, rows: list) -> dict:
+   82:     return {
+   82:         "headers": headers,
+   82:         "rows": rows[:PREVIEW_ROWS],
+   82:         "shown": min(PREVIEW_ROWS, len(rows)),
+   82:         "total": len(rows),
+           }
+       
+       
+    1: def _already_imported(entry: _Entry, db_path) -> dict:
+           """Look up an existing COMPLETED/PARTIAL import with the same file hash.
+       
+           Returns a compact provenance dict (or None) so the UI can show
+           "This dataset appears to have already been imported" with a link to the
+           existing import instead of duplicating records.
+           """
+   78:     if not entry.file_hash:
+               return None
+   78:     conn = open_db(db_path)
+   78:     try:
+   78:         row = get_import_by_hash(conn, entry.file_hash)
+           finally:
+   78:         conn.close()
+   78:     if row is None:
+   74:         return None
+    4:     return {
+    4:         "data_import_id": row["id"],
+    4:         "dataset_name": row["dataset_name"],
+    4:         "file_name": row["file_name"],
+    4:         "status": row["status"],
+    4:         "record_count": row["record_count"],
+    4:         "imported": row["successful_records"],
+    4:         "duplicates": row["duplicate_records"],
+    4:         "failed": row["failed_records"],
+    4:         "completed_at": row["completed_at"],
+           }

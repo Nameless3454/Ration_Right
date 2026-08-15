@@ -1,0 +1,13 @@
+{
+  "preloadedSkills": [
+    "mcp-builder",
+    "agent-browser",
+    "writing-plans",
+    "executing-plans",
+    "verification-before-completion",
+    "planning-with-files",
+    "frontend-design",
+    "web-design-guidelines"
+  ],
+  "startupScript": "add s"
+}

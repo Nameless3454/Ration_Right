@@ -1,0 +1,1633 @@
+   37: """RationRight — local API + dashboard server (Phase 7, hardened in Phase 8).
+       
+       Serves the RationRight dashboard and exposes the real multi-agent workflow
+       through a minimal HTTP API. Uses only the Python standard library (no third-
+       party dependencies, no build step, no secrets).
+       
+       Endpoints:
+           GET  /                 -> dashboard (static/index.html)
+           GET  /static/<file>    -> static assets (css/js)
+           GET  /api/health       -> system health check (dataset, agents, config)
+           GET  /api/dataset      -> the synthetic Phase 1 dataset
+           GET  /api/imports      -> Phase 3 import history
+           GET  /api/imports/<id> -> Phase 3 import status
+           GET  /api/analytics/*  -> Phase 5: database-backed dashboard analytics
+           POST /api/analyze      -> run the real workflow, return its result
+           POST /api/upload       -> Phase 3: accept a CSV/XLSX/JSON upload
+           POST /api/uploads/<t>/validate -> Phase 3: map + validate + preview
+           POST /api/uploads/<t>/confirm  -> Phase 3: import into the database
+           OPTIONS /api/analyze   -> CORS preflight
+       
+       Run:
+           python3 server.py [--host 127.0.0.1] [--port 8000]
+                            [--dataset data/synthetic/transactions.json]
+                            [--analyze-delay-ms 0]
+       
+       The dataset is validated at startup: if it is missing or invalid, the server
+       refuses to start with a clear error instead of failing mysteriously on the
+       first request. ``--analyze-delay-ms`` (or the ``RATIONRIGHT_ANALYZE_DELAY_MS``
+       environment variable) adds an artificial delay before running the workflow;
+       it defaults to 0 and is useful for observing the UI loading state with a slow
+       analysis. Results are always real — only the timing is affected.
+       """
+       
+   37: from __future__ import annotations
+       
+   37: import argparse
+   37: import base64
+   37: import hashlib
+   37: import hmac
+   37: import json
+   37: import logging
+   37: import os
+   37: import secrets
+   37: import sys
+   37: import threading
+   37: import time
+   37: import traceback
+   37: import urllib.parse
+   37: import uuid
+   37: from collections import deque
+   37: from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+   37: from pathlib import Path
+       
+   37: PROJECT_ROOT = Path(__file__).resolve().parent
+   37: STATIC_ROOT = (PROJECT_ROOT / "static").resolve()
+   37: if str(PROJECT_ROOT) not in sys.path:
+           sys.path.insert(0, str(PROJECT_ROOT))
+       
+   37: from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst  # noqa: E402
+   37: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator  # noqa: E402
+   37: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder  # noqa: E402
+   37: from agents.agent_4_alert_generator import Agent4AlertGenerator  # noqa: E402
+   37: from agents.env import load_env_file  # noqa: E402
+   37: import analytics  # noqa: E402
+   37: from database import (  # noqa: E402
+           DEFAULT_DB_PATH,
+           list_audit,
+           open_db,
+           record_audit,
+       )
+   37: from ingestion import (  # noqa: E402
+           EmptyDatasetError,
+           FileTooLargeError,
+           MappingError,
+           NotFoundError,
+           ParseError,
+           UnsupportedFileTypeError,
+           confirm_step,
+           handle_upload,
+           import_history,
+           import_status,
+           validate_step,
+       )
+   37: from ingestion.parsers import get_max_upload_bytes  # noqa: E402
+   37: from connectors import (  # noqa: E402
+           get_source_status,
+           list_sources,
+           register_configured_sources,
+           sync_source,
+       )
+   37: from connectors.service import list_source_imports  # noqa: E402
+   37: from data_context import (  # noqa: E402
+           list_agent_datasets,
+           run_workflow_on_dataset,
+           synthetic_dataset_block,
+       )
+   37: import analysis_center  # noqa: E402
+   37: import command_center  # noqa: E402
+   37: import monitoring  # noqa: E402
+   37: import simulation  # noqa: E402
+   37: from pipeline import (  # noqa: E402
+           freshness,
+           pipeline_runs,
+           pipeline_status,
+           quality_panel,
+           record_analysis_run,
+           run_detail,
+           test_connection,
+       )
+   37: from scripts.validate_dataset import (  # noqa: E402
+           DEFAULT_DATASET_PATH,
+           load_dataset,
+           validate_transactions,
+       )
+   37: from workflow import run_workflow  # noqa: E402
+       
+   37: logger = logging.getLogger("rationright.server")
+       
+       # ---------------------------------------------------------------------------
+       # Phase 14 — security configuration (all from environment, never committed)
+       # ---------------------------------------------------------------------------
+       
+       # Opt-in authentication. When set, every /api/* route (except health/ready/
+       # auth) requires a valid session cookie obtained from POST /api/auth/login.
+   37: AUTH_TOKEN = (os.environ.get("RATIONRIGHT_AUTH_TOKEN", "") or "").strip()
+       # Secret used to sign session cookies. Derive from AUTH_TOKEN when unset so a
+       # deployment that only sets the access token still gets signed sessions.
+   37: SESSION_SECRET = (
+   37:     os.environ.get("RATIONRIGHT_SESSION_SECRET", "") or AUTH_TOKEN
+   34:     or "rationright-local-dev-session-secret"
+       )
+   37: SESSION_TTL_SECONDS = 86400
+   37: COOKIE_SECURE = os.environ.get("RATIONRIGHT_COOKIE_SECURE", "0") == "1"
+       # CORS: same-origin by default (no header). To allow specific origins set
+       # RATIONRIGHT_ALLOWED_ORIGINS="https://a.example,https://b.example".
+       # RATIONRIGHT_CORS_ALLOW_ANY=1 restores the permissive dev header.
+  149: ALLOWED_ORIGINS = [o.strip() for o in
+   37:                    os.environ.get("RATIONRIGHT_ALLOWED_ORIGINS", "").split(",")
+   37:                    if o.strip()]
+   37: CORS_ALLOW_ANY = os.environ.get("RATIONRIGHT_CORS_ALLOW_ANY", "0") == "1"
+       
+       # In-memory rate limits for expensive endpoints: (limit, window_seconds).
+       # Generous enough for real use and automated tests; login stays deliberately
+       # tight to slow brute-force attempts.
+   37: RATE_LIMITS = {
+   37:     "/api/analyze": (30, 60),
+   37:     "/api/monitoring/run": (30, 60),
+   37:     "/api/reports": (30, 60),           # POST only
+   37:     "/api/upload": (60, 60),
+   37:     "/api/simulation/run": (60, 60),
+   37:     "/api/auth/login": (5, 60),
+       }
+       
+   37: CSP_HEADER = (
+   37:     "default-src 'self' blob: data:; "
+           "script-src 'self'; "
+           "style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data: blob:; "
+           "connect-src 'self'; "
+           "font-src 'self' data:; "
+           "frame-ancestors 'none'; "
+           "base-uri 'self'; "
+           "form-action 'self'"
+       )
+       
+   37: MIME_TYPES = {
+   37:     ".html": "text/html; charset=utf-8",
+   37:     ".css": "text/css; charset=utf-8",
+   37:     ".js": "text/javascript; charset=utf-8",
+   37:     ".json": "application/json; charset=utf-8",
+   37:     ".svg": "image/svg+xml",
+   37:     ".png": "image/png",
+   37:     ".ico": "image/x-icon",
+       }
+       
+       
+   74: class _RateLimiter:
+   37:     """Minimal in-memory sliding-window rate limiter keyed by client address.
+       
+           Per-server instance (not global) so tests stay isolated. Uses
+           ``time.monotonic`` and a lock; no dependencies.
+           """
+       
+   37:     def __init__(self):
+   48:         self._hits = {}
+   48:         self._lock = threading.Lock()
+       
+   37:     def allow(self, key: str, limit: int, window: int):
+               """Return ``(ok, retry_after_seconds)`` for one request."""
+   47:         now = time.monotonic()
+   47:         with self._lock:
+   47:             bucket = self._hits.setdefault(key, deque())
+   47:             while bucket and now - bucket[0] >= window:
+                       bucket.popleft()
+   47:             if len(bucket) >= limit:
+    3:                 retry = max(1, int(window - (now - bucket[0])))
+    3:                 return False, retry
+   44:             bucket.append(now)
+   44:             return True, 0
+       
+       
+   74: class RationRightHandler(BaseHTTPRequestHandler):
+   37:     """Minimal handler: dashboard, static assets, dataset, and workflow API."""
+       
+   37:     server_version = "RationRight/1.0"
+       
+           # ---------- shared helpers ----------
+       
+   37:     def _cors_headers(self):
+  154:         origin = self.headers.get("Origin", "")
+  154:         if CORS_ALLOW_ANY:
+    1:             self.send_header("Access-Control-Allow-Origin", "*")
+  153:         elif ALLOWED_ORIGINS and origin in ALLOWED_ORIGINS:
+    1:             self.send_header("Access-Control-Allow-Origin", origin)
+    1:             self.send_header("Vary", "Origin")
+               # Otherwise: same-origin only — no CORS header is sent at all.
+       
+   37:     def _security_headers(self):
+  152:         self.send_header("X-Content-Type-Options", "nosniff")
+  152:         self.send_header("Referrer-Policy", "no-referrer")
+  152:         self.send_header("X-Frame-Options", "DENY")
+  152:         self.send_header("Content-Security-Policy", CSP_HEADER)
+       
+   37:     def _send(self, status, body=b"", content_type="application/json; charset=utf-8"):
+  145:         self.send_response(status)
+  145:         self.send_header("Content-Type", content_type)
+  145:         self.send_header("Cache-Control", "no-store")  # API = live DB state, never stale
+  145:         self.send_header("X-Request-ID", getattr(self, "request_id", ""))
+  145:         self._cors_headers()
+  145:         self._security_headers()
+  145:         self.send_header("Content-Length", str(len(body)))
+  145:         self.end_headers()
+  145:         if body:
+  145:             self.wfile.write(body)
+       
+   37:     def _send_json(self, status, payload):
+  195:         if isinstance(payload, dict) and "error" in payload \
+   50:                 and isinstance(payload["error"], dict):
+   10:             payload["error"].setdefault("request_id", getattr(self, "request_id", None))
+  145:         self._send(status, json.dumps(payload, indent=2).encode("utf-8"))
+       
+   37:     def _read_body(self):
+   51:         length = int(self.headers.get("Content-Length") or 0)
+   51:         if length <= 0:
+                   return b""
+   51:         return self.rfile.read(length)
+       
+   37:     def log_message(self, fmt, *args):
+  314:         logger.info("request_id=%s %s - %s",
+  157:                     getattr(self, "request_id", "-"),
+  157:                     self.address_string(), fmt % args)
+       
+           # ---------- auth / sessions (Phase 14, opt-in) ----------
+       
+   37:     def _session_ok(self) -> bool:
+               """True when a valid, unexpired, non-revoked session cookie is present."""
+    6:         cookie = self.headers.get("Cookie", "")
+    6:         revoked = getattr(self.server, "revoked_sessions", set())
+    8:         for part in cookie.split(";"):
+    6:             name, _, value = part.strip().partition("=")
+    6:             if name != "rationai_session":
+    2:                 continue
+    4:             if value in revoked:
+    1:                 return False
+    3:             try:
+    3:                 payload_b64, sig = value.split(".", 1)
+    3:                 payload = base64.urlsafe_b64decode(payload_b64 + "==").decode()
+    3:                 exp_str, _nonce = payload.split(".", 1)
+    6:                 expected = hmac.new(
+    3:                     SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+                       ).hexdigest()
+    3:                 if not hmac.compare_digest(sig, expected):
+    1:                     return False
+    2:                 return int(exp_str) > int(time.time())
+                   except Exception:  # noqa: BLE001
+                       return False
+    2:         return False
+       
+   37:     def _make_session_cookie(self) -> str:
+    2:         exp = int(time.time()) + SESSION_TTL_SECONDS
+    2:         payload = "%d.%s" % (exp, secrets.token_hex(8))
+    4:         sig = hmac.new(SESSION_SECRET.encode(), payload.encode(),
+    2:                        hashlib.sha256).hexdigest()
+    2:         token = base64.urlsafe_b64encode(payload.encode()).decode() + "." + sig
+    2:         flags = "HttpOnly; SameSite=Lax; Path=/; Max-Age=%d" % SESSION_TTL_SECONDS
+    2:         if COOKIE_SECURE:
+                   flags += "; Secure"
+    2:         return "rationai_session=%s; %s" % (token, flags)
+       
+   37:     def _require_auth(self) -> bool:
+               """Enforce auth for /api/* when RATIONRIGHT_AUTH_TOKEN is set."""
+  143:         if not AUTH_TOKEN:
+  137:             return True
+    6:         path = self.path.split("?", 1)[0]
+    6:         public = {"/api/health", "/api/ready", "/api/auth/login",
+                         "/api/auth/status"}
+    6:         if path in public:
+    1:             return True
+    5:         if path.startswith("/api/") and not self._session_ok():
+    6:             self._send_json(401, {"error": {
+    3:                 "code": "UNAUTHORIZED",
+    3:                 "message": "Authentication required. POST /api/auth/login "
+                                   "with the configured access token.",
+                   }})
+    3:             return False
+    2:         return True
+       
+   37:     def _rate_limit(self, limit: int, window: int) -> bool:
+   47:         limiter = getattr(self.server, "rate_limiter", None)
+   47:         if limiter is None:
+                   return True
+   47:         ok, retry = limiter.allow(self.address_string(), limit, window)
+   47:         if not ok:
+    3:             self.send_response(429)
+    3:             self.send_header("Content-Type", "application/json; charset=utf-8")
+    3:             self.send_header("Retry-After", str(retry))
+    3:             self.send_header("X-Request-ID", getattr(self, "request_id", ""))
+    3:             self.send_header("Content-Length", "0")
+    3:             self.end_headers()
+    6:             logger.warning("request_id=%s rate-limited %s %s",
+    3:                            getattr(self, "request_id", "-"),
+    3:                            self.command, self.path)
+   47:         return ok
+       
+           # ---------- GET ----------
+       
+   37:     def do_GET(self):
+   92:         self.request_id = uuid.uuid4().hex[:8]
+   92:         path = self.path.split("?", 1)[0]
+   92:         if not self._require_auth():
+    3:             return
+   89:         if path in ("/", "/index.html"):
+    1:             self._serve_file(STATIC_ROOT / "index.html")
+   88:         elif path.startswith("/static/"):
+    1:             relative = path[len("/static/"):]
+    1:             target = (STATIC_ROOT / relative).resolve()
+    1:             if str(target).startswith(str(STATIC_ROOT) + os.sep):
+    1:                 self._serve_file(target)
+                   else:
+                       self._send_json(404, {"error": "Not found"})
+   87:         elif path == "/api/dataset":
+    2:             try:
+    2:                 dataset = load_dataset(self.server.dataset_path)
+                   except Exception:
+                       logger.error("Failed to load dataset:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Dataset could not be loaded"})
+                       return
+    2:             self._send_json(200, dataset)
+   85:         elif path == "/sample/pds_sample.csv":
+    2:             self._serve_file(Path(__file__).resolve().parent / "data" / "sample" / "pds_sample.csv")
+   83:         elif path == "/api/health":
+    6:             self._send_json(200, build_health(self.server.dataset_path))
+   77:         elif path == "/api/ready":
+    1:             self._handle_ready()
+   76:         elif path == "/api/auth/status":
+    2:             self._send_json(200, {
+    1:                 "auth_enabled": bool(AUTH_TOKEN),
+    1:                 "authenticated": self._session_ok(),
+                   })
+   75:         elif path == "/api/audit":
+    2:             self._handle_audit()
+   73:         elif path == "/api/data-sources":
+    4:             try:
+    4:                 self._send_json(200, {"sources": list_sources(db_path=self.server.db_path)})
+                   except Exception:
+                       logger.error("Data sources failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load data sources"})
+   69:         elif path.startswith("/api/data-sources/"):
+    4:             self._handle_data_source(path)
+   65:         elif path == "/api/datasets":
+    4:             try:
+    4:                 self._send_json(200, {"datasets": list_agent_datasets(db_path=self.server.db_path)})
+                   except Exception:
+                       logger.error("Dataset list failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load available datasets"})
+   61:         elif path == "/api/analysis/types":
+    1:             self._send_json(200, {"types": analysis_center.analysis_type_registry()})
+   60:         elif path == "/api/analysis/precheck":
+                   self._handle_analysis_precheck()
+   60:         elif path == "/api/analysis/history":
+    1:             self._handle_analysis_history(self.path)
+   59:         elif path.startswith("/api/analysis/history/"):
+    2:             self._handle_analysis_detail(path)
+   57:         elif path == "/api/simulation/types":
+    1:             self._send_json(200, {"types": simulation.simulation_type_registry()})
+   56:         elif path == "/api/simulation/entities":
+    1:             self._handle_simulation_entities(self.path)
+   55:         elif path == "/api/simulation/situation":
+    1:             self._handle_simulation_situation(self.path)
+   54:         elif path == "/api/simulation/history":
+    1:             self._handle_simulation_history(self.path)
+   53:         elif path.startswith("/api/simulation/history/"):
+    1:             self._handle_simulation_detail(path)
+   52:         elif path == "/api/alerts/summary":
+    1:             try:
+    1:                 self._send_json(200, monitoring.alert_summary(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Alert summary failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load alert summary"})
+   51:         elif path == "/api/alerts/trend":
+    1:             _, _, query = self.path.partition("?")
+    3:             trend_params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    1:             try:
+    2:                 self._send_json(200, monitoring.alert_trend(
+    1:                     db_path=self.server.db_path,
+    1:                     days=trend_params.get("days", "7") or "7"))
+                   except Exception:
+                       logger.error("Alert trend failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load alert trend"})
+   50:         elif path == "/api/alerts/rules":
+    1:             try:
+    1:                 self._send_json(200, monitoring.alert_rules_view(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Alert rules failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load alert rules"})
+   49:         elif path == "/api/alerts":
+    5:             self._handle_alerts_list(self.path)
+   44:         elif path.startswith("/api/alerts/"):
+    2:             self._handle_alert_detail(path)
+   42:         elif path == "/api/monitoring/status":
+                   try:
+                       self._send_json(200, monitoring.monitoring_status(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Monitoring status failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load monitoring status"})
+   42:         elif path == "/api/imports":
+    1:             try:
+    1:                 self._send_json(200, import_history(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Import history failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load import history"})
+   41:         elif path == "/api/pipeline/status":
+    1:             try:
+    1:                 self._send_json(200, pipeline_status(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Pipeline status failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not compute pipeline status"})
+   40:         elif path == "/api/pipeline/freshness":
+    1:             try:
+    1:                 self._send_json(200, freshness(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Freshness failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not compute data freshness"})
+   39:         elif path == "/api/pipeline/quality":
+                   try:
+                       self._send_json(200, quality_panel(db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Quality panel failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not compute data quality"})
+   39:         elif path.startswith("/api/pipeline/runs/"):
+    2:             self._handle_pipeline_run(path)
+   37:         elif path == "/api/pipeline/runs":
+    2:             self._handle_pipeline_runs(self.path)
+   35:         elif path.startswith("/api/imports/"):
+    1:             self._handle_import_status(path)
+   34:         elif path == "/api/command-center":
+   11:             try:
+   11:                 filters = self._query_filters()
+   33:                 self._send_json(200, command_center.command_center(
+   22:                     db_path=self.server.db_path, **filters))
+    1:             except ValueError as exc:
+    2:                 self._send_json(400, {"error": {
+    1:                     "code": "INVALID_INPUT", "message": str(exc)}})
+                   except Exception:
+                       logger.error("Command center failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load command center"})
+   23:         elif path == "/api/reports":
+    1:             try:
+    2:                 self._send_json(200, command_center.report_history(
+    1:                     db_path=self.server.db_path))
+                   except Exception:
+                       logger.error("Report history failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "Could not load report history"})
+   22:         elif path.startswith("/api/reports/"):
+    3:             rid = path[len("/api/reports/"):]
+    3:             report = command_center.report_detail(rid, db_path=self.server.db_path)
+    3:             if report is None:
+    2:                 self._send_json(404, {"error": "Report not found"})
+    2:                 return
+    1:             payload = report.pop("payload", None) or {}
+    1:             payload["report_id"] = report.get("report_id")
+    1:             payload["created_at"] = report.get("created_at")
+    1:             payload["status"] = report.get("status")
+    1:             self._send_json(200, payload)
+   19:         elif path.startswith("/api/analytics/"):
+   18:             self._handle_analytics(self.path)
+               else:
+    1:             self._send_json(404, {"error": "Not found"})
+       
+   37:     def _serve_file(self, path: Path):
+    4:         if not path.is_file():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    4:         content_type = MIME_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    4:         self.send_response(200)
+    4:         self.send_header("Content-Type", content_type)
+    4:         self.send_header("Cache-Control", "no-store")
+    4:         self.send_header("X-Request-ID", getattr(self, "request_id", ""))
+    4:         self._cors_headers()
+    4:         self._security_headers()
+    4:         self.send_header("Content-Length", str(path.stat().st_size))
+    4:         self.end_headers()
+    4:         self.wfile.write(path.read_bytes())
+       
+           # ---------- POST ----------
+       
+   37:     def do_POST(self):
+   63:         self.request_id = uuid.uuid4().hex[:8]
+   63:         path = self.path.split("?", 1)[0]
+   63:         if path == "/api/auth/login":
+   11:             self._handle_auth_login()
+   11:             return
+   52:         if path == "/api/auth/logout":
+    1:             self._handle_auth_logout()
+    1:             return
+   51:         if not self._require_auth():
+                   return
+   51:         limit = RATE_LIMITS.get(path)
+   51:         if limit and not self._rate_limit(*limit):
+                   return
+   51:         if path == "/api/analyze":
+   18:             self._handle_analyze()
+   33:         elif path.startswith("/api/data-sources/"):
+    5:             self._handle_data_source_post(path)
+   28:         elif path == "/api/analysis/precheck":
+    1:             self._handle_analysis_precheck()
+   27:         elif path == "/api/simulation/run":
+    5:             self._handle_simulation_run()
+   22:         elif path == "/api/monitoring/run":
+    1:             self._handle_monitoring_run()
+   21:         elif path == "/api/reports":
+    1:             self._handle_report_generate()
+   20:         elif path.startswith("/api/alerts/rules/"):
+    1:             self._handle_alert_rule_update(path)
+   19:         elif path.startswith("/api/alerts/"):
+    3:             self._handle_alert_action(path)
+   16:         elif path == "/api/upload":
+   11:             self._handle_upload()
+    5:         elif path.endswith("/validate") and path.startswith("/api/uploads/"):
+    3:             self._handle_validate(path[len("/api/uploads/"):-len("/validate")])
+    2:         elif path.endswith("/confirm") and path.startswith("/api/uploads/"):
+    2:             self._handle_confirm(path[len("/api/uploads/"):-len("/confirm")])
+               else:
+                   self._send_json(404, {"error": "Not found"})
+       
+           # ---------- data sources / external connectors (Phase 7) ----------
+       
+   37:     def _handle_data_source(self, path: str):
+    4:         rest = path[len("/api/data-sources/"):]
+    4:         parts = rest.split("/")
+    4:         try:
+    4:             source_id = int(parts[0])
+               except (TypeError, ValueError):
+                   self._send_json(400, {"error": "data source id must be an integer"})
+                   return
+    4:         try:
+    4:             if len(parts) == 1 or (len(parts) == 2 and parts[1] == "status"):
+    3:                 view = get_source_status(source_id, db_path=self.server.db_path)
+    3:                 if view is None:
+    1:                     self._send_json(404, {"error": "Unknown data source"})
+    1:                     return
+    2:                 self._send_json(200, view)
+    1:             elif len(parts) == 2 and parts[1] == "imports":
+    1:                 imports = list_source_imports(source_id, db_path=self.server.db_path)
+    1:                 if not imports and get_source_status(source_id, db_path=self.server.db_path) is None:
+                           self._send_json(404, {"error": "Unknown data source"})
+                           return
+    1:                 self._send_json(200, {"imports": imports})
+                   else:
+                       self._send_json(404, {"error": "Not found"})
+               except Exception:
+                   logger.error("Data source detail failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load the data source"})
+       
+   37:     def _handle_data_source_post(self, path: str):
+    5:         rest = path[len("/api/data-sources/"):]
+    5:         parts = rest.split("/")
+    5:         if len(parts) != 2:
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    5:         try:
+    5:             source_id = int(parts[0])
+               except (TypeError, ValueError):
+                   self._send_json(400, {"error": "data source id must be an integer"})
+                   return
+    5:         if get_source_status(source_id, db_path=self.server.db_path) is None:
+    2:             self._send_json(404, {"error": "Unknown data source"})
+    2:             return
+    3:         if parts[1] == "sync":
+    3:             try:
+    6:                 summary = sync_source(
+    3:                     source_id,
+    3:                     db_path=self.server.db_path,
+    3:                     request_host=self.headers.get("Host"),
+                       )
+                   except Exception as exc:
+                       logger.error("Sync failed unexpectedly:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "The sync could not be completed: %s" % exc})
+                       return
+    3:             status = 200 if summary.get("status") in ("COMPLETED", "PARTIAL", "UP_TO_DATE") else 502
+    6:             self._audit("source.sync", entity_type="data_source",
+    3:                         entity_id=str(source_id),
+    6:                         detail="status=%s imported=%s"
+    3:                                % (summary.get("status"), summary.get("imported")))
+    3:             self._send_json(status, summary)
+    3:             return
+               if parts[1] == "test":
+                   try:
+                       probe = test_connection(
+                           source_id,
+                           db_path=self.server.db_path,
+                           request_host=self.headers.get("Host"),
+                       )
+                   except Exception as exc:
+                       logger.error("Connection test failed unexpectedly:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "The connection test could not be completed: %s" % exc})
+                       return
+                   status = 200 if probe["status"] == "ok" else (
+                       503 if probe["status"] == "error" else 200)
+                   self._send_json(status, probe)
+                   return
+               self._send_json(404, {"error": "Not found"})
+       
+           # ---------- data ingestion (Phase 3) ----------
+       
+   37:     def _handle_upload(self):
+   11:         try:
+   11:             max_bytes = get_max_upload_bytes()
+               except Exception:  # noqa: BLE001
+                   max_bytes = 10 * 1024 * 1024
+   11:         content_length = int(self.headers.get("Content-Length") or 0)
+   11:         if content_length > max_bytes:
+    4:             self._send_json(413, {
+    4:                 "error": "File too large. Maximum upload size is %d MB."
+    2:                          % (max_bytes // (1024 * 1024))
+                   })
+    2:             return
+    9:         data = self._read_body()
+    9:         filename = self.headers.get("X-Filename") or ""
+    9:         content_type = self.headers.get("Content-Type") or ""
+    9:         try:
+    9:             payload = handle_upload(data, filename, content_type)
+    6:         except UnsupportedFileTypeError as exc:
+    3:             self._send_json(400, {"error": str(exc)})
+    3:             return
+    3:         except FileTooLargeError as exc:
+                   self._send_json(413, {"error": str(exc)})
+                   return
+    3:         except (EmptyDatasetError, ParseError) as exc:
+    3:             self._send_json(400, {"error": str(exc)})
+    3:             return
+               except Exception:  # noqa: BLE001
+                   logger.error("Upload failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "The uploaded file could not be processed"})
+                   return
+    3:         self._send_json(200, payload)
+       
+   37:     def _handle_validate(self, token: str):
+    3:         body = self._read_json_body()
+    3:         if body is None:
+                   return
+    3:         try:
+    6:             payload = validate_step(
+    3:                 token,
+    3:                 dataset_type=body.get("dataset_type"),
+    3:                 mapping=body.get("mapping"),
+    3:                 sheet=body.get("sheet"),
+    3:                 db_path=self.server.db_path,
+                   )
+    2:         except NotFoundError as exc:
+    1:             self._send_json(404, {"error": str(exc)})
+    1:             return
+    1:         except MappingError as exc:
+    1:             self._send_json(400, {"error": str(exc)})
+    1:             return
+               except (EmptyDatasetError, ParseError) as exc:
+                   self._send_json(400, {"error": str(exc)})
+                   return
+               except Exception:  # noqa: BLE001
+                   logger.error("Validation failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "The dataset could not be validated"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_confirm(self, token: str):
+    2:         self._read_json_body()  # optional body; ignore contents
+    2:         try:
+    2:             summary = confirm_step(token, db_path=self.server.db_path)
+    1:         except NotFoundError as exc:
+    1:             self._send_json(404, {"error": str(exc)})
+    1:             return
+               except MappingError as exc:
+                   self._send_json(400, {"error": str(exc)})
+                   return
+               except Exception:  # noqa: BLE001
+                   logger.error("Import failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "The dataset could not be imported"})
+                   return
+    2:         self._audit("import.confirm", entity_type="data_import",
+    1:                     entity_id=str(summary.get("data_import_id") or ""),
+    1:                     detail="status=%s" % (summary.get("status") or ""))
+    1:         self._send_json(200, summary)
+       
+   37:     def _handle_import_status(self, path: str):
+    1:         raw_id = path[len("/api/imports/"):]
+    1:         if not raw_id.isdigit():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    1:         try:
+    1:             payload = import_status(int(raw_id), db_path=self.server.db_path)
+               except NotFoundError as exc:
+                   self._send_json(404, {"error": str(exc)})
+                   return
+               except Exception:  # noqa: BLE001
+                   logger.error("Import status failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load import status"})
+                   return
+    1:         self._send_json(200, payload)
+       
+           # ---------- data pipeline (Phase 8) ----------
+       
+   37:     def _handle_pipeline_runs(self, request_path: str):
+    2:         _, _, query = request_path.partition("?")
+    6:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+       
+    2:         def _int(name, default):
+    4:             try:
+    4:                 return int(params.get(name, default))
+                   except (TypeError, ValueError):
+                       return default
+       
+    2:         def _limit(name, default, low, high):
+    4:             value = _int(name, default)
+    4:             return max(low, min(high, value))
+       
+    2:         source = None
+    2:         raw_source = params.get("source")
+    2:         if raw_source is not None and raw_source != "":
+                   try:
+                       source = int(raw_source)
+                   except (TypeError, ValueError):
+                       self._send_json(400, {"error": "source must be an integer data source id"})
+                       return
+    2:         try:
+    4:             payload = pipeline_runs(
+    2:                 db_path=self.server.db_path,
+    2:                 source=source,
+    2:                 status=params.get("status") or None,
+    2:                 q=params.get("q") or None,
+    2:                 from_date=params.get("from") or None,
+    2:                 to_date=params.get("to") or None,
+    2:                 page=_limit("page", 1, 1, 100000),
+    2:                 per_page=_limit("per_page", 10, 1, 100),
+                   )
+               except Exception:
+                   logger.error("Pipeline runs failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load pipeline runs"})
+                   return
+    2:         self._send_json(200, payload)
+       
+   37:     def _handle_pipeline_run(self, path: str):
+    2:         raw_id = path[len("/api/pipeline/runs/"):]
+    2:         if not raw_id.isdigit():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    2:         try:
+    2:             detail = run_detail(int(raw_id), db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Pipeline run detail failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load the pipeline run"})
+                   return
+    2:         if detail is None:
+    1:             self._send_json(404, {"error": "Unknown import"})
+    1:             return
+    1:         self._send_json(200, detail)
+       
+           # ---------- analysis command center (Phase 9) ----------
+       
+   37:     def _handle_analysis_precheck(self):
+    1:         body = self._read_json_body()
+    1:         if body is None:
+                   return
+    1:         dataset_mode = body.get("dataset", "synthetic")
+    1:         if dataset_mode not in ("synthetic", "real"):
+                   self._send_json(400, {"error": 'Unknown dataset mode. Supported: "synthetic", "real"'})
+                   return
+    1:         data_import_id = body.get("data_import_id")
+    1:         if dataset_mode == "real" and data_import_id is not None:
+                   try:
+                       data_import_id = int(data_import_id)
+                   except (TypeError, ValueError):
+                       self._send_json(400, {"error": "data_import_id must be an integer"})
+                       return
+    1:         try:
+    2:             payload = analysis_center.precheck(
+    1:                 dataset_mode=dataset_mode,
+    1:                 data_import_id=data_import_id,
+    1:                 db_path=self.server.db_path,
+                   )
+               except Exception:
+                   logger.error("Precheck failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not run the analysis precheck"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_analysis_history(self, request_path: str):
+    1:         _, _, query = request_path.partition("?")
+    3:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    1:         try:
+    1:             page = max(1, int(params.get("page", "1")))
+               except (TypeError, ValueError):
+                   page = 1
+    1:         try:
+    1:             per_page = max(1, min(100, int(params.get("per_page", "10"))))
+               except (TypeError, ValueError):
+                   per_page = 10
+    1:         try:
+    2:             payload = analysis_center.analysis_history(
+    1:                 db_path=self.server.db_path, page=page, per_page=per_page)
+               except Exception:
+                   logger.error("Analysis history failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load analysis history"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_analysis_detail(self, path: str):
+    2:         raw_id = path[len("/api/analysis/history/"):]
+    2:         if not raw_id.isdigit():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    2:         try:
+    4:             detail = analysis_center.analysis_detail(
+    2:                 int(raw_id), db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Analysis detail failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load the analysis run"})
+                   return
+    2:         if detail is None:
+    1:             self._send_json(404, {"error": "Unknown analysis run"})
+    1:             return
+    1:         self._send_json(200, detail)
+       
+           # ---------- decision support / what-if simulation (Phase 10) ----------
+       
+   37:     def _simulation_import_id(self, params: dict):
+               """Parse the import id from query params; returns (id, error_json or None)."""
+    2:         raw = params.get("import_id")
+    2:         if not raw:
+                   return None, self._send_json(400, {"error": "import_id is required"})
+    2:         try:
+    2:             return int(raw), None
+               except (TypeError, ValueError):
+                   self._send_json(400, {"error": "import_id must be an integer"})
+                   return None, None
+       
+   37:     def _handle_simulation_entities(self, request_path: str):
+    1:         _, _, query = request_path.partition("?")
+    3:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    1:         import_id, error = self._simulation_import_id(params)
+    1:         if error is not None:
+                   return
+    1:         try:
+    1:             payload = simulation.simulation_entities(import_id, db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Simulation entities failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load simulation entities"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_simulation_situation(self, request_path: str):
+    1:         _, _, query = request_path.partition("?")
+    3:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    1:         import_id, error = self._simulation_import_id(params)
+    1:         if error is not None:
+                   return
+    1:         try:
+    1:             payload = simulation.current_situation(import_id, db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Simulation situation failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not compute the current situation"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_simulation_run(self):
+    5:         body = self._read_json_body()
+    5:         if body is None:
+                   return
+    5:         try:
+    5:             import_id = int(body.get("import_id"))
+    1:         except (TypeError, ValueError):
+    1:             self._send_json(400, {"error": "import_id must be an integer"})
+    1:             return
+    4:         try:
+    8:             result = simulation.run_scenario(
+    4:                 import_id,
+    4:                 commodity=body.get("commodity"),
+    4:                 district=body.get("district") or None,
+    4:                 fps_code=body.get("fps_code") or None,
+    4:                 demand_change_pct=body.get("demand_change_pct") or 0,
+    4:                 supply_delay_days=body.get("supply_delay_days") or 0,
+    4:                 inventory_change_pct=body.get("inventory_change_pct") or 0,
+    4:                 db_path=self.server.db_path,
+                   )
+    2:         except simulation.SimulationError as exc:
+    2:             self._send_json(400, {"error": str(exc)})
+    2:             return
+               except Exception:
+                   logger.error("Simulation failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "The simulation could not be completed"})
+                   return
+    4:         self._audit("simulation.run", entity_type="simulation",
+    2:                     entity_id=result.get("scenario_id"),
+    2:                     detail="type=%s" % (result.get("scenario_type") or ""))
+    2:         self._send_json(200, result)
+       
+   37:     def _handle_simulation_history(self, request_path: str):
+    1:         _, _, query = request_path.partition("?")
+    2:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    1:         try:
+    1:             page = max(1, int(params.get("page", "1")))
+               except (TypeError, ValueError):
+                   page = 1
+    1:         try:
+    1:             per_page = max(1, min(100, int(params.get("per_page", "10"))))
+               except (TypeError, ValueError):
+                   per_page = 10
+    1:         try:
+    2:             payload = simulation.scenario_history(
+    1:                 db_path=self.server.db_path, page=page, per_page=per_page)
+               except Exception:
+                   logger.error("Scenario history failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load scenario history"})
+                   return
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_simulation_detail(self, path: str):
+    1:         raw_id = path[len("/api/simulation/history/"):]
+    1:         if not raw_id.isdigit():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    1:         try:
+    1:             detail = simulation.scenario_detail(int(raw_id), db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Scenario detail failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load the scenario"})
+                   return
+    1:         if detail is None:
+                   self._send_json(404, {"error": "Unknown scenario"})
+                   return
+    1:         self._send_json(200, detail)
+       
+           # ---------- alerts / monitoring (Phase 11) ----------
+       
+   37:     def _handle_alerts_list(self, request_path: str):
+    5:         _, _, query = request_path.partition("?")
+   23:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+    5:         try:
+    5:             page = max(1, int(params.get("page", "1")))
+               except (TypeError, ValueError):
+                   page = 1
+    5:         try:
+    5:             per_page = max(1, min(200, int(params.get("per_page", "20"))))
+               except (TypeError, ValueError):
+                   per_page = 20
+    5:         try:
+   10:             payload = monitoring.list_alerts_view(
+    5:                 db_path=self.server.db_path,
+    5:                 q=params.get("q"),
+    5:                 severity=params.get("severity"),
+    5:                 rule_type=params.get("type"),
+    5:                 status=params.get("status"),
+    5:                 days=params.get("days"),
+    5:                 page=page,
+    5:                 per_page=per_page,
+                   )
+               except Exception:
+                   logger.error("Alert list failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load alerts"})
+                   return
+    5:         self._send_json(200, payload)
+       
+   37:     def _handle_alert_detail(self, path: str):
+    2:         raw_id = path[len("/api/alerts/"):]
+    2:         if not raw_id or "/" in raw_id:
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    2:         try:
+    2:             detail = monitoring.alert_detail_view(raw_id, db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Alert detail failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load the alert"})
+                   return
+    2:         if detail is None:
+    1:             self._send_json(404, {"error": "Unknown alert"})
+    1:             return
+    1:         self._send_json(200, detail)
+       
+   37:     def _handle_monitoring_run(self):
+    1:         try:
+    1:             payload = monitoring.run_monitoring(db_path=self.server.db_path)
+               except Exception:
+                   logger.error("Monitoring run failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Monitoring could not be completed."})
+                   return
+    2:         self._audit("monitoring.run", detail="%d created, %d updated, %d resolved"
+    2:                     % (payload.get("created", 0), payload.get("updated", 0),
+    1:                        payload.get("resolved", 0)))
+    1:         self._send_json(200, payload)
+       
+   37:     def _handle_alert_action(self, path: str):
+    3:         rest = path[len("/api/alerts/"):]
+    3:         parts = rest.split("/")
+    3:         if len(parts) != 2 or not parts[0]:
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    3:         alert_id, action = parts
+    3:         if action not in ("acknowledge", "resolve", "dismiss"):
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    3:         body = self._read_json_body()
+    3:         if body is None:
+    1:             return
+    2:         dismissed_reason = (body.get("reason") or "").strip() or None
+    6:         status = {"acknowledge": "ACKNOWLEDGED",
+    2:                   "resolve": "RESOLVED",
+    4:                   "dismiss": "DISMISSED"}[action]
+    2:         try:
+    4:             changed = monitoring.set_alert_status_view(
+    2:                 alert_id, status, dismissed_reason=dismissed_reason,
+    2:                 db_path=self.server.db_path)
+               except ValueError as exc:
+                   self._send_json(400, {"error": str(exc)})
+                   return
+               except Exception:
+                   logger.error("Alert action failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not update the alert"})
+                   return
+    2:         if not changed:
+                   self._send_json(404, {"error": "Unknown alert"})
+                   return
+    4:         self._audit("alert.%s" % action, entity_type="alert", entity_id=alert_id,
+    2:                     detail="status -> %s" % status)
+    2:         self._send_json(200, {"ok": True, "alert_id": alert_id, "status": status})
+       
+   37:     def _handle_alert_rule_update(self, path: str):
+    1:         raw_id = path[len("/api/alerts/rules/"):]
+    1:         if not raw_id.isdigit():
+                   self._send_json(404, {"error": "Not found"})
+                   return
+    1:         body = self._read_json_body()
+    1:         if body is None:
+                   return
+    1:         try:
+    2:             rule = monitoring.update_rule_view(
+    1:                 int(raw_id),
+    1:                 enabled=body.get("enabled"),
+    1:                 threshold=body.get("threshold"),
+    1:                 db_path=self.server.db_path,
+                   )
+               except ValueError as exc:
+                   self._send_json(400, {"error": str(exc)})
+                   return
+               except Exception:
+                   logger.error("Alert rule update failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not update the alert rule"})
+                   return
+    1:         if rule is None:
+                   self._send_json(404, {"error": "Unknown alert rule"})
+                   return
+    2:         self._audit("alert_rule.update", entity_type="alert_rule",
+    1:                     entity_id=str(raw_id),
+    2:                     detail="enabled=%s threshold=%s" % (rule.get("enabled"),
+    1:                                                          rule.get("threshold")))
+    1:         self._send_json(200, rule)
+       
+           # ---------- command center / reports (Phase 12) ----------
+       
+   37:     def _query_filters(self) -> dict:
+               """Parse validated command-center filters from the query string."""
+   11:         _, _, query = self.path.partition("?")
+   28:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+   11:         allowed = ("state", "district", "fps", "commodity", "trend_range")
+   11:         out = {}
+   66:         for key in allowed:
+   55:             value = (params.get(key) or "").strip()
+   55:             if value:
+    4:                 out[key] = value
+   33:         for src, dst in (("from", "from_date"), ("to", "to_date")):
+   22:             value = (params.get(src) or "").strip()
+   22:             if value:
+    2:                 out[dst] = value
+   11:         return out
+       
+   37:     def _handle_report_generate(self):
+    1:         body = self._read_json_body()
+    1:         if body is None:
+                   return
+    2:         filters = {k: v for k, v in (body.get("filters") or {}).items()
+                          if k in ("state", "district", "fps", "commodity", "from", "to")}
+    1:         try:
+    2:             report = command_center.generate_report(
+    1:                 db_path=self.server.db_path,
+    1:                 period=body.get("period") or None,
+    1:                 source=body.get("source") or None,
+    1:                 filters=filters,
+                   )
+               except Exception:
+                   logger.error("Report generation failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not generate the report"})
+                   return
+    2:         self._audit("report.generate", entity_type="report",
+    1:                     entity_id=report.get("report_id"),
+    1:                     detail="period=%s" % (report.get("period") or ""))
+    1:         self._send_json(200, report)
+       
+           # ---------- analytics (Phase 5, database-backed) ----------
+       
+   37:     def _handle_analytics(self, request_path: str):
+   18:         path, _, query = request_path.partition("?")
+   59:         params = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+       
+   18:         def _get(name, default=None):
+   56:             value = params.get(name)
+   56:             return value if value not in (None, "") else default
+       
+   18:         try:
+   18:             conn = analytics.analytics(db_path=self.server.db_path)
+               except Exception:  # noqa: BLE001
+                   logger.error("Analytics: database unavailable:\n%s", traceback.format_exc())
+                   self._send_json(503, {"error": "Database unavailable."})
+                   return
+   18:         try:
+   18:             try:
+   18:                 payload = self._run_analytics(path, params, _get, conn)
+                   finally:
+   18:                 conn.close()
+    5:         except analytics.AnalyticsError as exc:
+    5:             self._send_json(400, {"error": str(exc)})
+    5:             return
+               except Exception:  # noqa: BLE001
+                   logger.error("Analytics %s failed:\n%s", path, traceback.format_exc())
+                   self._send_json(500, {"error": "Analytics could not be computed."})
+                   return
+   13:         self._send_json(200, payload)
+       
+   37:     def _run_analytics(self, path: str, params: dict, _get, conn):
+   18:         if path == "/api/analytics/overview":
+   18:             return analytics.overview(
+    9:                 conn, range_key=_get("range", "all"),
+    9:                 from_date=_get("from"), to_date=_get("to"),
+                   )
+    9:         if path == "/api/analytics/distribution":
+   10:             return analytics.distribution(
+    5:                 conn, range_key=_get("range", "all"),
+    5:                 granularity=_get("granularity", "day"),
+    5:                 from_date=_get("from"), to_date=_get("to"),
+                   )
+    4:         if path == "/api/analytics/inventory":
+                   return analytics.inventory(conn)
+    4:         if path == "/api/analytics/beneficiaries":
+    2:             return analytics.beneficiaries(
+    1:                 conn, q=_get("q"), state=_get("state"), district=_get("district"),
+    1:                 category=_get("category"), status=_get("status"),
+    1:                 page=int(_get("page", "1")), per_page=int(_get("per_page", "10")),
+    1:                 sort=_get("sort", analytics.BENEFICIARY_DEFAULT_SORT),
+                   )
+    3:         if path.startswith("/api/analytics/beneficiaries/"):
+    1:             ref = urllib.parse.unquote(path[len("/api/analytics/beneficiaries/"):])
+    1:             return analytics.beneficiary_detail(conn, ref)
+    2:         if path == "/api/analytics/fps":
+                   return analytics.fps(conn)
+    2:         if path == "/api/analytics/alerts":
+    2:             return analytics.operational_alerts(
+    1:                 conn, recent_days=int(_get("days", str(analytics.NO_RECENT_DISTRIBUTION_DAYS)))
+                   )
+    1:         if path == "/api/analytics/transactions":
+                   return analytics.transactions(
+                       conn, range_key=_get("range", "all"), status=_get("status"),
+                       page=int(_get("page", "1")), per_page=int(_get("per_page", "10")),
+                       from_date=_get("from"), to_date=_get("to"),
+                   )
+    1:         raise analytics.AnalyticsError("Unknown analytics endpoint.")
+       
+   37:     def _read_json_body(self):
+   24:         raw = self._read_body()
+   24:         body = {}
+   24:         if raw:
+   24:             try:
+   24:                 body = json.loads(raw.decode("utf-8"))
+                   except (ValueError, UnicodeDecodeError):
+                       self._send_json(400, {"error": "Invalid JSON body"})
+                       return None
+   24:         if not isinstance(body, dict):
+    1:             self._send_json(400, {"error": "Request body must be a JSON object"})
+    1:             return None
+   23:         return body
+       
+           # ---------- auth / ready / audit handlers (Phase 14) ----------
+       
+   37:     def _audit(self, action, entity_type=None, entity_id=None, detail=None):
+               """Append an audit entry; never raises, never logs secrets."""
+   28:         try:
+   28:             conn = open_db(self.server.db_path)
+   28:             try:
+   56:                 record_audit(
+   28:                     conn, action=action, entity_type=entity_type,
+   28:                     entity_id=entity_id, detail=detail,
+   28:                     request_id=getattr(self, "request_id", None),
+                       )
+   28:                 conn.commit()
+                   finally:
+   28:                 conn.close()
+               except Exception:  # noqa: BLE001
+                   logger.error("Audit write failed: %s", traceback.format_exc())
+       
+   37:     def _handle_auth_login(self):
+   11:         if not AUTH_TOKEN:
+                   self._send_json(400, {"error": {
+                       "code": "AUTH_DISABLED",
+                       "message": "Authentication is not enabled on this server.",
+                   }})
+                   return
+   11:         limit = RATE_LIMITS["/api/auth/login"]
+   11:         if not self._rate_limit(*limit):
+    3:             return
+    8:         body = self._read_json_body()
+    8:         if body is None:
+                   return
+    8:         token = str(body.get("token") or "").strip()
+    8:         if not hmac.compare_digest(token, AUTH_TOKEN):
+    6:             self._audit("auth.login_failed", detail="invalid access token")
+   12:             self._send_json(401, {"error": {
+    6:                 "code": "INVALID_CREDENTIALS",
+    6:                 "message": "Invalid access token.",
+                   }})
+    6:             return
+    2:         cookie = self._make_session_cookie()
+    2:         self._audit("auth.login", detail="session issued")
+    2:         payload = {"ok": True, "authenticated": True}
+    2:         body_bytes = json.dumps(payload).encode("utf-8")
+    2:         self.send_response(200)
+    2:         self.send_header("Content-Type", "application/json; charset=utf-8")
+    2:         self.send_header("Cache-Control", "no-store")
+    2:         self.send_header("Set-Cookie", cookie)
+    2:         self.send_header("X-Request-ID", getattr(self, "request_id", ""))
+    2:         self._cors_headers()
+    2:         self._security_headers()
+    2:         self.send_header("Content-Length", str(len(body_bytes)))
+    2:         self.end_headers()
+    2:         self.wfile.write(body_bytes)
+       
+   37:     def _handle_auth_logout(self):
+    1:         revoked = getattr(self.server, "revoked_sessions", set())
+    1:         cookie = self.headers.get("Cookie", "")
+    2:         for part in cookie.split(";"):
+    1:             name, _, value = part.strip().partition("=")
+    1:             if name == "rationai_session" and value:
+    1:                 revoked.add(value)
+    1:         self._audit("auth.logout")
+    1:         body_bytes = json.dumps({"ok": True}).encode("utf-8")
+    1:         self.send_response(200)
+    1:         self.send_header("Content-Type", "application/json; charset=utf-8")
+    1:         self.send_header("Cache-Control", "no-store")
+    2:         self.send_header("Set-Cookie",
+    1:                          "rationai_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+    1:         self.send_header("X-Request-ID", getattr(self, "request_id", ""))
+    1:         self._cors_headers()
+    1:         self._security_headers()
+    1:         self.send_header("Content-Length", str(len(body_bytes)))
+    1:         self.end_headers()
+    1:         self.wfile.write(body_bytes)
+       
+   37:     def _handle_ready(self):
+               """Readiness: database writable + AI/provider + connector state."""
+    2:         checks = {"database": "READY", "ai": "NOT_CONFIGURED",
+    1:                   "external_sources": "NOT_CONNECTED"}
+    1:         status = "ok"
+    1:         try:
+    1:             conn = open_db(self.server.db_path)
+    1:             try:
+    1:                 conn.execute("SELECT 1").fetchone()
+                   finally:
+    1:                 conn.close()
+               except Exception:  # noqa: BLE001
+                   checks["database"] = "ERROR"
+                   status = "error"
+    1:         try:
+    1:             from agents.env import llm_enabled  # noqa: E402
+                   checks["ai"] = "CONFIGURED" if llm_enabled() else "NOT_CONFIGURED"
+    1:         except Exception:  # noqa: BLE001
+    1:             pass
+    1:         try:
+    1:             sources = list_sources(db_path=self.server.db_path)
+    3:             if any(s.get("status") == "ACTIVE" for s in sources):
+    1:                 checks["external_sources"] = "CONFIGURED"
+               except Exception:  # noqa: BLE001
+                   pass
+    2:         self._send_json(200 if status == "ok" else 503, {
+    1:             "status": status,
+    1:             "checks": checks,
+    1:             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               })
+       
+   37:     def _handle_audit(self):
+    8:         params = {k: v[0] for k, v in urllib.parse.parse_qs(
+    2:             self.path.partition("?")[2]).items()}
+    2:         try:
+    2:             limit = int(params.get("limit", "50") or "50")
+               except ValueError:
+                   limit = 50
+    2:         if limit < 1 or limit > 500:
+    1:             limit = 50
+    2:         action = (params.get("action") or "").strip() or None
+    2:         entity = (params.get("entity_type") or "").strip() or None
+    2:         try:
+    2:             conn = open_db(self.server.db_path)
+    2:             try:
+    4:                 rows = list_audit(conn, limit=limit, action=action,
+    2:                                   entity_type=entity)
+                   finally:
+    2:                 conn.close()
+               except Exception:  # noqa: BLE001
+                   logger.error("Audit list failed:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "Could not load audit log"})
+                   return
+    2:         self._send_json(200, {"entries": rows, "total": len(rows)})
+       
+   37:     def _handle_analyze(self):
+   18:         raw = self._read_body()
+   18:         body = {}
+   18:         if raw:
+   18:             try:
+   18:                 body = json.loads(raw.decode("utf-8"))
+    1:             except (ValueError, UnicodeDecodeError):
+    1:                 self._send_json(400, {"error": "Invalid JSON body"})
+    1:                 return
+   17:         if not isinstance(body, dict):
+                   self._send_json(400, {"error": "Request body must be a JSON object"})
+                   return
+   17:         dataset_name = body.get("dataset", "synthetic")
+   17:         if dataset_name not in ("synthetic", "real"):
+    4:             self._send_json(400, {
+    2:                 "error": 'Unknown dataset mode. Supported: "synthetic", "real"',
+                   })
+    2:             return
+       
+   15:         import_id = None
+   15:         if dataset_name == "real":
+    5:             import_id = body.get("data_import_id")
+    5:             if import_id is None:
+    4:                 self._send_json(400, {
+    2:                     "error": 'Real-data mode requires "data_import_id" '
+                                    '(see GET /api/datasets for available imports)'
+                       })
+    2:                 return
+    3:             try:
+    3:                 import_id = int(import_id)
+                   except (TypeError, ValueError):
+                       self._send_json(400, {"error": "data_import_id must be an integer"})
+                       return
+       
+               # Phase 9 command center: when analysis types are supplied, route
+               # through analysis_center (real agents + deterministic types + merged
+               # insights + persisted config). Without types, behavior is unchanged.
+   13:         analysis_types = body.get("types")
+   13:         filters = body.get("filters") or {}
+   13:         if not isinstance(filters, dict):
+    1:             self._send_json(400, {"error": "filters must be an object"})
+    1:             return
+   12:         if analysis_types is not None:
+    3:             if not isinstance(analysis_types, list) or not analysis_types:
+                       self._send_json(400, {"error": "types must be a non-empty array of analysis type keys"})
+                       return
+   10:             unknown = [t for t in analysis_types if t not in analysis_center.VALID_ANALYSIS_TYPES]
+    3:             if unknown:
+    2:                 self._send_json(400, {
+    2:                     "error": "Unknown analysis type(s): %s. Supported: %s" % (
+    1:                         ", ".join(map(str, unknown)), ", ".join(sorted(analysis_center.VALID_ANALYSIS_TYPES))),
+                       })
+    1:                 return
+    2:             try:
+    4:                 result = analysis_center.run_analysis(
+    2:                     dataset_mode=dataset_name,
+    2:                     data_import_id=import_id,
+    2:                     types=analysis_types,
+    2:                     filters=filters,
+    2:                     db_path=self.server.db_path,
+                       )
+                   except Exception:
+                       logger.error("Command-center analysis failed:\n%s", traceback.format_exc())
+                       self._send_json(500, {"error": "The analysis could not be completed"})
+                       return
+    2:             if result is None:
+    1:                 self._send_json(404, {"error": "Unknown data_import_id %r" % import_id})
+    1:                 return
+    1:             self._send_json(200, result)
+    1:             return
+       
+    9:         delay_ms = int(os.environ.get("RATIONRIGHT_ANALYZE_DELAY_MS", "0") or "0")
+    9:         if delay_ms > 0:
+                   logger.info("Delaying analysis by %d ms (RATIONRIGHT_ANALYZE_DELAY_MS)", delay_ms)
+                   time.sleep(delay_ms / 1000.0)
+       
+    9:         try:
+    9:             if dataset_name == "real":
+    4:                 result = run_workflow_on_dataset(
+    2:                     import_id, db_path=self.server.db_path
+                       )
+    2:                 if result is None:
+    2:                     self._send_json(404, {
+    1:                         "error": "Unknown data_import_id %r" % import_id,
+                           })
+    1:                     return
+                   else:
+    7:                 transactions = load_dataset(self.server.dataset_path)["transactions"]
+    7:                 logger.info("Running workflow on %d transaction(s)", len(transactions))
+    7:                 result = run_workflow(transactions)
+    7:                 result["dataset"] = synthetic_dataset_block(transactions)
+               except Exception:
+                   logger.error("Unexpected workflow failure:\n%s", traceback.format_exc())
+                   self._send_json(500, {"error": "The analysis workflow failed unexpectedly"})
+                   return
+               # Record durable lineage metadata (Phase 8): the AI insight a judge
+               # sees in the UI now traces back through an analysis run to its
+               # dataset/import/source. The full result is still returned live.
+    8:         try:
+   16:             run = record_analysis_run(
+    8:                 result, dataset_mode=dataset_name,
+    8:                 data_import_id=import_id, db_path=self.server.db_path,
+                   )
+    8:             result["analysis_run"] = run
+   16:             self._audit("analysis.run", entity_type="analysis",
+    8:                         entity_id=run.get("analysis_id") or run.get("id"),
+    8:                         detail="dataset=%s mode=%s" % (dataset_name, import_id))
+               except Exception:  # noqa: BLE001
+                   logger.error("Could not record analysis run:\n%s", traceback.format_exc())
+    8:         self._send_json(200, result)
+       
+           # ---------- CORS preflight ----------
+       
+   37:     def do_OPTIONS(self):
+    2:         self.request_id = uuid.uuid4().hex[:8]
+    2:         self.send_response(204)
+    2:         self._cors_headers()
+    2:         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    2:         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    2:         self.send_header("Access-Control-Max-Age", "600")
+    2:         self.send_header("Content-Length", "0")
+    2:         self.end_headers()
+       
+       
+   37: def build_health(dataset_path=None) -> dict:
+           """Build the system health payload: dataset, agents, and configuration.
+       
+           Never exposes secrets or internal paths beyond the configured dataset name.
+           Each check reports its own status so the UI/CLI can show per-component
+           PASS/FAIL rather than a single opaque boolean.
+           """
+    7:     checks = {}
+    7:     overall = "ok"
+       
+           # Dataset check: must exist, load, and pass the Phase 1 contract validation.
+    7:     try:
+    7:         dataset = load_dataset(dataset_path or DEFAULT_DATASET_PATH)
+    6:         errors = validate_transactions(dataset["transactions"])
+    6:         if errors:
+                   checks["dataset"] = {
+                       "status": "degraded",
+                       "detail": "%d validation error(s)" % len(errors),
+                   }
+                   overall = "degraded"
+               else:
+    6:             checks["dataset"] = {
+    6:                 "status": "ok",
+   12:                 "detail": "%d transaction(s), %d beneficiary(ies)" % (
+    6:                     len(dataset["transactions"]),
+  162:                     len({t["beneficiary_id"] for t in dataset["transactions"]}),
+                       ),
+                   }
+    1:     except Exception as exc:  # noqa: BLE001
+    1:         checks["dataset"] = {"status": "error", "detail": str(exc)}
+    1:         overall = "error"
+       
+           # Agent checks: every agent must import and instantiate.
+    7:     agent_classes = {
+    7:         "agent_1": Agent1TransactionAnalyst,
+    7:         "agent_2": Agent2AnomalyInvestigator,
+    7:         "agent_3": Agent3EvidenceCaseBuilder,
+    7:         "agent_4": Agent4AlertGenerator,
+           }
+   35:     for name, cls in agent_classes.items():
+   28:         try:
+   28:             cls()
+   28:             checks[name] = {"status": "ok"}
+               except Exception as exc:  # noqa: BLE001
+                   checks[name] = {"status": "error", "detail": str(exc)}
+                   overall = "error"
+       
+           # Configuration check: no required environment variables; thresholds are
+           # defaults unless the shared pattern config is missing.
+    7:     try:
+    7:         from agents.pattern_config import (  # noqa: PLC0415
+                   RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES,
+                   RAPID_GEOGRAPHIC_MIN_DISTANCE_KM,
+               )
+    7:         checks["config"] = {
+    7:             "status": "ok",
+   14:             "detail": "interval<=%s min, distance>=%s km" % (
+    7:                 RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES,
+    7:                 RAPID_GEOGRAPHIC_MIN_DISTANCE_KM,
+                   ),
+               }
+           except Exception as exc:  # noqa: BLE001
+               checks["config"] = {"status": "error", "detail": str(exc)}
+               overall = "error"
+       
+           # LLM narratives: optional feature — report enabled/model without ever
+           # exposing the API key.
+    7:     try:
+    7:         from agents.llm import llm_enabled  # noqa: PLC0415
+    7:         from agents.env import PROJECT_ROOT  # noqa: PLC0415
+    7:         checks["llm"] = {
+    7:             "status": "ok",
+                   "detail": (
+    7:                 "enabled (model: %s)" % os.environ.get("RATIONRIGHT_LLM_MODEL", "gpt-4o-mini")
+    7:                 if llm_enabled()
+    7:                 else "disabled (optional)"
+                   ),
+               }
+           except Exception as exc:  # noqa: BLE001
+               checks["llm"] = {"status": "ok", "detail": "unavailable (%s)" % exc}
+       
+    7:     return {
+    7:         "status": overall,
+    7:         "service": "rationright",
+    7:         "checks": checks,
+           }
+       
+       
+   37: def validate_startup(dataset_path) -> None:
+           """Validate required startup configuration; raise ValueError with a clear
+           developer-facing message if anything is missing or invalid."""
+    2:     path = Path(dataset_path)
+    2:     if not path.is_file():
+    2:         raise ValueError(
+    2:             "Dataset file not found: %s. Run the server from the project root, "
+    1:             "or pass --dataset <path>." % path
+               )
+    1:     try:
+    1:         dataset = load_dataset(path)
+    1:         errors = validate_transactions(dataset["transactions"])
+           except ValueError as exc:
+               raise ValueError("Dataset failed validation: %s" % exc) from exc
+    1:     if errors:
+    2:         raise ValueError(
+    1:             "Dataset failed validation with %d error(s): %s" % (len(errors), errors[0])
+               )
+       
+       
+   37: def make_server(host: str = "127.0.0.1", port: int = 0, dataset_path=None, db_path=None) -> ThreadingHTTPServer:
+   48:     if db_path:
+   44:         try:
+   44:             register_configured_sources(db_path)
+               except Exception:  # noqa: BLE001
+                   logger.error("Could not register configured data sources:\n%s", traceback.format_exc())
+           """Create (but do not start) a RationRight server. Port 0 picks an ephemeral
+           port. ``dataset_path`` is the dataset served by /api/dataset and analyzed
+           by /api/analyze; defaults to the canonical Phase 1 dataset. ``db_path`` is
+           the database used by the Phase 3 ingestion endpoints; defaults to
+           ``data/rationright.db``."""
+   48:     server = ThreadingHTTPServer((host, port), RationRightHandler)
+   48:     server.dataset_path = dataset_path or DEFAULT_DATASET_PATH
+   48:     server.db_path = db_path or DEFAULT_DB_PATH
+   48:     server.rate_limiter = _RateLimiter()
+   48:     server.revoked_sessions = set()
+   48:     return server
+       
+       
+   37: def main(argv=None) -> int:
+           # Load local secrets (e.g. OPENAI_API_KEY) from the git-ignored .env file
+           # before anything reads them. Shell exports take precedence.
+           load_env_file()
+       
+           parser = argparse.ArgumentParser(
+               description="Run the RationRight dashboard + workflow API server."
+           )
+           parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+           parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+           parser.add_argument(
+               "--dataset",
+               type=Path,
+               default=DEFAULT_DATASET_PATH,
+               help="Dataset to serve and analyze (default: %(default)s)",
+           )
+           parser.add_argument(
+               "--analyze-delay-ms",
+               type=int,
+               default=int(os.environ.get("RATIONRIGHT_ANALYZE_DELAY_MS", "0") or "0"),
+               help="Artificial delay before running the workflow, in ms (default: 0)",
+           )
+           parser.add_argument(
+               "--db",
+               type=Path,
+               default=DEFAULT_DB_PATH,
+               help="Database used by the ingestion endpoints (default: %(default)s)",
+           )
+           args = parser.parse_args(argv)
+       
+           logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+           if args.analyze_delay_ms > 0:
+               os.environ["RATIONRIGHT_ANALYZE_DELAY_MS"] = str(args.analyze_delay_ms)
+       
+           try:
+               validate_startup(args.dataset)
+           except ValueError as exc:
+               logger.error("Startup configuration error: %s", exc)
+               print("ERROR: %s" % exc, file=sys.stderr)
+               return 2
+       
+           server = make_server(args.host, args.port, dataset_path=args.dataset, db_path=args.db)
+           host, port = server.server_address[:2]
+           logger.info("RationRight server running at http://%s:%s", host, port)
+           try:
+               server.serve_forever()
+           except KeyboardInterrupt:
+               logger.info("Shutting down")
+           finally:
+               server.server_close()
+           return 0
+       
+       
+   37: if __name__ == "__main__":
+           sys.exit(main())

@@ -1,0 +1,261 @@
+    1: """RationRight — Phase 1: synthetic dataset validation.
+       
+       Validates ``data/synthetic/transactions.json`` against the documented
+       transaction contract (RationRight_complete_docs/data_contract.md) and
+       verifies the deliberately planted rapid-geographic-transaction pattern.
+       
+       Standalone run::
+       
+           python scripts/validate_dataset.py
+       
+       Test suite::
+       
+           python -m unittest discover -s tests -t . -v
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import json
+    1: import math
+    1: import sys
+    1: from datetime import datetime
+    1: from pathlib import Path
+       
+    1: PROJECT_ROOT = Path(__file__).resolve().parent.parent
+       # Allow standalone execution (``python3 scripts/validate_dataset.py``) to
+       # import the shared pattern configuration from the project root.
+    1: if str(PROJECT_ROOT) not in sys.path:
+           sys.path.insert(0, str(PROJECT_ROOT))
+       
+       # Rapid-geographic-transaction pattern thresholds, shared with the agents via
+       # ``agents.pattern_config`` so no threshold values are duplicated.
+    1: from agents.pattern_config import (  # noqa: E402
+           RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES as SHORT_INTERVAL_MINUTES,
+           RAPID_GEOGRAPHIC_MIN_DISTANCE_KM as LARGE_DISTANCE_KM,
+       )
+       
+    1: DEFAULT_DATASET_PATH = PROJECT_ROOT / "data" / "synthetic" / "transactions.json"
+       
+    1: REQUIRED_FIELDS = (
+           "transaction_id",
+           "beneficiary_id",
+           "timestamp",
+           "latitude",
+           "longitude",
+           "ration_type",
+           "quantity",
+       )
+       
+    1: RATION_TYPES = ("rice", "wheat", "sugar", "kerosene")
+       
+       # The deliberately planted suspicious pair (documented in data/synthetic/README.md).
+    1: PLANTED_ANOMALY_IDS = ("TX001", "TX002")
+       
+       
+    1: def load_dataset(path: Path = DEFAULT_DATASET_PATH) -> dict:
+           """Load the synthetic dataset JSON file and return the parsed content."""
+   99:     with open(path, "r", encoding="utf-8") as fh:
+   98:         return json.load(fh)
+       
+       
+    1: def validate_transactions(transactions: list) -> list:
+           """Return a list of validation error strings; an empty list means valid."""
+   65:     errors: list = []
+   65:     seen_ids: set = set()
+ 1151:     for index, tx in enumerate(transactions):
+ 1086:         prefix = f"record[{index}]"
+ 1086:         if not isinstance(tx, dict):
+    1:             errors.append(f"{prefix}: transaction must be an object, got {type(tx).__name__}")
+    1:             continue
+       
+ 8680:         for field in REQUIRED_FIELDS:
+ 7595:             if field not in tx:
+   11:                 errors.append(f"{prefix}: missing required field '{field}'")
+       
+ 1085:         transaction_id = tx.get("transaction_id")
+ 1085:         if not isinstance(transaction_id, str) or not transaction_id:
+                   errors.append(f"{prefix}: transaction_id must be a non-empty string")
+ 1085:         elif transaction_id in seen_ids:
+                   errors.append(f"{prefix}: duplicate transaction_id '{transaction_id}'")
+ 1085:         if isinstance(transaction_id, str):
+ 1085:             seen_ids.add(transaction_id)
+       
+ 1085:         beneficiary_id = tx.get("beneficiary_id")
+ 1085:         if not isinstance(beneficiary_id, str) or not beneficiary_id:
+    2:             errors.append(f"{prefix}: beneficiary_id must be a non-empty string")
+       
+ 1085:         raw_timestamp = tx.get("timestamp")
+ 1085:         if not isinstance(raw_timestamp, str) or not raw_timestamp:
+    3:             errors.append(f"{prefix}: timestamp must be a non-empty string")
+               else:
+ 1082:             try:
+ 1082:                 datetime.fromisoformat(raw_timestamp)
+    1:             except ValueError:
+    1:                 errors.append(f"{prefix}: timestamp '{raw_timestamp}' is not valid ISO-8601")
+       
+ 1085:         latitude = tx.get("latitude")
+ 1085:         if not isinstance(latitude, (int, float)) or isinstance(latitude, bool) or not (-90 <= latitude <= 90):
+   15:             errors.append(f"{prefix}: latitude must be a number in [-90, 90]")
+ 1085:         longitude = tx.get("longitude")
+ 1085:         if not isinstance(longitude, (int, float)) or isinstance(longitude, bool) or not (-180 <= longitude <= 180):
+   14:             errors.append(f"{prefix}: longitude must be a number in [-180, 180]")
+       
+ 1085:         quantity = tx.get("quantity")
+ 1085:         if not isinstance(quantity, (int, float)) or isinstance(quantity, bool) or quantity <= 0:
+    1:             errors.append(f"{prefix}: quantity must be a positive number")
+       
+ 1085:         ration_type = tx.get("ration_type")
+ 1085:         if ration_type not in RATION_TYPES:
+    1:             errors.append(f"{prefix}: ration_type '{ration_type}' not in {RATION_TYPES}")
+       
+   65:     return errors
+       
+       
+    1: def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+           """Great-circle distance between two coordinates in kilometres.
+       
+           Deterministic code calculation; never estimated by an LLM.
+           """
+ 1877:     radius_km = 6371.0
+ 1877:     phi1, phi2 = math.radians(lat1), math.radians(lat2)
+ 1877:     dphi = math.radians(lat2 - lat1)
+ 1877:     dlambda = math.radians(lon2 - lon1)
+ 1877:     a = (
+ 3754:         math.sin(dphi / 2) ** 2
+ 1877:         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+           )
+ 1877:     return 2 * radius_km * math.asin(math.sqrt(a))
+       
+       
+    1: def minutes_between(timestamp_a: str, timestamp_b: str) -> float:
+           """Absolute time difference in minutes between two ISO-8601 timestamps."""
+ 1874:     dt_a = datetime.fromisoformat(timestamp_a)
+ 1874:     dt_b = datetime.fromisoformat(timestamp_b)
+ 1874:     return abs((dt_b - dt_a).total_seconds()) / 60.0
+       
+       
+    1: def find_suspicious_pairs(
+           transactions: list,
+    1:     short_interval_minutes: float = SHORT_INTERVAL_MINUTES,
+    1:     large_distance_km: float = LARGE_DISTANCE_KM,
+       ) -> list:
+           """Find same-beneficiary pairs meeting the rapid-geographic pattern.
+       
+           Returns a list of dicts with transaction_ids, beneficiary_id,
+           time_difference_minutes, and distance_km.
+           """
+   56:     by_beneficiary: dict = {}
+  972:     for tx in transactions:
+  916:         by_beneficiary.setdefault(tx["beneficiary_id"], []).append(tx)
+       
+   56:     pairs: list = []
+  256:     for beneficiary_id, records in by_beneficiary.items():
+ 1116:         for i in range(len(records)):
+ 2733:             for j in range(i + 1, len(records)):
+ 1817:                 a, b = records[i], records[j]
+ 1817:                 delta_minutes = minutes_between(a["timestamp"], b["timestamp"])
+ 3634:                 distance_km = haversine_km(
+ 1817:                     a["latitude"], a["longitude"], b["latitude"], b["longitude"]
+                       )
+ 1817:                 if delta_minutes <= short_interval_minutes and distance_km >= large_distance_km:
+   84:                     pairs.append(
+   42:                         {
+   42:                             "transaction_ids": sorted([a["transaction_id"], b["transaction_id"]]),
+   42:                             "beneficiary_id": beneficiary_id,
+   42:                             "time_difference_minutes": round(delta_minutes, 2),
+   42:                             "distance_km": round(distance_km, 2),
+                               }
+                           )
+   56:     return pairs
+       
+       
+    1: def verify_planted_anomaly(transactions: list, planted_ids: tuple = PLANTED_ANOMALY_IDS) -> dict:
+           """Verify the planted pair exists and satisfies the intended pattern.
+       
+           Returns a report dict; ``pattern_satisfied`` is True only when the pair
+           shares a beneficiary, is within the short interval, and is far apart.
+           """
+   27:     by_id = {tx["transaction_id"]: tx for tx in transactions}
+    4:     missing = [tx_id for tx_id in planted_ids if tx_id not in by_id]
+    1:     if missing:
+               return {"present": False, "missing_transactions": missing}
+       
+    1:     a, b = by_id[planted_ids[0]], by_id[planted_ids[1]]
+    1:     time_difference_minutes = minutes_between(a["timestamp"], b["timestamp"])
+    2:     distance_km = haversine_km(
+    1:         a["latitude"], a["longitude"], b["latitude"], b["longitude"]
+           )
+    1:     conditions = {
+    1:         "same_beneficiary": a["beneficiary_id"] == b["beneficiary_id"],
+    1:         "short_time_interval": time_difference_minutes <= SHORT_INTERVAL_MINUTES,
+    1:         "large_geographic_distance": distance_km >= LARGE_DISTANCE_KM,
+           }
+    1:     return {
+    1:         "present": True,
+    1:         "transaction_ids": list(planted_ids),
+    1:         "beneficiary_id": a["beneficiary_id"],
+    1:         "time_difference_minutes": round(time_difference_minutes, 2),
+    1:         "distance_km": round(distance_km, 2),
+    1:         "conditions": conditions,
+    1:         "pattern_satisfied": all(conditions.values()),
+           }
+       
+       
+    1: def main(path: Path = DEFAULT_DATASET_PATH) -> int:
+           """Run all dataset checks and print a report. Returns exit code."""
+           dataset = load_dataset(path)
+           transactions = dataset["transactions"]
+           metadata = dataset.get("metadata", {})
+       
+           print(f"Dataset:        {path}")
+           print(f"Label:          {metadata.get('label', '<missing>')}")
+           print(f"Version:        {metadata.get('version', '<missing>')}")
+           print(f"Records:        {len(transactions)}")
+           print(f"Beneficiaries:  {len({tx['beneficiary_id'] for tx in transactions})}")
+           print(f"Ration types:   {sorted({tx['ration_type'] for tx in transactions})}")
+       
+           errors = validate_transactions(transactions)
+           print(f"\nSchema validation: {'PASSED' if not errors else 'FAILED'}")
+           for error in errors:
+               print(f"  - {error}")
+       
+           report = verify_planted_anomaly(transactions)
+           print("\nPlanted anomaly verification:")
+           print(f"  Present:           {report['present']}")
+           if report["present"]:
+               print(f"  Transaction IDs:   {', '.join(report['transaction_ids'])}")
+               print(f"  Beneficiary:       {report['beneficiary_id']}")
+               print(f"  Time difference:   {report['time_difference_minutes']} minutes")
+               print(f"  Distance:          {report['distance_km']} km")
+               print(f"  Conditions met:    {report['conditions']}")
+               print(f"  Pattern satisfied: {report['pattern_satisfied']}")
+       
+           pairs = find_suspicious_pairs(transactions)
+           print("\nDeterministic scan for rapid-geographic pairs (thresholds "
+                 f"{SHORT_INTERVAL_MINUTES} min / {LARGE_DISTANCE_KM} km):")
+           if not pairs:
+               print("  (none found)")
+           for pair in pairs:
+               print(
+                   f"  {pair['transaction_ids']} beneficiary={pair['beneficiary_id']} "
+                   f"interval={pair['time_difference_minutes']} min "
+                   f"distance={pair['distance_km']} km"
+               )
+       
+           exactly_planted = (
+               len(pairs) == 1 and pairs[0]["transaction_ids"] == sorted(PLANTED_ANOMALY_IDS)
+           )
+           print(f"\nExactly the planted pair only: {'YES' if exactly_planted else 'NO'}")
+       
+           passed = (
+               not errors
+               and report.get("present", False)
+               and report.get("pattern_satisfied", False)
+               and exactly_planted
+           )
+           print(f"\nRESULT: {'PASSED' if passed else 'FAILED'}")
+           return 0 if passed else 1
+       
+       
+    1: if __name__ == "__main__":
+           sys.exit(main())

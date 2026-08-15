@@ -1,0 +1,321 @@
+    1: """RationRight — Agent 2: Anomaly Investigator (Phase 3).
+       
+       Verifies anomaly candidates produced by Agent 1 against the ACTUAL source
+       transaction records using deterministic tools. Agent 1 says "this may be
+       suspicious"; Agent 2 says "I checked those exact transactions and calculated
+       the evidence."
+       
+       Everything numerical is deterministic code, never an LLM or a guess:
+       
+       - transaction lookup against the supplied records;
+       - timestamp parsing and time-difference calculation;
+       - haversine geographic distance;
+       - validation of existence, timestamps, coordinates, and beneficiary consistency;
+       - threshold evaluation using the shared pattern configuration.
+       
+       The calculated evidence is NEVER copied from Agent 1's output; it is computed
+       independently from the source transactions.
+       
+       Output follows ``RationRight_complete_docs/data_contract.md``. Verified
+       findings carry computed evidence; failed verifications return status
+       ``unverified`` with empty evidence and a factual explanation of why. The agent
+       never declares guilt or fraud — a verified finding means "the anomaly candidate
+       is supported by the supplied data and requires human verification".
+       
+       Run standalone::
+       
+           python3 scripts/run_agent_2.py
+       
+       Import::
+       
+           from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+       """
+       
+    1: from __future__ import annotations
+       
+    1: import logging
+    1: from datetime import datetime
+       
+    1: from agents.llm import maybe_generate
+    1: from agents.pattern_config import (
+           RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES,
+           RAPID_GEOGRAPHIC_MIN_DISTANCE_KM,
+       )
+    1: from scripts.validate_dataset import haversine_km, minutes_between
+       
+    1: logger = logging.getLogger("rationright.agent_2")
+       
+       # Thresholds reused from the shared pattern configuration (same as Agent 1).
+    1: DEFAULT_MAX_INTERVAL_MINUTES = RAPID_GEOGRAPHIC_MAX_INTERVAL_MINUTES
+    1: DEFAULT_MIN_DISTANCE_KM = RAPID_GEOGRAPHIC_MIN_DISTANCE_KM
+       
+    1: FINDING_FIELDS = (
+           "finding_id",
+           "anomaly_id",
+           "status",
+           "transaction_ids",
+           "evidence",
+           "evidence_sources",
+           "explanation",
+       )
+       
+       
+    2: class Agent2AnomalyInvestigator:
+    1:     """Anomaly Investigator: verifies one anomaly candidate per run."""
+       
+    1:     def __init__(
+               self,
+    1:         max_interval_minutes: float = DEFAULT_MAX_INTERVAL_MINUTES,
+    1:         min_distance_km: float = DEFAULT_MIN_DISTANCE_KM,
+    1:         narrative_generator=None,
+           ):
+   71:         if max_interval_minutes <= 0:
+                   raise ValueError("max_interval_minutes must be positive")
+   71:         if min_distance_km <= 0:
+                   raise ValueError("min_distance_km must be positive")
+   71:         self.max_interval_minutes = max_interval_minutes
+   71:         self.min_distance_km = min_distance_km
+   71:         self.narrative_generator = narrative_generator
+       
+    1:     def run(self, payload: dict, finding_id: str = "FIND001") -> dict:
+               """Verify one anomaly candidate and return a structured finding.
+       
+               ``payload`` must be ``{"anomaly": {...}, "transactions": [...]}``
+               following the documented contracts. ``finding_id`` lets the workflow
+               assign unique IDs per candidate (default ``FIND001`` preserves
+               standalone behavior).
+               """
+   69:         logger.info("Agent 2 started")
+   69:         if not isinstance(finding_id, str) or not finding_id:
+                   raise ValueError("finding_id must be a non-empty string")
+   69:         if not isinstance(payload, dict):
+    1:             raise ValueError("payload must be an object with 'anomaly' and 'transactions'")
+   68:         anomaly = payload.get("anomaly")
+   68:         transactions = payload.get("transactions")
+   68:         if not isinstance(anomaly, dict):
+    1:             raise ValueError("payload['anomaly'] must be an object")
+   67:         if not isinstance(transactions, list):
+                   raise ValueError("payload['transactions'] must be a list")
+       
+   67:         self._validate_candidate(anomaly)
+   64:         anomaly_id = anomaly["anomaly_id"]
+   64:         transaction_ids = list(anomaly["transaction_ids"])
+   64:         expected_beneficiary = anomaly.get("beneficiary_id")
+  128:         logger.info("Candidate received: %s (%s) referencing %s",
+   64:                     anomaly_id, anomaly.get("anomaly_type", "<unknown>"), transaction_ids)
+       
+               # 1. Transaction lookup against the supplied source records.
+ 1373:         by_id = {
+ 1181:             tx.get("transaction_id"): tx
+ 1245:             for tx in transactions
+ 1181:             if isinstance(tx, dict) and isinstance(tx.get("transaction_id"), str)
+               }
+  256:         missing = [tid for tid in transaction_ids if tid not in by_id]
+   64:         if missing:
+    2:             logger.warning("Transaction(s) not found: %s", missing)
+    4:             return self._unverified(
+    2:                 anomaly_id,
+    2:                 transaction_ids,
+    4:                 "Required transaction data was unavailable: transaction(s) "
+    2:                 f"{', '.join(missing)} not found in the supplied records.",
+    2:                 finding_id=finding_id,
+                   )
+   62:         logger.info("Transactions located: %s", transaction_ids)
+       
+               # 2. Validate the referenced records.
+  248:         records = [by_id[tid] for tid in transaction_ids]
+  248:         inspected = [self._inspect_transaction(tx) for tx in records]
+   62:         problems = []
+  186:         for tid, info in zip(transaction_ids, inspected):
+  124:             if not info["timestamp_ok"]:
+    2:                 problems.append(f"{tid} has a missing/invalid timestamp")
+  124:             if not info["coordinates_ok"]:
+    2:                 problems.append(f"{tid} has missing/invalid coordinates")
+  124:             if not info["beneficiary_ok"]:
+                       problems.append(f"{tid} has a missing/invalid beneficiary_id")
+   62:         if problems:
+    4:             logger.warning("Validation issue(s) on referenced transactions: %s", problems)
+    8:             return self._unverified(
+    4:                 anomaly_id,
+    4:                 transaction_ids,
+    4:                 "Required transaction data was unavailable: " + "; ".join(problems) + ".",
+    4:                 finding_id=finding_id,
+                   )
+       
+               # 3. Beneficiary consistency.
+  232:         beneficiary_ids = {info["beneficiary_id"] for info in inspected}
+   58:         if len(beneficiary_ids) != 1:
+    2:             logger.warning(
+    1:                 "Referenced transactions belong to different beneficiaries: %s",
+    1:                 sorted(beneficiary_ids),
+                   )
+    2:             return self._unverified(
+    1:                 anomaly_id,
+    1:                 transaction_ids,
+    2:                 "The referenced transactions belong to different beneficiaries "
+    1:                 f"({sorted(beneficiary_ids)}); a same-beneficiary anomaly cannot be verified.",
+    1:                 finding_id=finding_id,
+                   )
+   57:         actual_beneficiary = next(iter(beneficiary_ids))
+   57:         if expected_beneficiary and actual_beneficiary != expected_beneficiary:
+    2:             logger.warning(
+    1:                 "Beneficiary mismatch: candidate expects %s, transactions belong to %s",
+    1:                 expected_beneficiary,
+    1:                 actual_beneficiary,
+                   )
+    2:             return self._unverified(
+    1:                 anomaly_id,
+    1:                 transaction_ids,
+    2:                 f"The referenced transactions belong to beneficiary {actual_beneficiary}, "
+    1:                 f"not the expected {expected_beneficiary}.",
+    1:                 finding_id=finding_id,
+                   )
+   56:         logger.info("Beneficiary consistency: OK (%s)", actual_beneficiary)
+       
+               # 4. Deterministic calculations from the actual source records.
+   56:         first, second = records[0], records[1]
+   56:         time_difference_minutes = minutes_between(first["timestamp"], second["timestamp"])
+  112:         distance_km = haversine_km(
+   56:             first["latitude"], first["longitude"],
+   56:             second["latitude"], second["longitude"],
+               )
+   56:         logger.info("Timestamp validation: OK")
+   56:         logger.info("Time difference calculated: %.2f minutes", time_difference_minutes)
+   56:         logger.info("Coordinates validated: OK")
+   56:         logger.info("Geographic distance calculated: %.2f km", distance_km)
+       
+               # 5. Threshold evaluation (shared thresholds, inclusive bounds).
+   56:         interval_ok = time_difference_minutes <= self.max_interval_minutes
+   56:         distance_ok = distance_km >= self.min_distance_km
+  112:         logger.info(
+   56:             "Thresholds evaluated: interval %.2f <= %g (%s); distance %.2f >= %g (%s)",
+   56:             time_difference_minutes, self.max_interval_minutes, interval_ok,
+   56:             distance_km, self.min_distance_km, distance_ok,
+               )
+   56:         if not (interval_ok and distance_ok):
+    4:             logger.info("Anomaly conditions NOT satisfied; returning unverified finding.")
+    8:             return self._unverified(
+    4:                 anomaly_id,
+    4:                 transaction_ids,
+   28:                 "The referenced transactions do not satisfy the rapid-geographic-"
+    4:                 f"transaction thresholds (interval {time_difference_minutes:.2f} min "
+    8:                 f"<= {self.max_interval_minutes:g} min: {interval_ok}; distance "
+   12:                 f"{distance_km:.2f} km >= {self.min_distance_km:g} km: {distance_ok}).",
+    4:                 finding_id=finding_id,
+                   )
+       
+               # 6. Verified finding with calculated evidence. The explanation is the
+               # optional LLM narrative point; the evidence itself is always the
+               # deterministic calculation above, never the LLM's.
+   52:         fallback_explanation = (
+  312:             f"The referenced transactions {transaction_ids} for beneficiary "
+  104:             f"{actual_beneficiary} occurred {time_difference_minutes:.2f} minutes apart "
+   52:             f"at {distance_km:.2f} km, satisfying the rapid-geographic-transaction "
+   52:             f"thresholds (interval <= {self.max_interval_minutes:g} min, distance >= "
+   52:             f"{self.min_distance_km:g} km). Evidence supports the anomaly candidate "
+                   "and requires human verification."
+               )
+   52:         finding = {
+   52:             "finding_id": finding_id,
+   52:             "anomaly_id": anomaly_id,
+   52:             "status": "verified",
+   52:             "transaction_ids": list(transaction_ids),
+   52:             "evidence": {
+   52:                 "time_difference_minutes": round(time_difference_minutes, 2),
+   52:                 "distance_km": round(distance_km, 2),
+                   },
+   52:             "evidence_sources": list(transaction_ids),
+  104:             "explanation": maybe_generate(
+   52:                 "agent_2_explanation",
+   52:                 {
+   52:                     "finding_id": finding_id,
+   52:                     "anomaly_id": anomaly_id,
+   52:                     "anomaly_type": anomaly.get("anomaly_type"),
+   52:                     "transaction_ids": list(transaction_ids),
+   52:                     "beneficiary_id": actual_beneficiary,
+   52:                     "time_difference_minutes": round(time_difference_minutes, 2),
+   52:                     "distance_km": round(distance_km, 2),
+   52:                     "max_interval_minutes": self.max_interval_minutes,
+   52:                     "min_distance_km": self.min_distance_km,
+                       },
+   52:                 fallback_explanation,
+   52:                 generator=self.narrative_generator,
+                   ),
+               }
+   52:         self._validate_finding(finding)
+  104:         logger.info("Verification result generated: %s (status=%s)",
+   52:                     finding["finding_id"], finding["status"])
+   52:         return finding
+       
+    1:     @staticmethod
+    1:     def _validate_candidate(anomaly: dict) -> None:
+               """Reject malformed anomaly candidates safely."""
+   67:         anomaly_id = anomaly.get("anomaly_id")
+   67:         transaction_ids = anomaly.get("transaction_ids")
+   67:         if not isinstance(anomaly_id, str) or not anomaly_id:
+    1:             raise ValueError("Anomaly candidate is missing a valid 'anomaly_id'")
+   66:         if not isinstance(transaction_ids, list) or len(transaction_ids) != 2:
+    2:             raise ValueError(
+    1:                 "Anomaly candidate 'transaction_ids' must be a list of exactly two "
+                       "transaction IDs"
+                   )
+  259:         if not all(isinstance(tid, str) and tid for tid in transaction_ids):
+    1:             raise ValueError("Anomaly candidate 'transaction_ids' must be non-empty strings")
+       
+    1:     @staticmethod
+    1:     def _inspect_transaction(tx: dict) -> dict:
+               """Return per-field validity flags for a referenced transaction."""
+  124:         raw_timestamp = tx.get("timestamp")
+  124:         timestamp_ok = isinstance(raw_timestamp, str) and bool(raw_timestamp)
+  124:         if timestamp_ok:
+  123:             try:
+  123:                 datetime.fromisoformat(raw_timestamp)
+    1:             except ValueError:
+    1:                 timestamp_ok = False
+       
+  124:         coordinates_ok = True
+  372:         for field, low, high in (("latitude", -90.0, 90.0), ("longitude", -180.0, 180.0)):
+  248:             value = tx.get(field)
+  248:             if not isinstance(value, (int, float)) or isinstance(value, bool) or not (low <= value <= high):
+    3:                 coordinates_ok = False
+       
+  124:         beneficiary_id = tx.get("beneficiary_id")
+  124:         beneficiary_ok = isinstance(beneficiary_id, str) and bool(beneficiary_id)
+  124:         return {
+  124:             "timestamp_ok": timestamp_ok,
+  124:             "coordinates_ok": coordinates_ok,
+  124:             "beneficiary_ok": beneficiary_ok,
+  124:             "beneficiary_id": beneficiary_id if beneficiary_ok else None,
+               }
+       
+    1:     def _unverified(self, anomaly_id: str, transaction_ids: list, explanation: str,
+                           finding_id: str = "FIND001") -> dict:
+               """Build a contract-compliant unverified finding with no fabricated evidence."""
+   12:         finding = {
+   12:             "finding_id": finding_id,
+   12:             "anomaly_id": anomaly_id,
+   12:             "status": "unverified",
+   12:             "transaction_ids": list(transaction_ids),
+   12:             "evidence": {},
+   12:             "evidence_sources": [],
+   12:             "explanation": explanation,
+               }
+   12:         self._validate_finding(finding)
+   24:         logger.info("Verification result generated: %s (status=%s)",
+   12:                     finding["finding_id"], finding["status"])
+   12:         return finding
+       
+    1:     @staticmethod
+    1:     def _validate_finding(finding: dict) -> None:
+               """Self-check that the finding satisfies the output contract."""
+   64:         required = set(FINDING_FIELDS)
+   64:         if not required.issubset(finding):
+                   raise ValueError(f"Invalid finding: {finding!r}")
+   64:         if finding["status"] not in ("verified", "unverified"):
+                   raise ValueError(f"Invalid finding status: {finding['status']!r}")
+   64:         if finding["status"] == "verified":
+   52:             evidence = finding["evidence"]
+   52:             if not isinstance(evidence, dict) or "time_difference_minutes" not in evidence or "distance_km" not in evidence:
+                       raise ValueError(f"Verified finding is missing calculated evidence: {finding!r}")
+   52:             if not finding["evidence_sources"]:
+                       raise ValueError(f"Verified finding is missing evidence sources: {finding!r}")

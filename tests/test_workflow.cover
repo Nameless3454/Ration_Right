@@ -1,0 +1,281 @@
+    1: """RationRight — Phase 6: multi-agent workflow integration tests.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import unittest
+       
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, haversine_km, load_dataset
+    1: from workflow import run_workflow
+       
+    1: REAL_TRANSACTIONS = load_dataset(DEFAULT_DATASET_PATH)["transactions"]
+       
+       
+    1: def make_tx(transaction_id, beneficiary_id, timestamp, latitude, longitude,
+                   ration_type="rice", quantity=10):
+    8:     return {
+    8:         "transaction_id": transaction_id,
+    8:         "beneficiary_id": beneficiary_id,
+    8:         "timestamp": timestamp,
+    8:         "latitude": latitude,
+    8:         "longitude": longitude,
+    8:         "ration_type": ration_type,
+    8:         "quantity": quantity,
+           }
+       
+       
+    1: def multi_anomaly_transactions():
+           """Two independent planted rapid-geographic pairs (different beneficiaries)."""
+    2:     return [
+    2:         make_tx("TX100", "BEN900", "2026-08-01T10:00:00", 19.0760, 72.8777),
+    2:         make_tx("TX101", "BEN900", "2026-08-01T10:05:00", 28.6139, 77.2090),
+    2:         make_tx("TX102", "BEN901", "2026-08-01T11:00:00", 18.5204, 73.8567),
+    2:         make_tx("TX103", "BEN901", "2026-08-01T11:10:00", 12.9716, 77.5946),
+           ]
+       
+       
+    1: def failing_agent_2(fail_for):
+           """Wrap the real Agent 2 but raise for the given anomaly IDs."""
+    1:     real = Agent2AnomalyInvestigator()
+       
+    2:     class _Wrapper:
+    1:         def run(self, payload, finding_id="FIND001"):
+    2:             anomaly_id = payload["anomaly"]["anomaly_id"]
+    2:             if anomaly_id in fail_for:
+    1:                 raise ValueError(f"forced Agent 2 failure for {anomaly_id}")
+    1:             return real.run(payload, finding_id=finding_id)
+       
+    1:     return _Wrapper()
+       
+       
+    1: def failing_agent_3():
+    2:     class _Wrapper:
+    1:         def run(self, payload):
+    1:             raise ValueError("forced Agent 3 failure")
+       
+    1:     return _Wrapper()
+       
+       
+    1: def failing_agent_4():
+    2:     class _Wrapper:
+    1:         def run(self, case):
+    1:             raise ValueError("forced Agent 4 failure")
+       
+    1:     return _Wrapper()
+       
+       
+    1: def unverified_agent_2():
+           """Agent 2 stand-in that returns an unverified finding for every candidate."""
+       
+    2:     class _Wrapper:
+    1:         def run(self, payload, finding_id="FIND001"):
+    1:             anomaly = payload["anomaly"]
+    1:             return {
+    1:                 "finding_id": finding_id,
+    1:                 "anomaly_id": anomaly["anomaly_id"],
+    1:                 "status": "unverified",
+    1:                 "transaction_ids": list(anomaly["transaction_ids"]),
+    1:                 "evidence": {},
+    1:                 "evidence_sources": [],
+    1:                 "explanation": "Test candidate could not be verified.",
+                   }
+       
+    1:     return _Wrapper()
+       
+       
+    2: class TestWorkflowHappyPath(unittest.TestCase):
+    1:     """TEST 1 — the real planted anomaly completes the full chain."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.result = run_workflow(REAL_TRANSACTIONS)
+       
+    1:     def test_workflow_completed(self):
+    1:         self.assertEqual(self.result["workflow_status"], "completed")
+    2:         self.assertEqual(
+    1:             self.result["stages"],
+    1:             {
+    1:                 "agent_1": "completed",
+    1:                 "agent_2": "completed",
+    1:                 "agent_3": "completed",
+    1:                 "agent_4": "completed",
+                   },
+               )
+    1:         self.assertEqual(self.result["errors"], [])
+       
+    1:     def test_planted_anomaly_reaches_alert(self):
+    1:         self.assertEqual(len(self.result["anomalies"]), 1)
+    1:         self.assertEqual(len(self.result["findings"]), 1)
+    1:         self.assertEqual(len(self.result["cases"]), 1)
+    1:         self.assertEqual(len(self.result["alerts"]), 1)
+    1:         self.assertEqual(self.result["findings"][0]["status"], "verified")
+    1:         self.assertEqual(self.result["alerts"][0]["status"], "open")
+    1:         self.assertEqual(self.result["unverified_findings"], [])
+       
+       
+    2: class TestWorkflowZeroAnomalies(unittest.TestCase):
+    1:     """TEST 2 — a normal dataset completes cleanly with zero alerts."""
+       
+    1:     def test_normal_dataset_completes_cleanly(self):
+   28:         transactions = [
+   26:             t for t in REAL_TRANSACTIONS if t["transaction_id"] not in ("TX001", "TX002")
+               ]
+    1:         result = run_workflow(transactions)
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(result["anomalies"], [])
+    1:         self.assertEqual(result["findings"], [])
+    1:         self.assertEqual(result["cases"], [])
+    1:         self.assertEqual(result["alerts"], [])
+    1:         self.assertEqual(result["errors"], [])
+    1:         self.assertEqual(result["stages"]["agent_1"], "completed")
+    1:         self.assertEqual(result["stages"]["agent_2"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_3"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_4"], "skipped")
+       
+       
+    2: class TestWorkflowMultipleAnomalies(unittest.TestCase):
+    1:     """TEST 3 — multiple candidates stay independent; no evidence mixing."""
+       
+    1:     def test_candidates_stay_independent(self):
+    1:         result = run_workflow(multi_anomaly_transactions())
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(len(result["anomalies"]), 2)
+    1:         self.assertEqual(len(result["findings"]), 2)
+    1:         self.assertEqual(len(result["cases"]), 1)
+    1:         self.assertEqual(len(result["alerts"]), 1)
+       
+    1:         case = result["cases"][0]
+    1:         self.assertEqual(case["finding_ids"], ["FIND001", "FIND002"])
+    6:         values = [e["value"] for e in case["evidence"]]
+    1:         self.assertEqual(values[0], 5.0)
+    1:         self.assertAlmostEqual(values[1], round(haversine_km(19.0760, 72.8777, 28.6139, 77.2090), 2), places=2)
+    1:         self.assertEqual(values[2], 10.0)
+    1:         self.assertAlmostEqual(values[3], round(haversine_km(18.5204, 73.8567, 12.9716, 77.5946), 2), places=2)
+       
+       
+    2: class TestWorkflowAgent2Failure(unittest.TestCase):
+    1:     """TEST 4 — a failing candidate is recorded; valid candidates continue."""
+       
+    1:     def test_failed_candidate_recorded_and_others_continue(self):
+    2:         result = run_workflow(
+    1:             multi_anomaly_transactions(),
+    1:             agent_2=failing_agent_2({"ANOM001"}),
+               )
+    1:         self.assertEqual(result["workflow_status"], "partial_failure")
+    1:         self.assertEqual(len(result["errors"]), 1)
+    1:         error = result["errors"][0]
+    1:         self.assertEqual(error["stage"], "agent_2")
+    1:         self.assertEqual(error["anomaly_id"], "ANOM001")
+    1:         self.assertEqual(error["status"], "failed")
+    1:         self.assertIn("forced Agent 2 failure", error["error"])
+       
+               # No fabricated finding for the failed candidate; the other continues.
+    1:         self.assertEqual(len(result["findings"]), 1)
+    1:         self.assertEqual(result["findings"][0]["anomaly_id"], "ANOM002")
+    1:         self.assertEqual(len(result["cases"]), 1)
+    1:         self.assertEqual(len(result["alerts"]), 1)
+       
+       
+    2: class TestWorkflowAgent3Failure(unittest.TestCase):
+    1:     """TEST 5 — an Agent 3 failure is recorded with stage attribution."""
+       
+    1:     def test_agent_3_failure_recorded(self):
+    1:         result = run_workflow(REAL_TRANSACTIONS, agent_3=failing_agent_3())
+    1:         self.assertEqual(result["workflow_status"], "partial_failure")
+    1:         self.assertEqual(len(result["errors"]), 1)
+    1:         self.assertEqual(result["errors"][0]["stage"], "agent_3")
+    1:         self.assertEqual(result["stages"]["agent_3"], "failed")
+    1:         self.assertEqual(result["cases"], [])
+    1:         self.assertEqual(result["alerts"], [])
+               # Agent 2 still succeeded and produced its finding.
+    1:         self.assertEqual(len(result["findings"]), 1)
+       
+       
+    2: class TestWorkflowAgent4Failure(unittest.TestCase):
+    1:     """TEST 6 — an Agent 4 failure is recorded with stage attribution."""
+       
+    1:     def test_agent_4_failure_recorded(self):
+    1:         result = run_workflow(REAL_TRANSACTIONS, agent_4=failing_agent_4())
+    1:         self.assertEqual(result["workflow_status"], "partial_failure")
+    1:         self.assertEqual(len(result["errors"]), 1)
+    1:         self.assertEqual(result["errors"][0]["stage"], "agent_4")
+    1:         self.assertEqual(result["stages"]["agent_4"], "failed")
+    1:         self.assertEqual(len(result["cases"]), 1)
+    1:         self.assertEqual(result["alerts"], [])
+       
+       
+    2: class TestWorkflowUnverifiedOnly(unittest.TestCase):
+    1:     """No verified findings completes cleanly without a case or alert."""
+       
+    1:     def test_all_unverified_completes_without_alert(self):
+    1:         result = run_workflow(REAL_TRANSACTIONS, agent_2=unverified_agent_2())
+    1:         self.assertEqual(result["workflow_status"], "completed")
+    1:         self.assertEqual(len(result["anomalies"]), 1)
+    1:         self.assertEqual(len(result["unverified_findings"]), 1)
+    1:         self.assertEqual(result["findings"], [])
+    1:         self.assertEqual(result["cases"], [])
+    1:         self.assertEqual(result["alerts"], [])
+    1:         self.assertEqual(result["stages"]["agent_3"], "skipped")
+    1:         self.assertEqual(result["stages"]["agent_4"], "skipped")
+       
+       
+    2: class TestWorkflowTraceability(unittest.TestCase):
+    1:     """TEST 7 — alert -> case -> finding -> anomaly -> transactions stay connected."""
+       
+    1:     def test_ids_connected_end_to_end(self):
+    1:         result = run_workflow(REAL_TRANSACTIONS)
+    1:         alert = result["alerts"][0]
+    1:         case = result["cases"][0]
+    1:         finding = result["findings"][0]
+    1:         anomaly = result["anomalies"][0]
+    1:         self.assertEqual(alert["case_id"], case["case_id"])
+    1:         self.assertEqual(case["finding_ids"], [finding["finding_id"]])
+    1:         self.assertEqual(finding["anomaly_id"], anomaly["anomaly_id"])
+    1:         self.assertEqual(anomaly["transaction_ids"], ["TX001", "TX002"])
+       
+       
+    2: class TestWorkflowNoFabrication(unittest.TestCase):
+    1:     """TEST 8 — every final alert refers to actual Phase 1 transactions."""
+       
+    1:     def test_all_anomaly_transactions_are_real(self):
+    1:         result = run_workflow(REAL_TRANSACTIONS)
+   27:         real_ids = {t["transaction_id"] for t in REAL_TRANSACTIONS}
+    2:         for anomaly in result["anomalies"]:
+    1:             self.assertTrue(set(anomaly["transaction_ids"]).issubset(real_ids))
+               # The alert's evidence values match the real calculation end to end.
+    1:         alert_message = result["alerts"][0]["message"]
+    1:         self.assertIn("12.0", alert_message)
+    1:         self.assertIn("1148.09", alert_message)
+       
+       
+    2: class TestWorkflowRepeatability(unittest.TestCase):
+    1:     """TEST 9 — repeated runs on the same data are identical."""
+       
+    1:     def test_results_are_identical_across_runs(self):
+    1:         first = run_workflow(REAL_TRANSACTIONS)
+    3:         for _ in range(2):
+    2:             again = run_workflow(REAL_TRANSACTIONS)
+    2:             self.assertEqual(again["workflow_status"], first["workflow_status"])
+    2:             self.assertEqual(again["anomalies"], first["anomalies"])
+    2:             self.assertEqual(again["findings"], first["findings"])
+    2:             self.assertEqual(again["cases"], first["cases"])
+    2:             self.assertEqual(again["alerts"], first["alerts"])
+       
+       
+    2: class TestWorkflowInvalidInput(unittest.TestCase):
+    1:     """Catastrophic input fails at the attributed stage, not vaguely."""
+       
+    1:     def test_invalid_input_reported_at_agent_1(self):
+    1:         result = run_workflow("not a list of transactions")
+    1:         self.assertEqual(result["workflow_status"], "failed")
+    1:         self.assertEqual(result["stages"]["agent_1"], "failed")
+    1:         self.assertEqual(len(result["errors"]), 1)
+    1:         self.assertEqual(result["errors"][0]["stage"], "agent_1")
+    1:         self.assertIn("list", result["errors"][0]["error"])
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

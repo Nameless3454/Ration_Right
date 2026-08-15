@@ -1,0 +1,386 @@
+    1: """RationRight — Phase 8: Data Pipeline status, quality, freshness, lineage.
+       
+       Covers ``pipeline.py``: the 8-stage pipeline status, overall health checks,
+       data freshness thresholds, the data quality panel (reusing the Phase 4
+       formula), server-side run history with filters/search/pagination, per-run
+       lineage (source -> import -> records -> database -> analysis -> AI), and the
+       real connection-test probe. Also verifies that ``POST /api/analyze`` records
+       a durable analysis run so AI insights trace back to their dataset.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import json
+    1: import tempfile
+    1: import threading
+    1: import unittest
+    1: import urllib.error
+    1: import urllib.request
+    1: from pathlib import Path
+       
+    1: import database as db
+    1: import pipeline as pl
+    1: from connectors.errors import AuthError, UnreachableError
+    1: from server import make_server
+       
+    1: BASE = "http://127.0.0.1"
+       
+       
+    1: def _seed(conn):
+           """Deterministic temp DB: synthetic seed + one completed upload import."""
+    9:     db.seed_synthetic(conn)
+    9:     src = db.get_data_source_by_name(conn, "Uploaded Dataset")
+    9:     if src is None:
+   18:         src_id = db.insert_data_source(
+    9:             conn, name="Uploaded Dataset", source_type="MANUAL",
+    9:             description="test", status="ACTIVE",
+               )
+           else:
+               src_id = src["id"]
+   18:     imp_id = db.insert_data_import(
+    9:         conn, data_source_id=src_id, dataset_name="up_test_aug",
+    9:         file_name="up_test.csv", file_type="CSV", record_count=100,
+    9:         successful_records=90, failed_records=6, duplicate_records=4,
+    9:         warnings_count=5, status="PARTIAL",
+           )
+           # Two real transaction rows so lineage counts are meaningful.
+   18:     db.upsert_beneficiaries(conn, [{"external_reference": "RB01", "district": "Lucknow",
+    9:                                     "ration_category": "AAY", "family_size": 4, "status": "ACTIVE"}])
+    9:     ben_map = db.beneficiary_ids(conn, ["RB01"])
+   18:     db.insert_transactions_batch(conn, [
+   18:         {"external_transaction_id": "UP1", "beneficiary_id": ben_map["RB01"],
+    9:          "fps_center_id": None, "transaction_date": "2026-08-01", "commodity": "rice",
+    9:          "quantity": 10.0, "unit": "kg", "latitude": 26.8, "longitude": 80.9,
+    9:          "status": "COMPLETED", "source_import_id": imp_id},
+   18:         {"external_transaction_id": "UP2", "beneficiary_id": ben_map["RB01"],
+    9:          "fps_center_id": None, "transaction_date": "2026-08-02", "commodity": "wheat",
+    9:          "quantity": 5.0, "unit": "kg", "latitude": 26.9, "longitude": 81.0,
+    9:          "status": "COMPLETED", "source_import_id": imp_id},
+           ])
+    9:     conn.commit()
+    9:     return src_id, imp_id
+       
+       
+    2: class PipelineStatusTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.db_path = Path(self._tmp.name) / "pipe.db"
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_status_stages_reflect_real_database(self):
+               """Each stage reports counts computed from the actual database."""
+    1:         _seed(self.conn)
+    1:         status = pl.pipeline_status(db_path=self.db_path)
+   10:         by_key = {s["key"]: s for s in status["stages"]}
+               # source: 2 configured sources (synthetic + uploaded)
+    1:         self.assertEqual(by_key["source"]["records"], 2)
+               # extract: sum of record_count across imports = 25 + 100
+    1:         self.assertEqual(by_key["extract"]["records"], 125)
+               # validate: sum of successful/failed/warnings
+    1:         self.assertEqual(by_key["validate"]["records"], 25 + 90)
+    1:         self.assertIn("6 invalid", by_key["validate"]["detail"])
+               # deduplicate: 4 duplicates reported (0 from synthetic)
+    1:         self.assertEqual(by_key["deduplicate"]["records"], 4)
+               # database: stored rows exist
+    1:         self.assertGreater(by_key["database"]["records"], 0)
+               # ai: no analysis run yet -> warn/unknown, never a fake number
+    1:         self.assertIn(by_key["ai"]["status"], ("warn", "unknown"))
+    1:         self.assertEqual(by_key["ai"]["records"], 0)
+       
+    1:     def test_overall_warns_without_analysis_then_healthy_after_run(self):
+    1:         db.seed_synthetic(self.conn)  # last import COMPLETED
+    1:         self.assertEqual(pl.pipeline_status(db_path=self.db_path)["overall"], "WARNING")
+    2:         pl.record_analysis_run(
+    2:             {"anomalies": [], "findings": [], "cases": [], "alerts": [],
+    1:              "errors": [], "workflow_status": "completed"},
+    1:             dataset_mode="synthetic", db_path=self.db_path,
+               )
+    1:         self.assertEqual(pl.pipeline_status(db_path=self.db_path)["overall"], "HEALTHY")
+       
+    1:     def test_overall_error_when_last_import_failed(self):
+    1:         db.seed_synthetic(self.conn)
+    1:         src = db.get_data_source_by_name(self.conn, "Uploaded Dataset")
+    1:         if src is None:
+    2:             src_id = db.insert_data_source(
+    1:                 self.conn, name="Uploaded Dataset", source_type="MANUAL", status="ACTIVE")
+               else:
+                   src_id = src["id"]
+    2:         db.insert_data_import(
+    1:             self.conn, data_source_id=src_id, dataset_name="broken",
+    1:             record_count=0, failed_records=1, status="FAILED",
+               )
+    1:         self.conn.commit()
+    1:         self.assertEqual(pl.pipeline_status(db_path=self.db_path)["overall"], "ERROR")
+       
+       
+    2: class FreshnessTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.db_path = Path(self._tmp.name) / "fresh.db"
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_unknown_without_imports(self):
+    1:         f = pl.freshness(db_path=self.db_path)
+    1:         self.assertEqual(f["status"], "UNKNOWN")
+    1:         self.assertIsNone(f["latest_data_at"])
+       
+    1:     def test_fresh_after_seed(self):
+    1:         db.seed_synthetic(self.conn)
+    1:         f = pl.freshness(db_path=self.db_path)
+    1:         self.assertEqual(f["status"], "FRESH")
+    1:         self.assertIsNotNone(f["age_label"])
+       
+    1:     def test_stale_with_old_timestamp(self):
+    1:         db.seed_synthetic(self.conn)
+    2:         self.conn.execute(
+    1:             "UPDATE data_imports SET completed_at = '2026-01-01T00:00:00'"
+               )
+    1:         self.conn.commit()
+    1:         self.assertEqual(pl.freshness(db_path=self.db_path)["status"], "UNKNOWN")
+       
+       
+    2: class QualityPanelTests(unittest.TestCase):
+    1:     def setUp(self):
+    2:         self._tmp = tempfile.TemporaryDirectory()
+    2:         self.db_path = Path(self._tmp.name) / "quality.db"
+    2:         self.addCleanup(self._tmp.cleanup)
+    2:         self.conn = db.open_db(self.db_path)
+       
+    1:     def test_score_matches_phase4_formula(self):
+    1:         _seed(self.conn)
+    1:         q = pl.quality_panel(db_path=self.db_path)
+               # Synthetic import: 25/25/0/0 -> 100. Upload: 100 records, 6 invalid,
+               # 4 dupes, 5 warnings -> 100 - 3*6 - 2*4 - 0.5*5 = 100-18-8-2.5 = 71.5.
+               # Weighted: (100*25 + 71.5*100) / 125 = (2500 + 7150)/125 = 77.2.
+    1:         self.assertEqual(q["overall_score"], 77.2)
+    1:         self.assertEqual(q["breakdown"]["completeness"], None)  # not stored -> Not available
+    1:         self.assertEqual(q["totals"]["records"], 125)
+       
+    1:     def test_empty_database(self):
+    1:         q = pl.quality_panel(db_path=self.db_path)
+    1:         self.assertIsNone(q["overall_score"])
+    1:         self.assertEqual(q["totals"]["records"], 0)
+       
+       
+    2: class PipelineRunsTests(unittest.TestCase):
+    1:     def setUp(self):
+    4:         self._tmp = tempfile.TemporaryDirectory()
+    4:         self.db_path = Path(self._tmp.name) / "runs.db"
+    4:         self.addCleanup(self._tmp.cleanup)
+    4:         self.conn = db.open_db(self.db_path)
+    4:         self.src_id, self.imp_id = _seed(self.conn)
+       
+    1:     def test_runs_listed_with_quality(self):
+    1:         data = pl.pipeline_runs(db_path=self.db_path)
+    1:         self.assertEqual(data["total"], 2)
+    4:         ids = {r["id"] for r in data["runs"]}
+    1:         self.assertIn(self.imp_id, ids)
+    4:         by_id = {r["id"]: r for r in data["runs"]}
+    1:         self.assertEqual(by_id[self.imp_id]["quality_score"], 71.5)
+    4:         self.assertIn("Uploaded Dataset", [s["name"] for s in data["sources"]])
+       
+    1:     def test_source_filter(self):
+    1:         data = pl.pipeline_runs(db_path=self.db_path, source=self.src_id)
+    1:         self.assertEqual(data["total"], 1)
+    1:         self.assertEqual(data["runs"][0]["id"], self.imp_id)
+       
+    1:     def test_status_filter_and_search(self):
+    1:         data = pl.pipeline_runs(db_path=self.db_path, status="PARTIAL")
+    1:         self.assertEqual(data["total"], 1)
+    1:         self.assertEqual(data["runs"][0]["status"], "PARTIAL")
+    1:         data = pl.pipeline_runs(db_path=self.db_path, q="up_test")
+    1:         self.assertEqual(data["total"], 1)
+    1:         data = pl.pipeline_runs(db_path=self.db_path, q="nonexistent")
+    1:         self.assertEqual(data["total"], 0)
+       
+    1:     def test_pagination(self):
+    1:         data = pl.pipeline_runs(db_path=self.db_path, page=1, per_page=1)
+    1:         self.assertEqual(len(data["runs"]), 1)
+    1:         self.assertEqual(data["pages"], 2)
+    1:         self.assertEqual(data["total"], 2)
+    1:         page2 = pl.pipeline_runs(db_path=self.db_path, page=2, per_page=1)
+    1:         self.assertNotEqual(data["runs"][0]["id"], page2["runs"][0]["id"])
+       
+       
+    2: class LineageTests(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self._tmp = tempfile.TemporaryDirectory()
+    3:         self.db_path = Path(self._tmp.name) / "lineage.db"
+    3:         self.addCleanup(self._tmp.cleanup)
+    3:         self.conn = db.open_db(self.db_path)
+    3:         self.src_id, self.imp_id = _seed(self.conn)
+       
+    1:     def test_run_detail_lineage_chain(self):
+    2:         pl.record_analysis_run(
+    2:             {"anomalies": [{}], "findings": [{}], "cases": [{}], "alerts": [{}],
+    1:              "errors": [], "workflow_status": "completed"},
+    1:             dataset_mode="real", data_import_id=self.imp_id, db_path=self.db_path,
+               )
+    1:         detail = pl.run_detail(self.imp_id, db_path=self.db_path)
+    1:         self.assertIsNotNone(detail)
+    1:         self.assertEqual(detail["import"]["data_import_id"], self.imp_id)
+    1:         self.assertEqual(detail["source"]["name"], "Uploaded Dataset")
+    1:         self.assertEqual(detail["records"]["record_count"], 100)
+    1:         self.assertEqual(detail["records"]["quality"]["score"], 71.5)
+    1:         self.assertEqual(detail["database"]["transactions"], 2)  # this import's rows
+    1:         self.assertEqual(detail["database"]["beneficiaries"], 1)
+    1:         self.assertEqual(len(detail["analysis_runs"]), 1)
+    1:         self.assertEqual(detail["analysis_runs"][0]["dataset_mode"], "real")
+    1:         self.assertEqual(detail["analysis_runs"][0]["alert_count"], 1)
+       
+    1:     def test_run_detail_unknown_import(self):
+    1:         self.assertIsNone(pl.run_detail(999999, db_path=self.db_path))
+       
+    1:     def test_record_analysis_run_statuses(self):
+    2:         run = pl.record_analysis_run(
+    2:             {"anomalies": [], "findings": [], "cases": [], "alerts": [],
+    1:              "errors": [], "skipped_reason": "Dataset has 1 transaction record(s).",
+    1:              "workflow_status": "completed"},
+    1:             dataset_mode="real", data_import_id=self.imp_id, db_path=self.db_path,
+               )
+    1:         self.assertTrue(run["analysis_id"].startswith("RA-"))
+    1:         conn = db.open_db(self.db_path)
+    1:         try:
+    1:             runs = db.get_analysis_runs_for_import(conn, import_id=self.imp_id)
+               finally:
+    1:             conn.close()
+    1:         self.assertEqual(runs[0]["status"], "INSUFFICIENT_DATA")
+    1:         self.assertEqual(runs[0]["summary"], "Dataset has 1 transaction record(s).")
+       
+       
+    2: class ConnectionTestTests(unittest.TestCase):
+    1:     def setUp(self):
+    5:         self._tmp = tempfile.TemporaryDirectory()
+    5:         self.db_path = Path(self._tmp.name) / "conn.db"
+    5:         self.addCleanup(self._tmp.cleanup)
+    5:         self.conn = db.open_db(self.db_path)
+    5:         db.seed_synthetic(self.conn)
+       
+    1:     def _add_source(self, name, source_type, base_url, status="ACTIVE"):
+    8:         sid = db.insert_data_source(
+    4:             self.conn, name=name, source_type=source_type,
+    4:             description="t", status=status, base_url=base_url,
+               )
+    4:         self.conn.commit()  # release the write lock before probe connections
+    4:         return sid
+       
+    1:     def test_unknown_source(self):
+    1:         probe = pl.test_connection(999999, db_path=self.db_path)
+    1:         self.assertEqual(probe["category"], "UNKNOWN_SOURCE")
+    1:         self.assertEqual(probe["status"], "error")
+       
+    1:     def test_ogd_without_key_is_not_tested(self):
+               """Auth-required source with no key: NOT_CONFIGURED, never fetched."""
+    1:         sid = self._add_source("ogd_pds_resource", "API", "https://example.in/api")
+    1:         probe = pl.test_connection(sid, db_path=self.db_path)
+    1:         self.assertEqual(probe["category"], "AUTH_NOT_CONFIGURED")
+    1:         self.assertEqual(probe["status"], "not_configured")
+    1:         self.assertIn("NOT tested", probe["detail"])
+       
+    1:     def test_successful_probe(self):
+    1:         sid = self._add_source("sample_open_pds", "CSV", "/sample/pds_sample.csv")
+    2:         probe = pl.test_connection(
+    1:             sid, db_path=self.db_path, request_host="127.0.0.1:8000",
+    2:             fetcher=lambda url, timeout=6, max_attempts=1: b"a,b,c\n1,2,3\n",
+               )
+    1:         self.assertEqual(probe["status"], "ok")
+    1:         self.assertEqual(probe["category"], "CONNECTION_OK")
+       
+    1:     def test_auth_failure_probe(self):
+    1:         sid = self._add_source("sample_open_pds", "CSV", "/sample/pds_sample.csv")
+    1:         def fail(url, timeout=6, max_attempts=1):
+    1:             raise AuthError("The source rejected the request credentials (HTTP 401)")
+    2:         probe = pl.test_connection(
+    1:             sid, db_path=self.db_path, request_host="127.0.0.1:8000", fetcher=fail,
+               )
+    1:         self.assertEqual(probe["category"], "AUTH_FAILED")
+       
+    1:     def test_unreachable_probe(self):
+    1:         sid = self._add_source("sample_open_pds", "CSV", "/sample/pds_sample.csv")
+    1:         def fail(url, timeout=6, max_attempts=1):
+    1:             raise UnreachableError("Could not reach the source")
+    2:         probe = pl.test_connection(
+    1:             sid, db_path=self.db_path, request_host="127.0.0.1:8000", fetcher=fail,
+               )
+    1:         self.assertEqual(probe["category"], "UNREACHABLE")
+       
+       
+    2: class PipelineApiTests(unittest.TestCase):
+    1:     """End-to-end API tests against the real server (dev DB)."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.server = make_server("127.0.0.1", 0)
+    1:         cls.port = cls.server.server_address[1]
+    1:         cls.base = f"{BASE}:{cls.port}"
+    1:         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+    1:         cls.thread.start()
+       
+    1:     @classmethod
+    1:     def tearDownClass(cls):
+    1:         cls.server.shutdown()
+    1:         cls.server.server_close()
+       
+    1:     def request(self, method, path, body=None):
+    8:         data = json.dumps(body).encode("utf-8") if body is not None else None
+    8:         headers = {"Content-Type": "application/json"} if data else {}
+    8:         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+    8:         try:
+    8:             with urllib.request.urlopen(req, timeout=20) as response:
+    6:                 return response.status, response.read().decode("utf-8")
+    2:         except urllib.error.HTTPError as exc:
+    2:             return exc.code, exc.read().decode("utf-8")
+       
+    1:     def test_pipeline_status_endpoint(self):
+    1:         status, body = self.request("GET", "/api/pipeline/status")
+    1:         self.assertEqual(status, 200)
+    1:         payload = json.loads(body)
+    1:         self.assertIn(payload["overall"], ("HEALTHY", "WARNING", "ERROR"))
+    1:         self.assertEqual(len(payload["stages"]), 8)
+       
+    1:     def test_pipeline_freshness_endpoint(self):
+    1:         status, body = self.request("GET", "/api/pipeline/freshness")
+    1:         self.assertEqual(status, 200)
+    1:         self.assertIn(json.loads(body)["status"], ("FRESH", "RECENT", "STALE", "UNKNOWN"))
+       
+    1:     def test_pipeline_runs_endpoint(self):
+    1:         status, body = self.request("GET", "/api/pipeline/runs?per_page=5")
+    1:         self.assertEqual(status, 200)
+    1:         payload = json.loads(body)
+    1:         self.assertIn("runs", payload)
+    1:         self.assertIn("total", payload)
+       
+    1:     def test_pipeline_run_detail_endpoint(self):
+    1:         _, body = self.request("GET", "/api/pipeline/runs?per_page=1")
+    1:         run_id = json.loads(body)["runs"][0]["id"]
+    1:         status, body = self.request("GET", "/api/pipeline/runs/%d" % run_id)
+    1:         self.assertEqual(status, 200)
+    1:         detail = json.loads(body)
+    6:         for key in ("import", "source", "records", "database", "analysis_runs"):
+    5:             self.assertIn(key, detail)
+       
+    1:     def test_pipeline_run_detail_unknown(self):
+    1:         status, _ = self.request("GET", "/api/pipeline/runs/999999")
+    1:         self.assertEqual(status, 404)
+       
+    1:     def test_connection_test_unknown_source(self):
+    1:         status, body = self.request("POST", "/api/data-sources/999999/test", {})
+    1:         self.assertEqual(status, 404)
+       
+    1:     def test_analyze_records_analysis_run(self):
+               """POST /api/analyze now persists lineage metadata in the result."""
+    1:         status, body = self.request("POST", "/api/analyze", {"dataset": "synthetic"})
+    1:         self.assertEqual(status, 200)
+    1:         result = json.loads(body)
+    1:         run = result.get("analysis_run")
+    1:         self.assertIsNotNone(run)
+    1:         self.assertTrue(run["analysis_id"].startswith("RA-"))
+    1:         self.assertEqual(run["status"], "COMPLETED")
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()

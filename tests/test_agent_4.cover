@@ -1,0 +1,237 @@
+    1: """RationRight — Phase 5: Agent 4 (Alert Generator) tests.
+       
+       Run from the project root::
+       
+           python3 -m unittest discover -s tests -t . -v
+       """
+       
+    1: import unittest
+       
+    1: from agents.agent_1_transaction_analyst import Agent1TransactionAnalyst
+    1: from agents.agent_2_anomaly_investigator import Agent2AnomalyInvestigator
+    1: from agents.agent_3_evidence_case_builder import Agent3EvidenceCaseBuilder
+    1: from agents.agent_4_alert_generator import Agent4AlertGenerator
+    1: from scripts.validate_dataset import DEFAULT_DATASET_PATH, load_dataset
+       
+    1: ALERT_FIELDS = {
+           "alert_id",
+           "case_id",
+           "severity",
+           "title",
+           "message",
+           "recommended_action",
+           "status",
+       }
+       
+       
+    1: def real_case():
+           """Run the real Agent 1 → 2 → 3 chain to produce a genuine case."""
+    5:     dataset = load_dataset(DEFAULT_DATASET_PATH)
+    5:     transactions = dataset["transactions"]
+    5:     anomalies = Agent1TransactionAnalyst().run(transactions)["anomalies"]
+   10:     finding = Agent2AnomalyInvestigator().run(
+    5:         {"anomaly": anomalies[0], "transactions": transactions}
+           )
+   10:     return Agent3EvidenceCaseBuilder().run(
+    5:         {"findings": [finding], "transactions": transactions}
+           )
+       
+       
+    1: def ready_case(case_id="CASE001", severity="high", evidence=None, summary="Summary."):
+           """Build a well-formed Agent 3-style case for isolated tests."""
+    8:     return {
+    8:         "case_id": case_id,
+    8:         "severity": severity,
+    8:         "status": "requires_human_review",
+    8:         "finding_ids": ["FIND001"],
+    8:         "summary": summary,
+   13:         "evidence": evidence if evidence is not None else [
+    5:             {"type": "time_difference", "value": 12.0, "unit": "minutes"},
+    5:             {"type": "distance", "value": 1148.09, "unit": "km"},
+               ],
+    8:         "confidence": 0.9,
+    8:         "recommended_action": "Human verification",
+           }
+       
+       
+    2: class TestAgent4ValidCase(unittest.TestCase):
+    1:     """TEST 1 — the REAL Agent 3 case produces a valid review alert."""
+       
+    1:     @classmethod
+    1:     def setUpClass(cls):
+    1:         cls.case = real_case()
+    1:         cls.alert = Agent4AlertGenerator().run(cls.case)
+       
+    1:     def test_alert_is_generated(self):
+    1:         self.assertEqual(set(self.alert.keys()), ALERT_FIELDS)
+    1:         self.assertEqual(self.alert["alert_id"], "ALERT001")
+    1:         self.assertEqual(self.alert["case_id"], "CASE001")
+    1:         self.assertEqual(self.alert["status"], "open")
+    1:         self.assertEqual(self.alert["severity"], "high")
+    1:         self.assertEqual(self.alert["recommended_action"], "Human verification")
+    1:         self.assertTrue(self.alert["title"])
+    1:         self.assertTrue(self.alert["message"])
+       
+    1:     def test_message_contains_verified_evidence(self):
+    1:         message = self.alert["message"]
+    1:         self.assertIn("12.0", message)
+    1:         self.assertIn("1148.09", message)
+       
+    1:     def test_language_is_careful(self):
+    1:         text = (self.alert["title"] + " " + self.alert["message"]).lower()
+    7:         for banned in ("guilty", "fraud", "block", "deny", "suspend", "punish"):
+    6:             self.assertNotIn(banned, text)
+    1:         self.assertIn("human verification", text)
+       
+       
+    2: class TestAgent4UnverifiedCase(unittest.TestCase):
+    1:     """TEST 2 — a not-ready case never produces a normal review alert."""
+       
+    1:     def test_not_ready_case_alert(self):
+    1:         case = {
+    1:             "case_id": "CASE002",
+    1:             "severity": "low",
+    1:             "status": "not_ready",
+    1:             "finding_ids": ["FIND001"],
+    1:             "summary": "Case is not ready.",
+    1:             "evidence": [],
+    1:             "confidence": 0.0,
+    1:             "recommended_action": "Human verification",
+               }
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertEqual(alert["status"], "not_ready")
+    1:         self.assertNotEqual(alert["status"], "open")
+    1:         self.assertEqual(alert["severity"], "low")
+       
+       
+    2: class TestAgent4MissingEvidence(unittest.TestCase):
+    1:     """TEST 3 — missing evidence fails safely with a not-ready alert."""
+       
+    1:     def test_missing_evidence_not_ready(self):
+    1:         case = ready_case(case_id="CASE003", evidence=[])
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertEqual(alert["status"], "not_ready")
+    1:         self.assertEqual(alert["severity"], "low")
+    1:         self.assertIn("evidence", alert["message"].lower())
+       
+    1:     def test_missing_required_evidence_type_not_ready(self):
+    2:         case = ready_case(
+    1:             case_id="CASE004",
+    1:             evidence=[{"type": "time_difference", "value": 12.0, "unit": "minutes"}],
+               )
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertEqual(alert["status"], "not_ready")
+       
+       
+    2: class TestAgent4EvidencePreservation(unittest.TestCase):
+    1:     """TEST 4 — Agent 3/Agent 2 evidence values are preserved exactly."""
+       
+    1:     def test_real_case_values_preserved(self):
+    1:         case = real_case()
+    1:         alert = Agent4AlertGenerator().run(case)
+    3:         for entry in case["evidence"]:
+    2:             self.assertIn(str(entry["value"]), alert["message"])
+    1:         self.assertEqual(alert["severity"], case["severity"])
+       
+    1:     def test_custom_values_preserved(self):
+    2:         case = ready_case(
+    1:             case_id="CASE005",
+    1:             severity="medium",
+    1:             evidence=[
+    1:                 {"type": "time_difference", "value": 25.0, "unit": "minutes"},
+    1:                 {"type": "distance", "value": 500.5, "unit": "km"},
+                   ],
+               )
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertEqual(alert["severity"], "medium")
+    1:         self.assertIn("25.0", alert["message"])
+    1:         self.assertIn("500.5", alert["message"])
+       
+       
+    2: class TestAgent4NoFabrication(unittest.TestCase):
+    1:     """TEST 5 — every alert fact comes from the Agent 3 input."""
+       
+    1:     def test_message_contains_only_input_values(self):
+    1:         case = real_case()
+    1:         alert = Agent4AlertGenerator().run(case)
+               # No transaction or beneficiary IDs are guessed into the message.
+    1:         self.assertNotIn("TX", alert["message"])
+    1:         self.assertNotIn("BEN", alert["message"])
+    1:         self.assertIn("Potential anomaly detected", alert["message"])
+    3:         for entry in case["evidence"]:
+    2:             self.assertIn(str(entry["value"]), alert["message"])
+       
+       
+    2: class TestAgent4PriorityRules(unittest.TestCase):
+    1:     """TEST 6 — severity/priority follows documented deterministic rules."""
+       
+    1:     def test_severity_preserved_for_each_level(self):
+    4:         for severity in ("high", "medium", "low"):
+    3:             case = ready_case(case_id=f"CASE-{severity}", severity=severity)
+    3:             alert = Agent4AlertGenerator().run(case)
+    3:             self.assertEqual(alert["severity"], severity)
+       
+    1:     def test_invalid_severity_rejected(self):
+    1:         case = ready_case(severity="urgent")
+    1:         with self.assertRaises(ValueError):
+    2:             Agent4AlertGenerator().run(case)
+       
+       
+    2: class TestAgent4MissingBeneficiary(unittest.TestCase):
+    1:     """TEST 7 — no beneficiary is ever guessed."""
+       
+    1:     def test_alert_contains_no_beneficiary_identity(self):
+    1:         case = real_case()
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertNotIn("beneficiary_id", alert)
+    1:         self.assertNotIn("BEN", alert["message"])
+    1:         self.assertNotIn("identity", alert["message"].lower())
+       
+       
+    2: class TestAgent4Agent3Compatibility(unittest.TestCase):
+    1:     """TEST 8 — Agent 4 consumes actual Agent 3 output without rewriting."""
+       
+    1:     def test_consumes_actual_agent_3_output(self):
+    1:         case = real_case()
+    1:         self.assertEqual(case["status"], "requires_human_review")
+    1:         alert = Agent4AlertGenerator().run(case)
+    1:         self.assertEqual(alert["status"], "open")
+    1:         self.assertEqual(alert["case_id"], case["case_id"])
+    1:         self.assertEqual(alert["severity"], case["severity"])
+       
+       
+    2: class TestAgent4InvalidInput(unittest.TestCase):
+    1:     """Malformed input produces clear validation errors."""
+       
+    1:     def test_invalid_input_raises(self):
+    1:         generator = Agent4AlertGenerator()
+    1:         with self.assertRaises(ValueError):
+    2:             generator.run("not-a-case")
+    1:         with self.assertRaises(ValueError):
+    2:             generator.run({})
+    1:         with self.assertRaises(ValueError):
+    2:             generator.run(ready_case(case_id="CASE-X", severity="urgent"))
+    1:         with self.assertRaises(ValueError):
+    3:             generator.run({
+    1:                 "case_id": "CASE001", "severity": "high", "status": "bogus",
+    1:                 "finding_ids": ["FIND001"], "summary": "s", "evidence": [],
+    1:                 "confidence": 0.5, "recommended_action": "Human verification",
+                   })
+    1:         with self.assertRaises(ValueError):
+    3:             generator.run({
+    1:                 "case_id": "CASE001", "severity": "high", "status": "requires_human_review",
+    1:                 "finding_ids": ["FIND001"], "summary": "s",
+    1:                 "evidence": [{"type": "time_difference", "value": "abc", "unit": "minutes"}],
+    1:                 "confidence": 0.5, "recommended_action": "Human verification",
+                   })
+    1:         with self.assertRaises(ValueError):
+    3:             generator.run({
+    1:                 "case_id": "CASE001", "severity": "high", "status": "requires_human_review",
+    1:                 "finding_ids": ["FIND001"],
+    1:                 "evidence": [],
+    1:                 "confidence": 0.5, "recommended_action": "Human verification",
+                   })
+       
+       
+    1: if __name__ == "__main__":
+           unittest.main()
