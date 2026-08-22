@@ -34,6 +34,7 @@ from database import (
     insert_data_import,
     insert_data_source,
     insert_inventory_batch,
+    insert_operational_summaries_batch,
     insert_transactions_batch,
     upsert_beneficiaries,
     upsert_fps_centers,
@@ -120,6 +121,7 @@ def run_import(
     pending_centers = []
     pending_transactions = []
     pending_inventory = []
+    pending_operational_summaries = []
     counters = {
         "imported": 0, "failed": 0, "duplicates": 0,
         "duplicates_exact": 0, "duplicates_possible": 0, "warnings": 0,
@@ -165,6 +167,9 @@ def run_import(
                 resolved.append(row)
             insert_inventory_batch(conn, resolved)
             pending_inventory.clear()
+        if pending_operational_summaries:
+            insert_operational_summaries_batch(conn, pending_operational_summaries)
+            pending_operational_summaries.clear()
 
     for row_number, row in enumerate(rows, start=2):
         record = _record_from_row(row, headers, mapping)
@@ -223,7 +228,7 @@ def run_import(
             pending_transactions, pending_inventory,
         )
         counters["imported"] += 1
-        if len(pending_transactions) + len(pending_inventory) + len(pending_beneficiaries) + len(pending_centers) >= BATCH_SIZE:
+        if len(pending_transactions) + len(pending_inventory) + len(pending_beneficiaries) + len(pending_centers) + len(pending_operational_summaries) >= BATCH_SIZE:
             flush()
 
     flush()
@@ -348,6 +353,26 @@ def _stage_record(
             "monthly_consumption": normalized.get("monthly_consumption"),
             "reorder_threshold": normalized.get("reorder_threshold"),
             "last_updated": normalized.get("last_updated"),
+            "source_import_id": import_id,
+        })
+        return
+
+    if dataset_type == "operational_summary":
+        pending_operational_summaries.append({
+            "district": normalized.get("district", ""),
+            "state": normalized.get("state"),
+            "total_cards": normalized.get("total_cards", 0.0),
+            "biometric_transactions": normalized.get("biometric_transactions", 0.0),
+            "aadhaar_otp_transactions": normalized.get("aadhaar_otp_transactions", 0.0),
+            "mobile_otp_transactions": normalized.get("mobile_otp_transactions", 0.0),
+            "iris_transactions": normalized.get("iris_transactions", 0.0),
+            "partial_offline_transactions": normalized.get("partial_offline_transactions", 0.0),
+            "total_transactions": normalized.get("total_transactions", 0.0),
+            "portability_transactions": normalized.get("portability_transactions", 0.0),
+            "online_transactions": normalized.get("online_transactions", 0.0),
+            "total_availed_percent": normalized.get("total_availed_percent", 0.0),
+            "partial_percent": normalized.get("partial_percent", 0.0),
+            "report_date": normalized.get("report_date"),
             "source_import_id": import_id,
         })
         return

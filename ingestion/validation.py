@@ -351,7 +351,7 @@ def validate_record(record: dict, dataset_type: str):
             warnings.append(warning)
 
     # --- dates ---
-    for field in ("transaction_date", "last_updated"):
+    for field in ("transaction_date", "last_updated", "report_date"):
         raw = record.get(field)
         if raw is None or to_text(raw) == "":
             continue
@@ -370,6 +370,12 @@ def validate_record(record: dict, dataset_type: str):
     for field, minimum in (
         ("quantity", 0.0), ("capacity", 0.0), ("current_stock", 0.0),
         ("monthly_consumption", 0.0), ("reorder_threshold", 0.0),
+        ("total_cards", 0.0), ("biometric_transactions", 0.0),
+        ("aadhaar_otp_transactions", 0.0), ("mobile_otp_transactions", 0.0),
+        ("iris_transactions", 0.0), ("partial_offline_transactions", 0.0),
+        ("total_transactions", 0.0), ("portability_transactions", 0.0),
+        ("online_transactions", 0.0), ("total_availed_percent", 0.0),
+        ("partial_percent", 0.0),
     ):
         raw = record.get(field)
         if raw is None or to_text(raw) == "":

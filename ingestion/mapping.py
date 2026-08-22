@@ -19,7 +19,7 @@ import re
 from ingestion.parsers import ParseError
 
 # Dataset kinds the importer understands.
-DATASET_TYPES = ("beneficiaries", "fps_centers", "ration_transactions", "inventory", "combined")
+DATASET_TYPES = ("beneficiaries", "fps_centers", "ration_transactions", "inventory", "combined", "operational_summary")
 
 DATASET_TYPE_LABELS = {
     "beneficiaries": "Beneficiaries",
@@ -27,6 +27,7 @@ DATASET_TYPE_LABELS = {
     "ration_transactions": "Ration Transactions",
     "inventory": "Inventory",
     "combined": "Combined Dataset",
+    "operational_summary": "Operational / District Summary",
 }
 
 # Human-readable labels for the internal fields (used by the mapping UI).
@@ -87,6 +88,14 @@ FIELDS_BY_TYPE = {
         "ration_category", "family_size",
         "name", "location", "capacity",
     ),
+    "operational_summary": (
+        "district", "total_cards", "biometric_transactions",
+        "aadhaar_otp_transactions", "mobile_otp_transactions",
+        "iris_transactions", "partial_offline_transactions",
+        "total_transactions", "portability_transactions",
+        "online_transactions", "total_availed_percent",
+        "partial_percent", "report_date", "state",
+    ),
 }
 
 # Required internal fields per dataset type (documented Phase 4 rules).
@@ -98,6 +107,7 @@ REQUIRED_FIELDS = {
     "ration_transactions": ("fps_center_id", "transaction_date", "commodity", "quantity"),
     "inventory": ("fps_center_id", "commodity", "current_stock"),
     "combined": ("fps_center_id", "transaction_date", "commodity", "quantity"),
+    "operational_summary": ("district",),
 }
 
 # Extendable alias table: internal field -> accepted external names
@@ -127,21 +137,36 @@ FIELD_ALIASES = {
     "fps_center_id": {
         "fpsid", "fps", "fairpriceshopcode", "shopcode", "centerid", "center",
         "fpscenter", "fpscode", "outletcode",
+        "fps_id", "fpsname", "fps_name", "fairpriceshopname",
+        "shopname", "shop_name", "distributioncenter",
+        "fpscentre", "fps_centre",
     },
     "transaction_date": {
         "transactiondate", "date", "datedistributed", "distributiondate",
         "timestamp", "txdate", "dateofdistribution", "transactiontime",
         "distributedon", "saledate", "issuedate",
+        "transaction_date", "distribution_date", "distributiondate",
+        "date_of_distribution", "txdate", "transdate",
+        "trans_date", "date_time", "datetime", "transactedon",
     },
     "commodity": {
         "commodity", "rationtype", "item", "itemname", "commodityname",
         "grain", "product", "material", "ration", "commoditytype", "itemtype",
         "goodstype", "commoditycode",
+        "commodity_name", "item_name", "product_name",
+        "commoditytype", "distributiontype", "distribution_type",
+        "ration_type", "food_item", "fooditem",
     },
     "quantity": {
         "quantity", "qty", "qtydistributed", "quantitydistributed", "amount",
         "quantitykg", "distributedqty", "kg", "quantityissued", "issueqty",
         "units", "quantityinkg", "weight", "qtyissued",
+        "quantity_kg", "qty_kg", "distributed_quantity",
+        "distribution_qty", "issue_quantity", "issued_qty",
+        "weight_kg", "total_qty", "total_quantity",
+        "quantitydistributedkg", "qtydistributedkg",
+        "weightkg", "totalqty", "distributedquantity",
+        "distributionquantity", "quantitydispensed",
     },
     "unit": {"unit", "units", "uom", "unitofmeasure"},
     "latitude": {"latitude", "lat", "latitudevalue"},
@@ -175,6 +200,59 @@ FIELD_ALIASES = {
         "lastupdated", "updated", "asof", "reportdate", "stockdate", "updatedate",
     },
     "status": {"status", "recordstatus", "stateflag"},
+    # Operational summary fields
+    "total_cards": {
+        "totalcards", "total_cards", "cards", "noofcards", "numberofcards",
+        "totalbeneficiaries", "total_beneficiaries", "beneficiarycount",
+        "beneficiary_count", "cardholders", "card_holders", "totalcard",
+    },
+    "biometric_transactions": {
+        "biometric", "biometric_transactions", "biometrictx", "biometriccount",
+        "biometric_count", "bio_auth", "biometric_auth",
+    },
+    "aadhaar_otp_transactions": {
+        "aadharotp", "aadhaarotp", "aadhaar_otp", "aadhaar_otp_transactions",
+        "aadhaarotptx", "aadhaarotcount", "aadharotpcount",
+        "aadhaarotpcount", "aadhaar_otp_count", "aadharnotp",
+    },
+    "mobile_otp_transactions": {
+        "mobileotp", "mobile_otp", "mobile_otp_transactions",
+        "mobileotptx", "mobileotcount", "mobileotpcount",
+        "mobile_otp_count", "smsotp", "sms_otp",
+    },
+    "iris_transactions": {
+        "iris", "iris_transactions", "iristx", "iriscount",
+        "iris_count", "iris_auth",
+    },
+    "partial_offline_transactions": {
+        "partialoffline", "partial_offline", "partial_offline_transactions",
+        "partialofflinetx", "partialofflinecount", "partial_offline_count",
+    },
+    "total_transactions": {
+        "total", "total_transactions", "totaltx", "grandtotal",
+        "grand_total", "totalcount", "total_count",
+    },
+    "portability_transactions": {
+        "portability", "portability_transactions", "portabilitytx",
+        "portabilitycount", "portability_count", "portable",
+    },
+    "online_transactions": {
+        "online", "online_transactions", "onlinetx", "onlinecount",
+        "online_count", "online_auth",
+    },
+    "total_availed_percent": {
+        "totalavailedpercent", "total_availed_percent", "availedpercent",
+        "availed_percent", "pctavailed", "pct_availed",
+        "availedpct", "totalavailed", "total_availed",
+    },
+    "partial_percent": {
+        "partialpercent", "partial_percent", "partialpct",
+        "partialpct", "partial", "partialp",
+    },
+    "report_date": {
+        "reportdate", "report_date", "reportingdate", "reporting_date",
+        "asofdate", "as_of_date", "data_date", "period",
+    },
 }
 
 # Fields whose values are constrained to an enumeration (validated at import).
@@ -184,6 +262,7 @@ STATUS_ALLOWED = {
     "ration_transactions": ("COMPLETED", "PENDING", "FAILED", "CANCELLED"),
     "inventory": (),
     "combined": ("COMPLETED", "PENDING", "FAILED", "CANCELLED"),
+    "operational_summary": (),
 }
 
 
@@ -251,12 +330,19 @@ def detect_mapping(headers: list, dataset_type: str) -> dict:
 def infer_dataset_type(headers: list) -> str:
     """Guess the dataset kind from the columns present.
 
-    Order of checks: inventory (stock columns, no quantity), transactions
+    Order of checks: operational summary (district + total_cards/total columns,
+    no commodity/quantity), inventory (stock columns, no quantity), transactions
     (commodity + quantity/date), FPS centers (fps code, no commodity),
     beneficiaries (beneficiary ref, no quantity), default transactions."""
     normalized = {normalize_header(h) for h in headers if normalize_header(h)}
     has = lambda field, aliases: bool(normalized & (set(aliases) | {field}))
 
+    # Operational summary: has district AND total_cards or total columns,
+    # but no commodity or quantity columns (district-level summary report).
+    has_district = has("district", FIELD_ALIASES["district"])
+    has_total_cards = has("total_cards", FIELD_ALIASES["total_cards"])
+    has_total_tx = has("total_transactions", FIELD_ALIASES["total_transactions"])
+    has_biometric = has("biometric_transactions", FIELD_ALIASES["biometric_transactions"])
     has_stock = has("current_stock", FIELD_ALIASES["current_stock"])
     has_quantity = has("quantity", FIELD_ALIASES["quantity"])
     has_commodity = has("commodity", FIELD_ALIASES["commodity"])
@@ -272,6 +358,10 @@ def infer_dataset_type(headers: list) -> str:
         return "fps_centers"
     if has_beneficiary and not has_quantity:
         return "beneficiaries"
+    # Operational summary: district-level aggregate report (has district + total
+    # or biometric columns, but NOT transaction-level commodity/quantity data).
+    if has_district and (has_total_cards or has_total_tx or has_biometric):
+        return "operational_summary"
     return "ration_transactions"
 
 
@@ -304,7 +394,12 @@ def validate_mapping(mapping: list, dataset_type: str) -> list:
     missing = [f for f in required_fields(dataset_type) if f not in mapped]
     if missing:
         labels = ", ".join(field_label(f) for f in missing)
-        return ["Required field(s) are not mapped: %s." % labels]
+        return [
+            "Required field(s) are not mapped: %s. "
+            "Use the dropdowns in the column mapping table above to assign each "
+            "required column to the correct RationRight field, then click "
+            "\"Validate & preview\" again." % labels
+        ]
     return []
 
 

@@ -332,6 +332,29 @@ CREATE TABLE IF NOT EXISTS reports (
     status        TEXT NOT NULL DEFAULT 'READY',
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS operational_summaries (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    district                     TEXT NOT NULL,
+    state                        TEXT,
+    total_cards                  REAL DEFAULT 0,
+    biometric_transactions       REAL DEFAULT 0,
+    aadhaar_otp_transactions     REAL DEFAULT 0,
+    mobile_otp_transactions      REAL DEFAULT 0,
+    iris_transactions            REAL DEFAULT 0,
+    partial_offline_transactions REAL DEFAULT 0,
+    total_transactions           REAL DEFAULT 0,
+    portability_transactions     REAL DEFAULT 0,
+    online_transactions          REAL DEFAULT 0,
+    total_availed_percent        REAL DEFAULT 0,
+    partial_percent              REAL DEFAULT 0,
+    report_date                  TEXT,
+    source_import_id             INTEGER REFERENCES data_imports(id) ON DELETE SET NULL,
+    created_at                   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ops_summary_import ON operational_summaries(source_import_id);
+CREATE INDEX IF NOT EXISTS idx_ops_summary_district ON operational_summaries(district);
 """
 
 # ---------------------------------------------------------------------------
@@ -2097,3 +2120,103 @@ def insert_inventory_batch(conn: sqlite3.Connection, records: list) -> None:
         " :reorder_threshold, :last_updated, :source_import_id, :now)",
         [dict(defaults, **record, now=now) for record in records],
     )
+
+
+# ---------------------------------------------------------------------------
+# Operational Summary (district-level PDS reports)
+# ---------------------------------------------------------------------------
+
+
+def insert_operational_summary(
+    conn: sqlite3.Connection,
+    *,
+    district: str,
+    state: Optional[str] = None,
+    total_cards: float = 0,
+    biometric_transactions: float = 0,
+    aadhaar_otp_transactions: float = 0,
+    mobile_otp_transactions: float = 0,
+    iris_transactions: float = 0,
+    partial_offline_transactions: float = 0,
+    total_transactions: float = 0,
+    portability_transactions: float = 0,
+    online_transactions: float = 0,
+    total_availed_percent: float = 0,
+    partial_percent: float = 0,
+    report_date: Optional[str] = None,
+    source_import_id: Optional[int] = None,
+) -> int:
+    """Insert one operational summary record; returns its id."""
+    if not isinstance(district, str) or not district.strip():
+        raise ValueError("district must be a non-empty string")
+    cur = conn.execute(
+        "INSERT INTO operational_summaries "
+        "(district, state, total_cards, biometric_transactions, "
+        " aadhaar_otp_transactions, mobile_otp_transactions, "
+        " iris_transactions, partial_offline_transactions, "
+        " total_transactions, portability_transactions, "
+        " online_transactions, total_availed_percent, "
+        " partial_percent, report_date, source_import_id, created_at) "
+        "VALUES (:district, :state, :total_cards, :biometric, "
+        " :aadhaar_otp, :mobile_otp, :iris, :partial_offline, "
+        " :total_tx, :portability, :online, :total_availed, "
+        " :partial, :report_date, :imp, :now)",
+        {
+            "district": district.strip(),
+            "state": state,
+            "total_cards": total_cards,
+            "biometric": biometric_transactions,
+            "aadhaar_otp": aadhaar_otp_transactions,
+            "mobile_otp": mobile_otp_transactions,
+            "iris": iris_transactions,
+            "partial_offline": partial_offline_transactions,
+            "total_tx": total_transactions,
+            "portability": portability_transactions,
+            "online": online_transactions,
+            "total_availed": total_availed_percent,
+            "partial": partial_percent,
+            "report_date": report_date,
+            "imp": source_import_id,
+            "now": _now_iso(),
+        },
+    )
+    return cur.lastrowid
+
+
+def insert_operational_summaries_batch(conn: sqlite3.Connection, records: list) -> None:
+    """Bulk insert normalized operational summary records (already validated)."""
+    now = _now_iso()
+    defaults = {
+        "district": "", "state": None,
+        "total_cards": 0.0, "biometric_transactions": 0.0,
+        "aadhaar_otp_transactions": 0.0, "mobile_otp_transactions": 0.0,
+        "iris_transactions": 0.0, "partial_offline_transactions": 0.0,
+        "total_transactions": 0.0, "portability_transactions": 0.0,
+        "online_transactions": 0.0, "total_availed_percent": 0.0,
+        "partial_percent": 0.0, "report_date": None,
+        "source_import_id": None,
+    }
+    conn.executemany(
+        "INSERT INTO operational_summaries "
+        "(district, state, total_cards, biometric_transactions, "
+        " aadhaar_otp_transactions, mobile_otp_transactions, "
+        " iris_transactions, partial_offline_transactions, "
+        " total_transactions, portability_transactions, "
+        " online_transactions, total_availed_percent, "
+        " partial_percent, report_date, source_import_id, created_at) "
+        "VALUES (:district, :state, :total_cards, :biometric_transactions, "
+        " :aadhaar_otp_transactions, :mobile_otp_transactions, "
+        " :iris_transactions, :partial_offline_transactions, "
+        " :total_transactions, :portability_transactions, "
+        " :online_transactions, :total_availed_percent, "
+        " :partial_percent, :report_date, :source_import_id, :now)",
+        [dict(defaults, **record, now=now) for record in records],
+    )
+
+
+def get_operational_summaries_for_import(conn: sqlite3.Connection, import_id: int) -> list:
+    rows = conn.execute(
+        "SELECT * FROM operational_summaries WHERE source_import_id = :imp ORDER BY id",
+        {"imp": import_id},
+    ).fetchall()
+    return [dict(row) for row in rows]
