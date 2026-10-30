@@ -2,9 +2,9 @@ import React, { useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { TopNavbar } from './components/TopNavbar';
 import { InvestigationDetailModal } from './components/InvestigationDetailModal';
+import { CinematicOverview } from './components/CinematicOverview';
 
 // Pages
-import { Overview } from './pages/Overview';
 import { AIAnalysis } from './pages/AIAnalysis';
 import { Alerts } from './pages/Alerts';
 import { Beneficiaries } from './pages/Beneficiaries';
@@ -15,7 +15,6 @@ import { Analytics } from './pages/Analytics';
 import { AIInsights } from './pages/AIInsights';
 import { DecisionSupport } from './pages/DecisionSupport';
 import { Reports } from './pages/Reports';
-import { CommandCenter } from './pages/CommandCenter';
 
 // Mock Data
 import { mockInvestigations } from './data/mockData';
@@ -23,10 +22,7 @@ import { Investigation } from './types';
 
 export const App: React.FC = () => {
   const [activeRoute, setActiveRoute] = useState<string>('overview');
-  const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  
-  // Selected investigation for modal
   const [selectedCase, setSelectedCase] = useState<Investigation | null>(null);
 
   const handleSelectCase = (id: string) => {
@@ -38,21 +34,11 @@ export const App: React.FC = () => {
 
   const handleNavigate = (route: string) => {
     setActiveRoute(route);
-    setSearchQuery(''); // Reset search on page change
+    setSearchQuery('');
   };
 
   const renderActivePage = () => {
     switch (activeRoute) {
-      case 'command-center':
-        return <CommandCenter onNavigate={handleNavigate} />;
-      case 'overview':
-        return (
-          <Overview 
-            onSelectInvestigation={handleSelectCase} 
-            onNavigate={handleNavigate}
-            searchQuery={searchQuery}
-          />
-        );
       case 'beneficiaries':
         return <Beneficiaries />;
       case 'distribution':
@@ -74,40 +60,54 @@ export const App: React.FC = () => {
       case 'settings':
         return <Settings />;
       default:
-        return <Overview onSelectInvestigation={handleSelectCase} onNavigate={handleNavigate} searchQuery={searchQuery} />;
+        return null;
     }
   };
 
-  return (
-    <div className="min-h-screen bg-[#F8FAFC] flex text-slate-800 font-sans">
-      {/* Sidebar Navigation */}
-      <Sidebar 
-        activeRoute={activeRoute} 
-        onNavigate={handleNavigate} 
-        isOpen={sidebarOpen}
-        onToggle={() => setSidebarOpen(!sidebarOpen)}
-      />
-
-      {/* Main Container */}
-      <div className="flex-1 flex flex-col min-w-0 lg:pl-[252px]">
-        {/* Top Navbar */}
-        <TopNavbar 
-          activeRoute={activeRoute} 
-          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+  // When on overview route: render the seamless CinematicOverview
+  if (activeRoute === 'overview') {
+    return (
+      <>
+        <CinematicOverview 
+          onSelectInvestigation={handleSelectCase}
+          onNavigate={handleNavigate}
         />
 
-        {/* Dynamic Page View Area */}
-        <main className="flex-1 p-4 md:p-6 max-w-7xl w-full mx-auto">
-          {renderActivePage()}
-        </main>
+        <InvestigationDetailModal 
+          investigation={selectedCase} 
+          onClose={() => setSelectedCase(null)} 
+        />
+      </>
+    );
+  }
 
-        {/* Footer */}
-        <footer className="border-t border-slate-200 px-6 py-4 bg-white text-center text-xs text-slate-400">
-          <p>RationRight uses synthetic demo data. A detected anomaly is not proof of fraud — every case is recommended for human verification.</p>
-        </footer>
+  // When navigating to other sub-pages (Beneficiaries, Inventory, Alerts, etc.)
+  return (
+    <div className="dashboard-page-wrapper" id="dashboard-root">
+      <div className="blob-canvas" aria-hidden="true">
+        <div className="blob blob-1"></div>
+        <div className="blob blob-2"></div>
+        <div className="blob blob-3"></div>
       </div>
 
-      {/* Case Details Modal */}
+      <div className="app-shell">
+        <Sidebar 
+          activeRoute={activeRoute} 
+          onNavigate={handleNavigate} 
+        />
+
+        <main className="main-content">
+          <TopNavbar 
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+          />
+
+          <div key={activeRoute} className="page-cinematic-stage">
+            {renderActivePage()}
+          </div>
+        </main>
+      </div>
+
       <InvestigationDetailModal 
         investigation={selectedCase} 
         onClose={() => setSelectedCase(null)} 

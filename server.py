@@ -154,10 +154,10 @@ RATE_LIMITS = {
 CSP_HEADER = (
     "default-src 'self' blob: data:; "
     "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
     "img-src 'self' data: blob:; "
     "connect-src 'self'; "
-    "font-src 'self' data:; "
+    "font-src 'self' data: https://fonts.gstatic.com; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "
     "form-action 'self'"
@@ -331,6 +331,8 @@ class RationRightHandler(BaseHTTPRequestHandler):
             return
         if path in ("/", "/index.html"):
             self._serve_file(STATIC_ROOT / "index.html")
+        elif path == "/overview.html":
+            self._serve_file(PROJECT_ROOT / "overview.html")
         elif path.startswith("/static/"):
             relative = path[len("/static/"):]
             target = (STATIC_ROOT / relative).resolve()

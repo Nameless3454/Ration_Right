@@ -1,9 +1,10 @@
+@import './overview-theme.css';
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  body {
-    font-family: 'Inter', sans-serif;
-  }
+#root {
+  width: 100%;
+  display: flex;
+  justify-content: center;
 }
