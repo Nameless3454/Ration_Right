@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # RationAI — Intelligent Ration & Food Security Intelligence Platform
 
 **RationAI converts public-distribution-system (PDS) operational data into
@@ -195,3 +196,6 @@ behavior, reset, and failure fallbacks) is in [docs/DEMO.md](docs/DEMO.md).
 | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) | Honest limitations |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Future work (post-hackathon) |
 | [QA_REPORT.md](QA_REPORT.md) | Phase 15 test results, AI scorecard, performance |
+=======
+# Ration_Right
+>>>>>>> 6c9b4521166ebbaac9fccf6e96af27292b53b928
