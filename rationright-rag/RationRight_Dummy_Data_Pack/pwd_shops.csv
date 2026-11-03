@@ -1,0 +1,6 @@
+dealer_id,district,gps_lat,gps_lon,monthly_capacity_kg,pwd_id,shop_name,state
+DLR001,Ghaziabad,28.6692,77.4538,5000,PWD001,Shakti Fair Price Shop,Uttar Pradesh
+DLR002,Ghaziabad,28.655,77.44,4200,PWD002,Jan Seva Ration Kendra,Uttar Pradesh
+DLR003,East Delhi,28.625,77.305,6000,PWD003,Asha Public Distribution Store,Delhi
+DLR004,Noida,28.581,77.326,4500,PWD004,Bharat Ration Point,Uttar Pradesh
+DLR005,Ghaziabad,28.682,77.415,3800,PWD005,Lok Kalyan FPS,Uttar Pradesh

@@ -1,0 +1,6 @@
+beneficiary_id,channel,commodity,date,demo_record,pwd_id,quantity_kg,status,transaction_id
+BEN001,biometric,Rice,2026-10-04,True,PWD001,10,success,TXN001
+BEN007,biometric,Wheat,2026-10-08,True,PWD002,20,success,TXN002
+BEN014,biometric,Wheat,2026-10-08,True,PWD004,20,success,TXN003
+BEN019,manual_override,Rice,2026-10-12,True,PWD005,10,success,TXN004
+BEN019,manual_override,Rice,2026-10-12,True,PWD005,10,success,TXN005

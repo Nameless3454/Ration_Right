@@ -3,6 +3,7 @@ import { Sidebar } from './components/Sidebar';
 import { TopNavbar } from './components/TopNavbar';
 import { InvestigationDetailModal } from './components/InvestigationDetailModal';
 import { CinematicOverview } from './components/CinematicOverview';
+import { FloatingChatbot } from './components/chat/FloatingChatbot';
 
 // Pages
 import { AIAnalysis } from './pages/AIAnalysis';
@@ -64,55 +65,56 @@ export const App: React.FC = () => {
     }
   };
 
-  // When on overview route: render the seamless CinematicOverview
-  if (activeRoute === 'overview') {
-    return (
-      <>
-        <CinematicOverview 
-          onSelectInvestigation={handleSelectCase}
-          onNavigate={handleNavigate}
-        />
-
-        <InvestigationDetailModal 
-          investigation={selectedCase} 
-          onClose={() => setSelectedCase(null)} 
-        />
-      </>
-    );
-  }
-
-  // When navigating to other sub-pages (Beneficiaries, Inventory, Alerts, etc.)
   return (
-    <div className="dashboard-page-wrapper" id="dashboard-root">
-      <div className="blob-canvas" aria-hidden="true">
-        <div className="blob blob-1"></div>
-        <div className="blob blob-2"></div>
-        <div className="blob blob-3"></div>
-      </div>
-
-      <div className="app-shell">
-        <Sidebar 
-          activeRoute={activeRoute} 
-          onNavigate={handleNavigate} 
-        />
-
-        <main className="main-content">
-          <TopNavbar 
-            searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
+    <>
+      {activeRoute === 'overview' ? (
+        <>
+          <CinematicOverview 
+            onSelectInvestigation={handleSelectCase}
+            onNavigate={handleNavigate}
           />
 
-          <div key={activeRoute} className="page-cinematic-stage">
-            {renderActivePage()}
+          <InvestigationDetailModal 
+            investigation={selectedCase} 
+            onClose={() => setSelectedCase(null)} 
+          />
+        </>
+      ) : (
+        <div className="dashboard-page-wrapper" id="dashboard-root">
+          <div className="blob-canvas" aria-hidden="true">
+            <div className="blob blob-1"></div>
+            <div className="blob blob-2"></div>
+            <div className="blob blob-3"></div>
           </div>
-        </main>
-      </div>
 
-      <InvestigationDetailModal 
-        investigation={selectedCase} 
-        onClose={() => setSelectedCase(null)} 
-      />
-    </div>
+          <div className="app-shell">
+            <Sidebar 
+              activeRoute={activeRoute} 
+              onNavigate={handleNavigate} 
+            />
+
+            <main className="main-content">
+              <TopNavbar 
+                searchQuery={searchQuery}
+                onSearchChange={setSearchQuery}
+              />
+
+              <div key={activeRoute} className="page-cinematic-stage">
+                {renderActivePage()}
+              </div>
+            </main>
+          </div>
+
+          <InvestigationDetailModal 
+            investigation={selectedCase} 
+            onClose={() => setSelectedCase(null)} 
+          />
+        </div>
+      )}
+
+      {/* Floating AI Assistant Chatbot */}
+      <FloatingChatbot activeRoute={activeRoute} />
+    </>
   );
 };
 

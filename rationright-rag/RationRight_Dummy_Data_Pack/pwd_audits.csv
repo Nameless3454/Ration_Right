@@ -1,0 +1,6 @@
+audit_id,complaints_count,demo_record,inspection_status,late_opening_days,manual_override_count,period,pwd_id
+AUD001,1,True,passed,0,1,2026-10,PWD001
+AUD002,4,True,pending,2,3,2026-10,PWD002
+AUD003,0,True,passed,0,0,2026-10,PWD003
+AUD004,6,True,failed,4,7,2026-10,PWD004
+AUD005,3,True,pending,1,5,2026-10,PWD005

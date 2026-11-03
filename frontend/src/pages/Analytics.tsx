@@ -21,7 +21,9 @@ import {
   Database, 
   Activity,
   CheckCircle2,
-  X
+  X,
+  Store,
+  Scale
 } from 'lucide-react';
 
 interface DataPoint {
@@ -539,6 +541,192 @@ export const Analytics: React.FC = () => {
           <div className="text-xs font-semibold text-[#5d7468] flex items-center gap-1.5 self-start sm:self-auto">
             <Sparkles size={14} className="text-[#14654a]" />
             <span>FCI consignment replenishment detected on Aug 06 (+77.3 MT)</span>
+          </div>
+        </div>
+      </div>
+
+      {/* =====================================================================
+          EXPANDED ANALYTICS: DISTRICT VELOCITY & STOCKOUT PROJECTIONS
+          ===================================================================== */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Card 1: District Outflow & Allocation Matrix */}
+        <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[28px] p-6 shadow-sm flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-[#14654a]/12 flex items-center justify-center text-[#14654a]">
+                  <TrendingUp size={16} />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
+                    Regional Outflow Velocity
+                  </h3>
+                  <p className="text-[11px] text-[#7a8b84] font-medium">October 2026 distribution metrics</p>
+                </div>
+              </div>
+              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
+                3 Districts
+              </span>
+            </div>
+
+            <div className="mt-4 space-y-3.5">
+              {[
+                { name: 'Ghaziabad', volume: 5150, cap: 14000, shops: 3, risk: 'Medium', note: '-280kg shortfall at PWD002' },
+                { name: 'East Delhi', volume: 2600, cap: 5000, shops: 1, risk: 'Low', note: '100% quota compliance' },
+                { name: 'Noida', volume: 1850, cap: 4500, shops: 1, risk: 'High', note: '-200kg shortfall, Audit Failed' }
+              ].map((dist) => {
+                const pct = Math.round((dist.volume / dist.cap) * 100);
+                return (
+                  <div key={dist.name} className="p-3 rounded-2xl bg-slate-50/70 border border-slate-200/60 hover:bg-white transition-all">
+                    <div className="flex items-center justify-between text-xs font-bold text-[#10261c]">
+                      <span className="flex items-center gap-1.5">
+                        <span>{dist.name}</span>
+                        <span className="text-[10px] text-slate-400 font-normal">({dist.shops} FPS)</span>
+                      </span>
+                      <span className="font-mono">{dist.volume.toLocaleString()} / {dist.cap.toLocaleString()} kg</span>
+                    </div>
+                    <div className="w-full h-2 bg-slate-200/60 rounded-full mt-2 overflow-hidden flex">
+                      <div 
+                        className={`h-full rounded-full transition-all duration-700 ${
+                          dist.risk === 'High' ? 'bg-gradient-to-r from-rose-500 to-red-600' :
+                          dist.risk === 'Medium' ? 'bg-gradient-to-r from-amber-500 to-amber-600' :
+                          'bg-gradient-to-r from-[#14654a] to-[#2fa56f]'
+                        }`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between mt-1.5 text-[10px]">
+                      <span className="text-slate-500">{dist.note}</span>
+                      <span className="font-bold text-slate-700">{pct}% utilized</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
+            <span>Aggregated Outflow:</span>
+            <span className="font-bold text-[#10261c]">9,450 kg (40.2% Total Cap)</span>
+          </div>
+        </div>
+
+        {/* Card 2: Commodity Breakdown & Quota Fill */}
+        <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[28px] p-6 shadow-sm flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center text-blue-700">
+                  <Scale size={16} />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
+                    Commodity Allocation Split
+                  </h3>
+                  <p className="text-[11px] text-[#7a8b84] font-medium">Grain-specific intake & disbursement</p>
+                </div>
+              </div>
+              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-800 border border-blue-200">
+                PDS Quota
+              </span>
+            </div>
+
+            <div className="mt-4 space-y-4">
+              {/* Rice */}
+              <div className="p-3.5 rounded-2xl bg-emerald-50/40 border border-emerald-100">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-extrabold text-[#10261c] flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-[#14654a]" />
+                    Rice (Grade A Paddy)
+                  </span>
+                  <span className="font-bold text-[#14654a]">5,600 kg (59.3%)</span>
+                </div>
+                <div className="w-full h-2 bg-emerald-100/70 rounded-full mt-2 overflow-hidden">
+                  <div className="h-full bg-gradient-to-r from-[#14654a] to-[#2fa56f] rounded-full" style={{ width: '59.3%' }} />
+                </div>
+                <div className="flex items-center justify-between mt-1 text-[10px] text-slate-500">
+                  <span>Physical Stock: 2,825 kg</span>
+                  <span className="text-rose-600 font-semibold">-480 kg Net Deficit (PWD002 & 004)</span>
+                </div>
+              </div>
+
+              {/* Wheat */}
+              <div className="p-3.5 rounded-2xl bg-amber-50/40 border border-amber-100">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-extrabold text-[#10261c] flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-amber-600" />
+                    Wheat (Standard Milling)
+                  </span>
+                  <span className="font-bold text-amber-800">3,850 kg (40.7%)</span>
+                </div>
+                <div className="w-full h-2 bg-amber-100/70 rounded-full mt-2 overflow-hidden">
+                  <div className="h-full bg-gradient-to-r from-amber-500 to-amber-600 rounded-full" style={{ width: '40.7%' }} />
+                </div>
+                <div className="flex items-center justify-between mt-1 text-[10px] text-slate-500">
+                  <span>Physical Stock: 3,245 kg</span>
+                  <span className="text-emerald-700 font-semibold">-400 kg Natural Variance (Compliant)</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
+            <span>Overall Stock Discrepancy:</span>
+            <span className="font-bold text-rose-700">-880 kg (-12.6% vs Expected)</span>
+          </div>
+        </div>
+
+        {/* Card 3: Stockout Forecasting & Center Runway */}
+        <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[28px] p-6 shadow-sm flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-purple-50 flex items-center justify-center text-purple-700">
+                  <Store size={16} />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
+                    FPS Depletion Runway
+                  </h3>
+                  <p className="text-[11px] text-[#7a8b84] font-medium">Estimated days until inventory exhaustion</p>
+                </div>
+              </div>
+              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-purple-50 text-purple-800 border border-purple-200">
+                5 Centers
+              </span>
+            </div>
+
+            <div className="mt-4 space-y-2.5">
+              {[
+                { id: 'PWD001', name: 'Shakti FPS', days: 14.2, status: 'Healthy', stock: '1,500 kg' },
+                { id: 'PWD002', name: 'Jan Seva Kendra', days: 6.5, status: 'Warning', stock: '1,020 kg' },
+                { id: 'PWD003', name: 'Annapurna Store', days: 18.0, status: 'Healthy', stock: '1,900 kg' },
+                { id: 'PWD004', name: 'Bharat Point', days: 3.8, status: 'Critical', stock: '650 kg' },
+                { id: 'PWD005', name: 'Lok Kalyan FPS', days: 11.5, status: 'Healthy', stock: '1,000 kg' },
+              ].map((shop) => (
+                <div key={shop.id} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-50/70 border border-slate-200/50 hover:bg-white transition-all text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono font-bold text-slate-500 text-[11px]">{shop.id}</span>
+                    <span className="font-semibold text-slate-800">{shop.name}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-slate-500 font-mono text-[11px]">{shop.stock}</span>
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+                      shop.status === 'Critical' ? 'bg-rose-100 text-rose-700' :
+                      shop.status === 'Warning' ? 'bg-amber-100 text-amber-700' :
+                      'bg-emerald-100 text-emerald-800'
+                    }`}>
+                      {shop.days} days
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
+            <span>Critical Reorder Required:</span>
+            <span className="font-bold text-rose-700">PWD004 (&lt; 4 days remaining)</span>
           </div>
         </div>
       </div>

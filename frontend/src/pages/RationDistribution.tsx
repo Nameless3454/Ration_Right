@@ -1,44 +1,49 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { 
   Truck, 
   Scale, 
-  ShieldAlert, 
   ArrowUpRight, 
   Search, 
   PlusCircle, 
   X, 
   CheckCircle2, 
-  MapPin, 
   Store, 
   FileDown, 
   TrendingUp, 
   Eye, 
   BarChart2,
-  PackageCheck
+  AlertTriangle,
+  Calendar,
+  Layers,
+  ChevronDown,
+  User,
+  ShieldCheck,
+  Check
 } from 'lucide-react';
-import { StatusBadge } from '../components/StatusBadge';
-import { mockDistricts } from '../data/mockData';
-import { District } from '../types';
+import { mockPWDShops, PWDShop } from '../data/mockData';
 
 export const RationDistribution: React.FC = () => {
-  const [districts, setDistricts] = useState<District[]>(mockDistricts);
-  const [filter, setFilter] = useState<'All' | 'Healthy' | 'Warning' | 'Critical'>('All');
-  const [search, setSearch] = useState('');
+  const [shops, setShops] = useState<PWDShop[]>(mockPWDShops);
+  const [selectedState, setSelectedState] = useState<string>('All');
+  const [selectedDistrict, setSelectedDistrict] = useState<string>('All');
+  const [selectedStatus, setSelectedStatus] = useState<'All' | 'Healthy' | 'Warning' | 'Critical'>('All');
+  const [selectedPeriod, setSelectedPeriod] = useState<string>('2026-10');
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Modals & toast states
   const [isRecordModalOpen, setIsRecordModalOpen] = useState(false);
-  const [selectedDistrict, setSelectedDistrict] = useState<District | null>(null);
+  const [selectedShop, setSelectedShop] = useState<PWDShop | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Record Distribution Form State
   const [formData, setFormData] = useState({
-    district: 'Lucknow',
-    fpsCenter: 'FPS-LU-0012',
+    district: 'Ghaziabad',
+    pwdId: 'PWD001',
     commodity: 'Rice',
-    quantityKg: 1250,
-    vehicleNo: 'UP-32-BN-8421',
-    driverName: 'Suresh Kumar'
+    quantityKg: 500,
+    vehicleNo: 'UP-14-BT-5421',
+    driverName: 'Ramesh Chandra'
   });
 
   const showToast = (msg: string) => {
@@ -48,12 +53,12 @@ export const RationDistribution: React.FC = () => {
 
   const handleOpenRecordModal = () => {
     setFormData({
-      district: 'Lucknow',
-      fpsCenter: 'FPS-LU-0012',
+      district: 'Ghaziabad',
+      pwdId: 'PWD001',
       commodity: 'Rice',
-      quantityKg: 1250,
-      vehicleNo: 'UP-32-BN-8421',
-      driverName: 'Suresh Kumar'
+      quantityKg: 500,
+      vehicleNo: 'UP-14-BT-5421',
+      driverName: 'Ramesh Chandra'
     });
     setIsRecordModalOpen(true);
   };
@@ -63,48 +68,94 @@ export const RationDistribution: React.FC = () => {
     const qty = Number(formData.quantityKg) || 0;
     if (qty <= 0) return;
 
-    setDistricts(prev => prev.map(d => {
-      if (d.name === formData.district) {
+    setShops(prev => prev.map(s => {
+      if (s.pwd_id === formData.pwdId) {
         return {
-          ...d,
-          distributionsKg: d.distributionsKg + qty,
-          transactions: d.transactions + Math.floor(qty / 20)
+          ...s,
+          distributed_kg: s.distributed_kg + qty,
+          closing_stock_kg: Math.max(0, s.closing_stock_kg - qty)
         };
       }
-      return d;
+      return s;
     }));
 
     setIsRecordModalOpen(false);
-    showToast(`Logged distribution of ${qty.toLocaleString()} kg to ${formData.district} (${formData.fpsCenter})`);
+    showToast(`Logged consignment distribution of ${qty.toLocaleString()} kg to ${formData.pwdId} (${formData.district})`);
   };
 
   const handleExportCSV = () => {
-    const headers = "District,FPS Centers,Distribution Volume (kg),Transactions,Status\n";
-    const rows = districts.map(d => `"${d.name}",${d.fpsCenters},${d.distributionsKg},${d.transactions},"${d.status}"`).join("\n");
+    const headers = "PWD ID,Shop Name,District,State,Dealer ID,Capacity (kg),Received (kg),Distributed (kg),Physical Stock (kg),Discrepancy (kg),Inspection Status\n";
+    const rows = filteredShops.map(s => 
+      `"${s.pwd_id}","${s.shop_name}","${s.district}","${s.state}","${s.dealer_id}",${s.monthly_capacity_kg},${s.received_kg},${s.distributed_kg},${s.physical_stock_kg},${s.discrepancy_kg},"${s.inspection_status}"`
+    ).join("\n");
+    
     const blob = new Blob([headers + rows], { type: 'text/csv' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `ration-distribution-${new Date().toISOString().split('T')[0]}.csv`;
+    a.download = `ration-distribution-${selectedPeriod}.csv`;
     a.click();
     window.URL.revokeObjectURL(url);
-    showToast("Distribution report exported as CSV");
+    showToast(`Exported ${filteredShops.length} distribution records as CSV`);
   };
 
-  // Filtered districts
-  const filteredDistricts = districts.filter(d => {
-    const matchesFilter = filter === 'All' || d.status === filter;
-    const matchesSearch = d.name.toLowerCase().includes(search.toLowerCase());
-    return matchesFilter && matchesSearch;
-  });
+  // Distinct lists for filter dropdowns
+  const availableStates = useMemo(() => ['All', ...Array.from(new Set(mockPWDShops.map(s => s.state)))], []);
+  const availableDistricts = useMemo(() => {
+    const filtered = selectedState === 'All' ? mockPWDShops : mockPWDShops.filter(s => s.state === selectedState);
+    return ['All', ...Array.from(new Set(filtered.map(s => s.district)))];
+  }, [selectedState]);
 
-  // Calculate dynamic totals
-  const totalAllocatedKg = districts.reduce((acc, d) => acc + d.distributionsKg, 0);
-  const totalTransactionsCount = districts.reduce((acc, d) => acc + d.transactions, 0);
-  const maxVolume = Math.max(...districts.map(d => d.distributionsKg), 1);
+  // Filtered Shops
+  const filteredShops = useMemo(() => {
+    return shops.filter(s => {
+      const matchState = selectedState === 'All' || s.state === selectedState;
+      const matchDistrict = selectedDistrict === 'All' || s.district === selectedDistrict;
+      
+      let shopStatus = 'Healthy';
+      if (s.inspection_status === 'failed' || s.discrepancy_kg < -100) {
+        shopStatus = 'Critical';
+      } else if (s.inspection_status === 'pending' || s.discrepancy_kg < 0) {
+        shopStatus = 'Warning';
+      }
+
+      const matchStatus = selectedStatus === 'All' || shopStatus === selectedStatus;
+      const matchSearch = s.shop_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                          s.pwd_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                          s.district.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                          s.dealer_id.toLowerCase().includes(searchQuery.toLowerCase());
+
+      return matchState && matchDistrict && matchStatus && matchSearch;
+    });
+  }, [shops, selectedState, selectedDistrict, selectedStatus, searchQuery]);
+
+  // Aggregated KPIs
+  const totalCapacity = useMemo(() => filteredShops.reduce((acc, s) => acc + s.monthly_capacity_kg, 0), [filteredShops]);
+  const totalReceived = useMemo(() => filteredShops.reduce((acc, s) => acc + s.received_kg, 0), [filteredShops]);
+  const totalDistributed = useMemo(() => filteredShops.reduce((acc, s) => acc + s.distributed_kg, 0), [filteredShops]);
+  const totalPhysical = useMemo(() => filteredShops.reduce((acc, s) => acc + s.physical_stock_kg, 0), [filteredShops]);
+  const totalDiscrepancy = useMemo(() => filteredShops.reduce((acc, s) => acc + s.discrepancy_kg, 0), [filteredShops]);
+
+  // District Progress Bars
+  const districtStats = useMemo(() => {
+    const map: Record<string, { name: string; capacity: number; distributed: number; count: number; status: string }> = {};
+    filteredShops.forEach(s => {
+      if (!map[s.district]) {
+        map[s.district] = { name: s.district, capacity: 0, distributed: 0, count: 0, status: 'Healthy' };
+      }
+      map[s.district].capacity += s.monthly_capacity_kg;
+      map[s.district].distributed += s.distributed_kg;
+      map[s.district].count += 1;
+      if (s.inspection_status === 'failed') map[s.district].status = 'Critical';
+      else if (s.discrepancy_kg < -50 && map[s.district].status !== 'Critical') map[s.district].status = 'Warning';
+    });
+    return Object.values(map);
+  }, [filteredShops]);
+
+  const maxDistrictVolume = Math.max(...districtStats.map(d => d.distributed), 1);
 
   return (
-    <div className="space-y-6 pb-12">
+    <div className="space-y-6 pb-12 animate-fadeIn">
       {/* Toast Notification */}
       {toastMessage && (
         <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 bg-[#0a3d2e] text-white px-5 py-3.5 rounded-2xl shadow-2xl border border-[#7fd8aa]/40 animate-in fade-in slide-in-from-bottom-5">
@@ -117,18 +168,21 @@ export const RationDistribution: React.FC = () => {
       )}
 
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-white/80 backdrop-blur-xl border border-white/80 p-5 rounded-3xl shadow-sm">
         <div>
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
             <h1 className="text-2xl md:text-3xl font-extrabold text-[#10261c] tracking-tight font-display">
               Ration Distribution
             </h1>
-            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold tracking-wide uppercase bg-[#2fa56f]/15 text-[#0d6840] border border-[#2fa56f]/30">
-              Active Logistics
+            <span className="px-3 py-1 rounded-full text-[11px] font-bold tracking-wide uppercase bg-emerald-50 text-emerald-800 border border-emerald-300">
+              October 2026 Dataset Active
+            </span>
+            <span className="px-2.5 py-1 rounded-full text-[11px] font-mono text-slate-500 bg-slate-100 border border-slate-200">
+              Period: {selectedPeriod}
             </span>
           </div>
           <p className="text-xs md:text-sm text-[#5d7468] mt-1 font-medium">
-            Monitor district-level allocation trends, transactional logs, and delivery logistics.
+            Live distribution quotas, quantity lifted, physical stock reconciliations, and outlet inspection records.
           </p>
         </div>
 
@@ -137,7 +191,7 @@ export const RationDistribution: React.FC = () => {
           <button
             type="button"
             onClick={handleExportCSV}
-            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full border border-slate-200/80 bg-white/80 hover:bg-white text-xs md:text-sm font-bold text-[#10261c] shadow-xs transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full border border-slate-200/80 bg-white hover:bg-slate-50 text-xs md:text-sm font-bold text-[#10261c] shadow-xs transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
           >
             <FileDown size={15} className="text-[#5d7468]" />
             <span>Export CSV</span>
@@ -158,79 +212,91 @@ export const RationDistribution: React.FC = () => {
         </div>
       </div>
 
-      {/* 4 Redesigned Glass KPI Cards */}
+      {/* 4 Connected KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Card 1: Ration Allocated */}
+        {/* Card 1: Total Allocation Capacity */}
         <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-5 shadow-sm hover:shadow-md hover:-translate-y-1 transition-all duration-300 flex flex-col justify-between min-h-[120px]">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Ration Allocated</span>
+            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Total Allocation</span>
             <div className="w-8 h-8 rounded-full bg-[#14654a]/12 flex items-center justify-center text-[#14654a]">
               <Truck size={17} />
             </div>
           </div>
           <div className="mt-2 flex items-baseline justify-between">
             <span className="text-2xl md:text-3xl font-extrabold text-[#10261c] font-display">
-              {totalAllocatedKg.toLocaleString(undefined, { maximumFractionDigits: 1 })} kg
+              {totalCapacity.toLocaleString()} kg
             </span>
             <span className="text-[11px] font-bold text-[#0d6840] flex items-center gap-0.5">
-              <TrendingUp size={12} />
-              +9.7% 7d
+              Monthly Cap
             </span>
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            Across {filteredShops.length} Fair Price Shop centers
           </div>
         </div>
 
-        {/* Card 2: Total Transactions */}
+        {/* Card 2: Quantity Lifted / Received */}
         <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-5 shadow-sm hover:shadow-md hover:-translate-y-1 transition-all duration-300 flex flex-col justify-between min-h-[120px]">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Total Transactions</span>
+            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Quantity Lifted (Inflow)</span>
+            <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-blue-700">
+              <Layers size={17} />
+            </div>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between">
+            <span className="text-2xl md:text-3xl font-extrabold text-blue-800 font-display">
+              {totalReceived.toLocaleString()} kg
+            </span>
+            <span className="text-[11px] font-bold text-blue-700">
+              FCI Despatch
+            </span>
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            Warehouse consignment intake
+          </div>
+        </div>
+
+        {/* Card 3: Total Reported Distributed */}
+        <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-5 shadow-sm hover:shadow-md hover:-translate-y-1 transition-all duration-300 flex flex-col justify-between min-h-[120px]">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Reported Distributed</span>
             <div className="w-8 h-8 rounded-full bg-[#2fa56f]/15 flex items-center justify-center text-[#14654a]">
               <ArrowUpRight size={18} />
             </div>
           </div>
           <div className="mt-2 flex items-baseline justify-between">
             <span className="text-2xl md:text-3xl font-extrabold text-[#14654a] font-display">
-              {totalTransactionsCount.toLocaleString()} records
+              {totalDistributed.toLocaleString()} kg
             </span>
             <span className="text-[11px] font-bold text-[#14654a] flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#2fa56f] animate-pulse"></span>
-              Live sync
+              <TrendingUp size={12} />
+              5,600 kg Rice
             </span>
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            3,850 kg Wheat disbursed
           </div>
         </div>
 
-        {/* Card 3: Average Quota Fill */}
+        {/* Card 4: Audited Stock & Discrepancy */}
         <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-5 shadow-sm hover:shadow-md hover:-translate-y-1 transition-all duration-300 flex flex-col justify-between min-h-[120px]">
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Average Quota Fill</span>
-            <div className="w-8 h-8 rounded-full bg-[#5b3df5]/12 flex items-center justify-center text-[#5b3df5]">
+            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Physical Verified Stock</span>
+            <div className="w-8 h-8 rounded-full bg-rose-50 flex items-center justify-center text-rose-600">
               <Scale size={18} />
             </div>
           </div>
           <div className="mt-2 flex items-baseline justify-between">
             <span className="text-2xl md:text-3xl font-extrabold text-[#10261c] font-display">
-              94.8%
+              {totalPhysical.toLocaleString()} kg
             </span>
-            <span className="text-[11px] font-bold text-slate-500">
-              Target: 95%
+            <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-200">
+              {totalDiscrepancy} kg Net
             </span>
           </div>
-        </div>
-
-        {/* Card 4: Critical Anomalies */}
-        <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-5 shadow-sm hover:shadow-md hover:-translate-y-1 transition-all duration-300 flex flex-col justify-between min-h-[120px]">
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">Critical Anomalies</span>
-            <div className="w-8 h-8 rounded-full bg-[#ef5b4a]/15 flex items-center justify-center text-[#ef5b4a]">
-              <ShieldAlert size={18} />
-            </div>
-          </div>
-          <div className="mt-2 flex items-baseline justify-between">
-            <span className="text-2xl md:text-3xl font-extrabold text-[#ef5b4a] font-display">
-              3 Cases
-            </span>
-            <span className="text-[11px] font-bold text-[#ef5b4a] bg-[#ef5b4a]/10 px-2 py-0.5 rounded-full">
-              East Delhi Flagged
-            </span>
+          <div className="text-[11px] text-rose-600 font-semibold mt-1 flex items-center gap-1">
+            <AlertTriangle size={12} />
+            Discrepancy at PWD002 & PWD004
           </div>
         </div>
       </div>
@@ -241,17 +307,17 @@ export const RationDistribution: React.FC = () => {
           <div className="flex items-center gap-2">
             <BarChart2 size={18} className="text-[#14654a]" />
             <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
-              District Allocation Volume Breakdown
+              District Allocation Volume Breakdown (October 2026 Run)
             </h3>
           </div>
           <span className="text-xs text-[#5d7468] font-medium hidden sm:inline">
-            Relative quota distribution across top districts
+            Relative quota distribution across Ghaziabad, East Delhi, and Noida
           </span>
         </div>
 
         <div className="space-y-3 pt-1">
-          {districts.map(d => {
-            const percent = (d.distributionsKg / maxVolume) * 100;
+          {districtStats.map(d => {
+            const percent = (d.distributed / maxDistrictVolume) * 100;
             const barColor = d.status === 'Critical' 
               ? 'bg-gradient-to-r from-red-500 to-[#ef5b4a]' 
               : d.status === 'Warning'
@@ -263,10 +329,20 @@ export const RationDistribution: React.FC = () => {
                 <div className="flex items-center justify-between text-xs font-semibold">
                   <span className="text-[#10261c] flex items-center gap-1.5">
                     <span className="font-bold">{d.name}</span>
-                    <span className="text-[11px] text-[#7a8b84]">({d.fpsCenters} FPS Centers)</span>
+                    <span className="text-[11px] text-[#7a8b84]">({d.count} FPS Outlet{d.count > 1 ? 's' : ''})</span>
+                    {d.status === 'Critical' && (
+                      <span className="text-[10px] font-bold text-rose-700 bg-rose-50 px-2 py-0.2 rounded border border-rose-200">
+                        Failed Inspection
+                      </span>
+                    )}
+                    {d.status === 'Warning' && (
+                      <span className="text-[10px] font-bold text-amber-700 bg-amber-50 px-2 py-0.2 rounded border border-amber-200">
+                        -280kg Shortage
+                      </span>
+                    )}
                   </span>
                   <span className="font-mono font-bold text-[#10261c]">
-                    {d.distributionsKg.toLocaleString()} kg
+                    {d.distributed.toLocaleString()} kg / {d.capacity.toLocaleString()} kg cap
                   </span>
                 </div>
                 <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden flex">
@@ -281,430 +357,557 @@ export const RationDistribution: React.FC = () => {
         </div>
       </div>
 
-      {/* Filter Toolbar */}
-      <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-4 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
-        {/* Status Filter Pills */}
-        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0">
-          {(['All', 'Healthy', 'Warning', 'Critical'] as const).map((s) => {
-            const count = s === 'All'
-              ? districts.length
-              : districts.filter(d => d.status === s).length;
-            const isActive = filter === s;
+      {/* Comprehensive Filter Toolbar */}
+      <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[24px] p-4 shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        {/* Dropdowns: State & District */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* State */}
+          <div className="flex items-center gap-1.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
+            <span className="font-bold text-slate-500">State:</span>
+            <select
+              value={selectedState}
+              onChange={(e) => { setSelectedState(e.target.value); setSelectedDistrict('All'); }}
+              className="bg-transparent font-bold text-slate-800 outline-none cursor-pointer"
+            >
+              {availableStates.map(st => (
+                <option key={st} value={st}>{st}</option>
+              ))}
+            </select>
+          </div>
 
-            return (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setFilter(s)}
-                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-bold transition-all duration-200 whitespace-nowrap cursor-pointer ${
-                  isActive
-                    ? 'bg-[#14654a] text-white shadow-sm'
-                    : 'bg-white/80 border border-slate-200/80 text-[#5d7468] hover:bg-slate-50 hover:text-[#10261c]'
-                }`}
-              >
-                <span>{s}</span>
-                <span className={`px-1.5 py-0.2 rounded-full text-[10px] ${
-                  isActive ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500'
-                }`}>
-                  {count}
-                </span>
-              </button>
-            );
-          })}
+          {/* District */}
+          <div className="flex items-center gap-1.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
+            <span className="font-bold text-slate-500">District:</span>
+            <select
+              value={selectedDistrict}
+              onChange={(e) => setSelectedDistrict(e.target.value)}
+              className="bg-transparent font-bold text-slate-800 outline-none cursor-pointer"
+            >
+              {availableDistricts.map(dt => (
+                <option key={dt} value={dt}>{dt}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Reporting Period */}
+          <div className="flex items-center gap-1.5 text-xs text-slate-600 bg-emerald-50/70 border border-emerald-200 rounded-xl px-3 py-1.5">
+            <Calendar size={13} className="text-emerald-700" />
+            <span className="font-bold text-slate-500">Period:</span>
+            <select
+              value={selectedPeriod}
+              onChange={(e) => setSelectedPeriod(e.target.value)}
+              className="bg-transparent font-bold text-emerald-800 outline-none cursor-pointer"
+            >
+              <option value="2026-10">2026-10 (October Dataset)</option>
+              <option value="2026-09">2026-09 (September Archive)</option>
+              <option value="2026-08">2026-08 (August Archive)</option>
+            </select>
+          </div>
         </div>
 
-        {/* Search */}
-        <div className="relative w-full md:w-72">
-          <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[#7a8b84]" />
-          <input
-            type="text"
-            placeholder="Search district name..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-full h-9 pl-9 pr-8 border border-slate-200/80 rounded-full text-xs font-medium focus:outline-none focus:border-[#14654a] focus:ring-1 focus:ring-[#14654a] bg-white/90 text-[#10261c] transition-all"
-          />
-          {search && (
-            <button 
-              onClick={() => setSearch('')}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-            >
-              <X size={13} />
-            </button>
-          )}
+        {/* Status Filter Pills & Search */}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-2xl">
+            {(['All', 'Healthy', 'Warning', 'Critical'] as const).map((s) => {
+              const isActive = selectedStatus === s;
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setSelectedStatus(s)}
+                  className={`px-3 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                    isActive 
+                      ? 'bg-white text-slate-900 shadow-xs' 
+                      : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  {s}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Search Box */}
+          <div className="relative flex-1 sm:w-60">
+            <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search shop, dealer, ID..."
+              className="w-full pl-9 pr-3.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-emerald-600 focus:bg-white outline-none"
+            />
+          </div>
         </div>
       </div>
 
-      {/* Main District Table */}
-      <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[28px] p-5 shadow-sm overflow-hidden space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
-            District-wise Allocation & Activity
-          </h3>
-          <span className="text-xs text-[#7a8b84]">
-            Showing {filteredDistricts.length} of {districts.length} districts
+      {/* Main Fair Price Shop Ledger Table */}
+      <div className="bg-white/85 backdrop-blur-xl border border-white/90 rounded-[28px] p-5 shadow-sm overflow-hidden">
+        <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+          <div>
+            <h3 className="font-extrabold text-[#10261c] text-sm md:text-base font-display">
+              Fair Price Shop Distribution & Inventory Ledger
+            </h3>
+            <p className="text-xs text-[#5d7468]">
+              Showing {filteredShops.length} distribution outlets with recorded grain movements and audit compliance.
+            </p>
+          </div>
+          <span className="text-xs font-mono font-bold text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200">
+            Official Run 2026-10
           </span>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-xs md:text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-[#7a8b84] font-bold tracking-wider text-[10.5px] uppercase">
-                <th className="py-3 px-4">District</th>
-                <th className="py-3 px-4">FPS Centers</th>
-                <th className="py-3 px-4">Distributions Volume</th>
-                <th className="py-3 px-4">Transactions</th>
-                <th className="py-3 px-4">Avg / Center</th>
-                <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4 text-right">Action</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-50">
-              {filteredDistricts.map((d) => {
-                const avgPerFps = Math.round(d.distributionsKg / d.fpsCenters);
-
-                return (
-                  <tr 
-                    key={d.name} 
-                    onClick={() => setSelectedDistrict(d)}
-                    className="hover:bg-[#ebf5f0]/60 transition-colors duration-150 cursor-pointer group"
-                  >
-                    {/* District Name with Icon */}
-                    <td className="py-3.5 px-4">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-7 h-7 rounded-full bg-[#14654a]/10 text-[#14654a] flex items-center justify-center shrink-0">
-                          <MapPin size={14} />
-                        </div>
-                        <span className="font-extrabold text-[#10261c] group-hover:text-[#14654a] transition-colors">
-                          {d.name}
-                        </span>
-                      </div>
-                    </td>
-
-                    {/* FPS Centers */}
-                    <td className="py-3.5 px-4">
-                      <div className="flex items-center gap-1.5 font-semibold text-[#5d7468]">
-                        <Store size={13} className="text-[#7a8b84]" />
-                        <span>{d.fpsCenters}</span>
-                      </div>
-                    </td>
-
-                    {/* Distributions Volume */}
-                    <td className="py-3.5 px-4">
-                      <span className="font-bold text-[#10261c] font-display text-sm">
-                        {d.distributionsKg.toLocaleString()} kg
-                      </span>
-                    </td>
-
-                    {/* Total Transactions */}
-                    <td className="py-3.5 px-4 font-mono font-semibold text-[#5d7468]">
-                      {d.transactions.toLocaleString()}
-                    </td>
-
-                    {/* Avg / Center */}
-                    <td className="py-3.5 px-4 text-slate-600 font-medium">
-                      {avgPerFps.toLocaleString()} kg/FPS
-                    </td>
-
-                    {/* Status */}
-                    <td className="py-3.5 px-4">
-                      <StatusBadge type={d.status} text={d.status} />
-                    </td>
-
-                    {/* Action Button */}
-                    <td className="py-3.5 px-4 text-right">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSelectedDistrict(d);
-                        }}
-                        className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold text-[#14654a] hover:bg-[#14654a]/10 transition-colors"
-                      >
-                        <Eye size={13} />
-                        <span>Inspect</span>
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-
-              {filteredDistricts.length === 0 && (
-                <tr>
-                  <td colSpan={7} className="py-12 text-center text-xs text-[#7a8b84]">
-                    No districts matching filter query.
-                  </td>
+        {filteredShops.length === 0 ? (
+          <div className="py-16 text-center">
+            <Store size={36} className="mx-auto text-slate-300 mb-2" />
+            <h4 className="text-sm font-bold text-slate-700">No matching distribution records found</h4>
+            <p className="text-xs text-slate-500 mt-1">Try resetting the district or status filters.</p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto mt-2">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-slate-100 text-[11px] font-bold text-[#7a8b84] uppercase tracking-wider">
+                  <th className="py-3 px-3">Shop ID & Name</th>
+                  <th className="py-3 px-3">District & State</th>
+                  <th className="py-3 px-3 text-right">Capacity (kg)</th>
+                  <th className="py-3 px-3 text-right">Received (kg)</th>
+                  <th className="py-3 px-3 text-right">Distributed (kg)</th>
+                  <th className="py-3 px-3 text-right">Physical Stock (kg)</th>
+                  <th className="py-3 px-3 text-right">Discrepancy</th>
+                  <th className="py-3 px-3 text-center">Inspection</th>
+                  <th className="py-3 px-3 text-center">Action</th>
                 </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filteredShops.map(shop => {
+                  const hasDeficit = shop.discrepancy_kg < -50;
+                  const isFailed = shop.inspection_status === 'failed';
+
+                  return (
+                    <tr 
+                      key={shop.pwd_id}
+                      className="hover:bg-slate-50/80 transition-colors group"
+                    >
+                      <td className="py-3.5 px-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className={`w-8 h-8 rounded-xl flex items-center justify-center font-mono font-bold text-[11px] shrink-0 ${
+                            isFailed 
+                              ? 'bg-rose-50 text-rose-700 border border-rose-200' 
+                              : hasDeficit 
+                              ? 'bg-amber-50 text-amber-700 border border-amber-200' 
+                              : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                          }`}>
+                            {shop.pwd_id}
+                          </div>
+                          <div>
+                            <span className="font-bold text-[#10261c] group-hover:text-emerald-900 block">
+                              {shop.shop_name}
+                            </span>
+                            <span className="text-[11px] text-slate-500 font-mono">
+                              Dealer: {shop.dealer_id}
+                            </span>
+                          </div>
+                        </div>
+                      </td>
+
+                      <td className="py-3.5 px-3">
+                        <span className="font-medium text-slate-800 block">{shop.district}</span>
+                        <span className="text-[11px] text-slate-500">{shop.state}</span>
+                      </td>
+
+                      <td className="py-3.5 px-3 text-right font-mono font-medium text-slate-700">
+                        {shop.monthly_capacity_kg.toLocaleString()} kg
+                      </td>
+
+                      <td className="py-3.5 px-3 text-right font-mono font-bold text-blue-700">
+                        +{shop.received_kg.toLocaleString()} kg
+                      </td>
+
+                      <td className="py-3.5 px-3 text-right font-mono font-bold text-[#10261c]">
+                        {shop.distributed_kg.toLocaleString()} kg
+                      </td>
+
+                      <td className="py-3.5 px-3 text-right font-mono font-bold text-slate-900">
+                        {shop.physical_stock_kg.toLocaleString()} kg
+                      </td>
+
+                      <td className="py-3.5 px-3 text-right">
+                        {shop.discrepancy_kg < 0 ? (
+                          <span className="inline-flex items-center gap-1 font-mono font-bold text-rose-700 bg-rose-50 px-2 py-0.5 rounded border border-rose-200">
+                            {shop.discrepancy_kg} kg
+                          </span>
+                        ) : (
+                          <span className="font-mono text-emerald-700 font-semibold">
+                            Balanced
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="py-3.5 px-3 text-center">
+                        <span className={`inline-block px-2.5 py-0.5 rounded-full text-[10.5px] font-bold uppercase tracking-wider ${
+                          shop.inspection_status === 'passed'
+                            ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                            : shop.inspection_status === 'failed'
+                            ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                            : 'bg-amber-50 text-amber-800 border border-amber-200'
+                        }`}>
+                          {shop.inspection_status}
+                        </span>
+                      </td>
+
+                      <td className="py-3.5 px-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedShop(shop)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-700 hover:text-emerald-800 bg-slate-100 hover:bg-slate-200 transition-all inline-flex items-center gap-1 cursor-pointer"
+                        >
+                          <Eye size={13} />
+                          <span>Inspect</span>
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
-      {/* =====================================================================
-          RECORD NEW DISTRIBUTION BATCH MODAL
-          ===================================================================== */}
-      {isRecordModalOpen && createPortal(
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-md animate-in fade-in duration-200" onClick={() => setIsRecordModalOpen(false)}>
-          <div 
-            className="bg-white border border-white/80 rounded-[28px] shadow-2xl w-full max-w-lg overflow-hidden flex flex-col animate-in zoom-in-95 duration-200"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4.5 border-b border-slate-100 bg-[#e7f0eb]/50">
+      {/* Inspect Shop Detail Modal */}
+      {selectedShop && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-md animate-fadeIn">
+          <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-lg w-full overflow-hidden animate-scaleUp">
+            <div className="p-6 bg-gradient-to-r from-[#062d22] to-[#14654a] text-white flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-[#14654a]/15 text-[#14654a] flex items-center justify-center shrink-0">
-                  <PackageCheck size={20} />
+                <div className="w-10 h-10 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center border border-white/20">
+                  <Store size={20} className="text-[#7fd8aa]" />
                 </div>
                 <div>
-                  <h3 className="font-extrabold text-[#10261c] text-base leading-tight font-display">
-                    Record Distribution Dispatch
-                  </h3>
-                  <p className="text-xs text-[#5d7468] mt-0.5">
-                    Log new grain consignment dispatched to Fair Price Shops
-                  </p>
+                  <h3 className="text-base font-bold">{selectedShop.shop_name}</h3>
+                  <p className="text-xs text-emerald-200 font-mono">ID: {selectedShop.pwd_id} • Dealer: {selectedShop.dealer_id}</p>
                 </div>
               </div>
               <button 
-                onClick={() => setIsRecordModalOpen(false)} 
-                className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+                onClick={() => setSelectedShop(null)}
+                className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center transition-colors"
               >
-                <X size={18} />
+                <X size={16} />
               </button>
             </div>
 
-            {/* Modal Form */}
-            <form onSubmit={handleRecordSubmit} className="p-6 space-y-4 text-xs md:text-sm">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                {/* District */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Destination District *
-                  </label>
-                  <select
-                    value={formData.district}
-                    onChange={(e) => setFormData({ ...formData, district: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c] bg-white"
-                  >
-                    {districts.map(d => (
-                      <option key={d.name} value={d.name}>{d.name}</option>
-                    ))}
-                  </select>
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200">
+                  <span className="text-[10px] uppercase font-bold text-slate-500 block">District & State</span>
+                  <span className="font-bold text-slate-900 mt-0.5 block">{selectedShop.district}, {selectedShop.state}</span>
+                  <span className="text-[10px] text-slate-500 font-mono">GPS: {selectedShop.gps_lat}, {selectedShop.gps_lon}</span>
                 </div>
 
-                {/* Destination FPS Center */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Destination FPS Center *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. FPS-LU-0012"
-                    value={formData.fpsCenter}
-                    onChange={(e) => setFormData({ ...formData, fpsCenter: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-mono font-bold text-[#10261c]"
-                  />
-                </div>
-
-                {/* Commodity Type */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Commodity *
-                  </label>
-                  <select
-                    value={formData.commodity}
-                    onChange={(e) => setFormData({ ...formData, commodity: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c] bg-white"
-                  >
-                    <option value="Rice">Rice (NFSA Fortified)</option>
-                    <option value="Wheat">Wheat (Standard)</option>
-                    <option value="Coarse Grain">Coarse Grains / Millets</option>
-                  </select>
-                </div>
-
-                {/* Quantity Dispatched (kg) */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Dispatched Quantity (kg) *
-                  </label>
-                  <input
-                    type="number"
-                    min="50"
-                    step="25"
-                    required
-                    value={formData.quantityKg}
-                    onChange={(e) => setFormData({ ...formData, quantityKg: Number(e.target.value) })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-bold text-[#10261c]"
-                  />
-                </div>
-
-                {/* Vehicle Transport No */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Vehicle Transport No.
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. DL-01-EA-4821"
-                    value={formData.vehicleNo}
-                    onChange={(e) => setFormData({ ...formData, vehicleNo: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold text-[#10261c]"
-                  />
-                </div>
-
-                {/* Dispatch Officer */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Authorized Driver / Agent
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Suresh Kumar"
-                    value={formData.driverName}
-                    onChange={(e) => setFormData({ ...formData, driverName: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold text-[#10261c]"
-                  />
+                <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200">
+                  <span className="text-[10px] uppercase font-bold text-slate-500 block">Inspection Audit</span>
+                  <span className={`font-bold mt-0.5 block uppercase ${
+                    selectedShop.inspection_status === 'passed' ? 'text-emerald-700' : 'text-rose-700'
+                  }`}>
+                    {selectedShop.inspection_status}
+                  </span>
+                  <span className="text-[10px] text-slate-500">{selectedShop.complaints_count} Citizen Complaints</span>
                 </div>
               </div>
 
-              {/* Action Buttons */}
-              <div className="flex items-center justify-end gap-2.5 pt-4 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setIsRecordModalOpen(false)}
-                  className="px-4 py-2 rounded-full border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-50 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-full text-white text-xs font-bold shadow-md transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                  style={{
-                    background: 'linear-gradient(135deg, #062d22, #14654a 52%, #2fa56f)',
-                    boxShadow: '0 8px 18px -4px rgba(20, 101, 74, 0.45)'
-                  }}
-                >
-                  Confirm Dispatch
-                </button>
+              {/* Stock Movement Details */}
+              <div className="p-4 rounded-2xl border border-slate-200 bg-slate-50/50 space-y-2 text-xs">
+                <div className="font-bold text-slate-800 pb-1 border-b border-slate-200">
+                  October 2026 Grain Stock Movement
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Opening Stock:</span>
+                  <span className="font-mono font-bold text-slate-800">{selectedShop.opening_stock_kg} kg</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Consignment Received:</span>
+                  <span className="font-mono font-bold text-blue-700">+{selectedShop.received_kg} kg</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Reported Distributed:</span>
+                  <span className="font-mono font-bold text-slate-800">-{selectedShop.distributed_kg} kg</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Expected Closing:</span>
+                  <span className="font-mono font-bold text-slate-800">{selectedShop.closing_stock_kg} kg</span>
+                </div>
+                <div className="flex justify-between pt-1 border-t border-slate-200">
+                  <span className="font-bold text-slate-700">Physically Audited Stock:</span>
+                  <span className="font-mono font-bold text-slate-900">{selectedShop.physical_stock_kg} kg</span>
+                </div>
+                {selectedShop.discrepancy_kg < 0 && (
+                  <div className="flex justify-between text-rose-700 font-bold pt-1">
+                    <span>Unexplained Stock Deficit:</span>
+                    <span className="font-mono">{selectedShop.discrepancy_kg} kg</span>
+                  </div>
+                )}
               </div>
-            </form>
+
+              {/* Administrative Compliance Notes */}
+              <div className="p-3 bg-amber-50 rounded-2xl border border-amber-200 text-amber-900 text-xs space-y-1">
+                <span className="font-bold block">Operational Indicators:</span>
+                <p>• Late opening days recorded: <strong>{selectedShop.late_opening_days}</strong></p>
+                <p>• Manual overrides authorized: <strong>{selectedShop.manual_override_count}</strong></p>
+                {selectedShop.inspection_status === 'failed' && (
+                  <p className="text-rose-700 font-bold mt-1">⚠️ Out-of-spec compliance: Formal audit enquiry active.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="p-5 bg-slate-50 border-t border-slate-100 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => setSelectedShop(null)}
+                className="px-5 py-2 rounded-xl text-xs font-bold text-slate-700 hover:bg-slate-200 transition-all cursor-pointer"
+              >
+                Close Dossier
+              </button>
+            </div>
           </div>
         </div>,
         document.body
       )}
 
-      {/* =====================================================================
-          DISTRICT LOGISTICS DETAIL MODAL
-          ===================================================================== */}
-      {selectedDistrict && createPortal(
+      {/* Record Distribution Consignment Modal (Redesigned) */}
+      {isRecordModalOpen && createPortal(
         <div 
-          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-md animate-in fade-in duration-200"
-          onClick={() => setSelectedDistrict(null)}
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/50 backdrop-blur-md animate-in fade-in duration-200"
+          onClick={() => setIsRecordModalOpen(false)}
         >
           <div 
-            className="bg-white border border-white/80 rounded-[28px] shadow-2xl w-full max-w-lg overflow-hidden flex flex-col animate-in zoom-in-95 duration-200"
+            className="bg-white border border-slate-200/80 rounded-[28px] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.3)] w-full max-w-lg overflow-hidden flex flex-col animate-in zoom-in-95 duration-200 max-h-[92vh]"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Header */}
-            <div className="flex items-center justify-between px-6 py-4.5 border-b border-slate-100 bg-[#e7f0eb]/50">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-full bg-[#14654a]/15 text-[#14654a] flex items-center justify-center shrink-0">
-                  <MapPin size={22} />
-                </div>
-                <div>
-                  <h3 className="font-extrabold text-[#10261c] text-lg leading-tight font-display">
-                    {selectedDistrict.name} District Logistics
-                  </h3>
-                  <div className="flex items-center gap-2 mt-0.5">
-                    <span className="text-xs font-bold text-[#5d7468]">
-                      {selectedDistrict.fpsCenters} Registered FPS Centers
-                    </span>
-                    <span className="w-1 h-1 rounded-full bg-slate-300"></span>
-                    <StatusBadge type={selectedDistrict.status} text={selectedDistrict.status} />
+            {/* Modal Header */}
+            <div className="relative px-6 pt-5 pb-4 border-b border-slate-100 bg-gradient-to-r from-emerald-50/70 via-teal-50/30 to-slate-50/50">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center gap-3.5">
+                  <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-[#14654a] to-[#0a3829] text-white flex items-center justify-center shadow-lg shadow-[#14654a]/25 shrink-0 ring-4 ring-emerald-500/10">
+                    <Truck size={20} className="stroke-[2.2]" />
                   </div>
-                </div>
-              </div>
-              <button 
-                onClick={() => setSelectedDistrict(null)} 
-                className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
-              >
-                <X size={18} />
-              </button>
-            </div>
-
-            {/* Content */}
-            <div className="p-6 space-y-4 text-xs md:text-sm">
-              <div className="grid grid-cols-2 gap-3.5 bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                <div>
-                  <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide block">
-                    Total Volume Dispatched
-                  </span>
-                  <strong className="text-base text-[#10261c] font-display mt-0.5 block">
-                    {selectedDistrict.distributionsKg.toLocaleString()} kg
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide block">
-                    Verified Transactions
-                  </span>
-                  <strong className="text-base text-[#10261c] font-display mt-0.5 block">
-                    {selectedDistrict.transactions.toLocaleString()} tx
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide block">
-                    Avg Per Fair Price Shop
-                  </span>
-                  <strong className="text-base text-[#14654a] font-display mt-0.5 block">
-                    {Math.round(selectedDistrict.distributionsKg / selectedDistrict.fpsCenters).toLocaleString()} kg/FPS
-                  </strong>
-                </div>
-                <div>
-                  <span className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide block">
-                    Quota Allocation Status
-                  </span>
-                  <strong className={`text-base font-display mt-0.5 block ${
-                    selectedDistrict.status === 'Critical' ? 'text-red-600' : 'text-green-700'
-                  }`}>
-                    {selectedDistrict.status === 'Critical' ? 'Anomaly Detected' : 'Optimal Flow'}
-                  </strong>
-                </div>
-              </div>
-
-              {/* Status Notice */}
-              {selectedDistrict.status === 'Critical' && (
-                <div className="bg-red-50 border border-red-200 rounded-2xl p-4 flex items-start gap-3 text-red-800">
-                  <ShieldAlert size={18} className="text-red-600 shrink-0 mt-0.5" />
                   <div>
-                    <h4 className="font-bold text-xs uppercase tracking-wide">High Temporal Anomaly Rate</h4>
-                    <p className="text-xs text-red-700 mt-0.5">
-                      AI anomaly detection detected 3 temporal distribution mismatches at FPS centers in this district. Audit team has been assigned.
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-extrabold text-[#10261c] text-lg leading-tight font-display tracking-tight">
+                        Record Consignment Dispatch
+                      </h3>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold tracking-wider uppercase bg-[#14654a]/10 text-[#14654a] border border-[#14654a]/20">
+                        Outbound Dispatch
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#5d7468] mt-0.5">
+                      Generate transit challan and allocate warehouse quota to Fair Price Shop
                     </p>
                   </div>
                 </div>
-              )}
-
-              {/* Close & Action Buttons */}
-              <div className="flex items-center justify-between pt-3 border-t border-slate-100">
-                <button
+                <button 
                   type="button"
-                  onClick={() => {
-                    setSelectedDistrict(null);
-                    showToast(`Dispatched emergency buffer inspection for ${selectedDistrict.name}`);
-                  }}
-                  className="px-4 py-2 rounded-full border border-slate-200 text-xs font-bold text-[#14654a] hover:bg-emerald-50 transition-colors"
+                  onClick={() => setIsRecordModalOpen(false)} 
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-white/80 border border-transparent hover:border-slate-200 transition-all shadow-none hover:shadow-sm"
+                  aria-label="Close dialog"
                 >
-                  Request Field Audit
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedDistrict(null)}
-                  className="px-5 py-2 rounded-full text-white text-xs font-bold shadow-xs bg-[#14654a] hover:bg-[#0b5c39] transition-colors"
-                >
-                  Close Details
+                  <X size={18} />
                 </button>
               </div>
             </div>
+
+            {/* Modal Form */}
+            <form onSubmit={handleRecordSubmit} className="p-6 overflow-y-auto space-y-4 text-xs md:text-sm custom-scrollbar">
+              {/* Destination Fair Price Shop */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700">
+                    Destination Fair Price Shop <span className="text-rose-500">*</span>
+                  </label>
+                  <span className="text-[10.5px] font-medium text-slate-400">Target Distribution Center</span>
+                </div>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                    <Store size={16} />
+                  </div>
+                  <select
+                    value={formData.pwdId}
+                    onChange={(e) => {
+                      const shop = shops.find(s => s.pwd_id === e.target.value);
+                      setFormData({
+                        ...formData,
+                        pwdId: e.target.value,
+                        district: shop?.district || 'Ghaziabad'
+                      });
+                    }}
+                    className="w-full pl-10 pr-9 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-xs sm:text-sm font-semibold text-slate-800 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all appearance-none cursor-pointer shadow-sm"
+                  >
+                    {shops.map(s => (
+                      <option key={s.pwd_id} value={s.pwd_id}>
+                        {s.pwd_id} — {s.shop_name} ({s.district})
+                      </option>
+                    ))}
+                  </select>
+                  <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none text-slate-400">
+                    <ChevronDown size={15} />
+                  </div>
+                </div>
+
+                {/* Target Shop Context Badge */}
+                {(() => {
+                  const targetShop = shops.find(s => s.pwd_id === formData.pwdId);
+                  if (!targetShop) return null;
+                  return (
+                    <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-50 border border-slate-200/60 text-[11px] text-slate-600">
+                      <span className="font-semibold text-slate-700">{targetShop.district}</span>
+                      <span className="text-slate-300">•</span>
+                      <span>Stock: <strong className="text-slate-800">{targetShop.closing_stock_kg.toLocaleString()} kg</strong></span>
+                      <span className="text-slate-300">•</span>
+                      <span>Dealer: <span className="font-mono font-bold text-slate-700">{targetShop.dealer_id}</span></span>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* Commodity Category Cards */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700">Commodity Type</label>
+                  <span className="text-[10.5px] font-medium text-slate-400">Ration Grain Grade</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2.5">
+                  {[
+                    { id: 'Rice', label: 'Rice (Grade A)', desc: 'Standard PDS distribution lot' },
+                    { id: 'Wheat', label: 'Wheat (Milling)', desc: 'Whole grain wheat quota' }
+                  ].map(com => {
+                    const isSelected = formData.commodity === com.id;
+                    return (
+                      <button
+                        key={com.id}
+                        type="button"
+                        onClick={() => setFormData({ ...formData, commodity: com.id })}
+                        className={`p-3 rounded-xl border text-left transition-all relative ${
+                          isSelected 
+                            ? 'bg-emerald-50/70 border-[#14654a] shadow-sm shadow-emerald-900/5 ring-1 ring-[#14654a]' 
+                            : 'bg-white hover:bg-slate-50/80 border-slate-200/80'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className={`text-xs font-extrabold ${isSelected ? 'text-[#14654a]' : 'text-slate-800'}`}>
+                            {com.label}
+                          </span>
+                          {isSelected && <Check size={13} className="text-[#14654a] stroke-[3]" />}
+                        </div>
+                        <p className="text-[10.5px] font-medium text-slate-500 leading-tight">{com.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Quantity (kg) with quick increments */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700">
+                    Dispatch Quantity <span className="text-rose-500">*</span>
+                  </label>
+                  <div className="flex items-center gap-1">
+                    {[100, 250, 500].map(addAmount => (
+                      <button
+                        key={addAmount}
+                        type="button"
+                        onClick={() => setFormData(prev => ({ ...prev, quantityKg: prev.quantityKg + addAmount }))}
+                        className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[10px] transition-colors"
+                        title={`Add ${addAmount} kg`}
+                      >
+                        +{addAmount}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                    <Scale size={16} />
+                  </div>
+                  <input
+                    type="number"
+                    min="1"
+                    required
+                    value={formData.quantityKg}
+                    onChange={(e) => setFormData({ ...formData, quantityKg: Number(e.target.value) })}
+                    className="w-full pl-10 pr-14 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-sm font-mono font-bold text-slate-800 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all shadow-sm"
+                  />
+                  <div className="absolute inset-y-0 right-0 pr-3.5 flex items-center pointer-events-none text-xs font-bold text-slate-500">
+                    KG
+                  </div>
+                </div>
+              </div>
+
+              {/* 2-Column Row: Vehicle Challan & Driver */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                {/* Vehicle Challan No. */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700">Vehicle Challan No.</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                      <Truck size={15} />
+                    </div>
+                    <input
+                      type="text"
+                      placeholder="e.g. UP-14-BT-5421"
+                      value={formData.vehicleNo}
+                      onChange={(e) => setFormData({ ...formData, vehicleNo: e.target.value })}
+                      className="w-full pl-9 pr-3.5 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-xs font-mono font-bold text-slate-800 uppercase focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all shadow-sm"
+                    />
+                  </div>
+                </div>
+
+                {/* Authorized Driver */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700">Authorized Driver</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                      <User size={15} />
+                    </div>
+                    <input
+                      type="text"
+                      placeholder="e.g. Ramesh Chandra"
+                      value={formData.driverName}
+                      onChange={(e) => setFormData({ ...formData, driverName: e.target.value })}
+                      className="w-full pl-9 pr-3.5 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all shadow-sm"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons & Ledger Notice */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 border-t border-slate-100">
+                <div className="flex items-center gap-1.5 text-slate-500 text-[11px]">
+                  <ShieldCheck size={14} className="text-[#14654a] shrink-0" />
+                  <span>Transit logged in State PDS Register</span>
+                </div>
+                <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setIsRecordModalOpen(false)}
+                    className="flex-1 sm:flex-initial px-4 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 hover:text-slate-800 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 sm:flex-initial px-5 py-2.5 rounded-xl text-white text-xs font-bold shadow-md transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] flex items-center justify-center gap-2"
+                    style={{
+                      background: 'linear-gradient(135deg, #062d22, #14654a 52%, #2fa56f)',
+                      boxShadow: '0 8px 18px -4px rgba(20, 101, 74, 0.45)'
+                    }}
+                  >
+                    <CheckCircle2 size={14} />
+                    <span>Confirm Distribution</span>
+                  </button>
+                </div>
+              </div>
+            </form>
           </div>
         </div>,
         document.body

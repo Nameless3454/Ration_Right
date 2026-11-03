@@ -105,7 +105,7 @@ html, body {
 .replay-btn {
   position: fixed;
   bottom: 24px;
-  right: 28px;
+  right: 256px;
   z-index: 1000;
   padding: 10px 20px;
   border-radius: 99px;
@@ -122,11 +122,18 @@ html, body {
   gap: 8px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.3s, transform 0.2s;
+  transition: opacity 0.3s, transform 0.2s, right 0.2s, bottom 0.2s;
 }
 .replay-btn:hover {
   transform: translateY(-2px);
   box-shadow: 0 14px 30px rgba(27, 74, 53, 0.4);
+}
+
+@media (max-width: 640px) {
+  .replay-btn {
+    bottom: 84px;
+    right: 24px;
+  }
 }
 
 /* ==========================================================================

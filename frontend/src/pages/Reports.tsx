@@ -53,6 +53,44 @@ export const Reports: React.FC = () => {
 
   const reportsList: ReportItem[] = useMemo(() => [
     {
+      id: 'REP-OCT-2026-DISTRIB',
+      title: 'October 2026 PDS Distribution Ledger & Physical Audit Dossier',
+      category: 'Statutory',
+      format: 'PDF',
+      size: '1.2 MB',
+      generatedDate: '31 Oct 2026',
+      description: 'Official monthly reconciliation for the October 2026 dataset: 5 Fair Price Shops, 23,500 kg capacity, 9,450 kg distributed, physical inventory verification, and -880 kg net discrepancy audit.',
+      recordCount: '5 FPS Centers / 20 Beneficiaries',
+      status: 'Certified',
+      lines: [
+        'Reporting Period: October 2026 (State Food & Civil Supplies Directorate)',
+        'Participating Outlets: PWD001 (Shakti), PWD002 (Jan Seva), PWD003 (Annapurna), PWD004 (Bharat), PWD005 (Lok Kalyan)',
+        'Total Allocation Capacity: 23,500 kg | Total Lifted / Inflow: 6,300 kg',
+        'Reported Distribution: 9,450 kg (5,600 kg Rice, 3,850 kg Wheat across 20 cardholders)',
+        'Physical Verification Stock: 6,070 kg (Expected Closing: 6,950 kg | Net Shortage: -880 kg)',
+        'Flagged Anomalies: PWD002 (-280 kg Rice shortage), PWD004 (-200 kg Rice shortage & Failed Inspection), BEN019 Multiple Claims'
+      ]
+    },
+    {
+      id: 'REP-RAG-2026',
+      title: 'Beneficiary & Distribution Registry Corpus (RAG Vector Model Dataset)',
+      category: 'Beneficiary',
+      format: 'PDF',
+      size: '55 KB (8 Pages)',
+      generatedDate: '02 Nov 2026',
+      description: 'Comprehensive 8-page semantic dataset optimized for RAG embeddings, vector databases, and LLM grounding. Contains citizen dossiers, FPS directories, buffer stock, AI investigations, and Q&A chunks.',
+      recordCount: '443 Structured Chunks',
+      status: 'Certified',
+      lines: [
+        'Corpus Authority: National Food Security Act (NFSA) 2013 Statutory Knowledge Base',
+        'Citizen Beneficiary Profiles: 24,582 Enrolled (AAY & PHH quota entitlement chunks)',
+        'FPS Outlet Network: 414 licensed distribution nodes with biometric telemetry',
+        'Strategic Silo Buffer Stock: 79,61,167 kg across Rice, Wheat, Sugar & Kerosene',
+        'Active AI Fraud Investigations: 4 multi-agent sentinel anomaly incident reports',
+        'Synthetic Grounding Q&A Index: Pre-computed question-answer chunks for vector retrieval'
+      ]
+    },
+    {
       id: 'REP-2026-08A',
       title: 'Monthly NFSA Statutory Compliance & Allocation Dossier',
       category: 'Statutory',
@@ -215,6 +253,17 @@ startxref
   };
 
   const handleDownload = (report: ReportItem) => {
+    if (report.id === 'REP-RAG-2026') {
+      const link = document.createElement('a');
+      link.href = '/static/RationRight_Beneficiary_and_Distribution_Data_RAG_Corpus.pdf';
+      link.download = 'RationRight_Beneficiary_and_Distribution_Data_RAG_Corpus.pdf';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      showToast('Downloaded RAG Model Corpus PDF (8 pages, 443 chunks).');
+      return;
+    }
+
     const safeFilename = `${report.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}.${report.format.toLowerCase()}`;
     if (report.format === 'CSV') {
       const csvText = report.lines.join('\n');

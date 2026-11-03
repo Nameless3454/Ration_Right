@@ -1,0 +1,622 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R 12 0 R 15 0 R 18 0 R 21 0 R 24 0 R] /Count 8 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 4 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 6305 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 726.89 505.28 55.00 re f
+BT /F2 14.00 Tf 1.000 1.000 1.000 rg 59.00 753.89 Td (RATIONRIGHT FOOD SECURITY PLATFORM) Tj ET
+BT /F1 10.00 Tf 0.800 0.950 0.880 rg 59.00 737.89 Td (National Beneficiary Registry & Operational Telemetry Corpus \(RAG Dataset\)) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 570.89 505.28 144.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 696.89 Td (DOCUMENT METADATA FOR VECTOR EMBEDDINGS & RAG MODELS) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 684.89 Td (Corpus Identifier:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 684.89 Td (NFSA-OPS-DATASET-2026-AUG-CORPUS) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 671.89 Td (Source Platform:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 671.89 Td (RationRight Public Distribution System \(PDS\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 658.89 Td (Target Ingestion:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 658.89 Td (Retrieval-Augmented Generation \(RAG\), Vector DBs, LLM Agents) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 645.89 Td (Legal Authority:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 645.89 Td (National Food Security Act \(NFSA\), 2013, Ministry of Consumer Affairs) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 632.89 Td (Active Beneficiaries:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 632.89 Td (24,582 Enrolled \(23,410 Verified Active, 1,172 Pending/Flagged\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 619.89 Td (Daily Outflow Tracked:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 619.89 Td (43,450.5 kg dispatched across 4,520 verified transactions) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 606.89 Td (Strategic Reserves:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 606.89 Td (79,61,167.9 kg foodgrains & buffer commodities across godowns) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 593.89 Td (Fair Price Shops \(FPS\):) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 593.89 Td (414 Active licensed distribution outlets with POS biometric terminals) Tj ET
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 552.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 559.89 Td (1. NFSA SCHEME DEFINITIONS & CONTEXT TAXONOMY) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 542.89 Td (Semantic background for entity resolution and question answering) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 528.89 Td (The National Food Security Act \(NFSA\) establishes targeted public distribution to guarantee) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 516.89 Td (subsidized foodgrains to eligible Indian citizens. Two primary welfare categories exist: \(1\)) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 504.89 Td (Antyodaya Anna Yojana \(AAY\): designated for the poorest socio-economic households, entitling) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 492.89 Td (the family to a flat allocation of 35.0 kg of subsidized foodgrains per month regardless of) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 480.89 Td (family size. \(2\) Priority Household \(PHH\): category entitling eligible families to 5.0 kg of) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 468.89 Td (foodgrains per person per month. Each distribution is strictly authenticated via biometric) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 456.89 Td (Aadhaar electronic Point-of-Sale \(ePOS\) terminals at licensed Fair Price Shops \(FPS\).) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 440.89 Td (RAG Retrieval Context: When users ask about quota entitlements, verify whether the beneficiary) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 428.89 Td (belongs to 'AAY' \(flat 35kg\) or 'PHH' \(5kg multiplied by total family members\). Example: A PHH) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 416.89 Td (cardholder with 4 family members receives exactly 20.0 kg monthly.) Tj ET
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 380.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 387.89 Td (2. OPERATIONAL TELEMETRY & STRATEGIC KPI BENCHMARKS) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 370.89 Td (Live platform metrics recorded across districts and storage silos) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 234.89 505.28 130.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 346.89 Td (KEY METRICS SUMMARY \(CURRENT FISCAL RUN\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 334.89 Td (Total Active Beneficiaries:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 334.89 Td (24,582 \(95.2% operational coverage rate\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 321.89 Td (Monthly Outflow Rate:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 321.89 Td (13,03,515 kg distributed across state networks) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 308.89 Td (Silo Storage Capacity:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 308.89 Td (1,00,00,000 kg total nominal buffer capacity) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 295.89 Td (Current Reserve Holding:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 295.89 Td (79,61,167.9 kg \(79.6% reserve safety stock level\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 282.89 Td (Stock Burn Pacing:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 282.89 Td (88.2% allocation pacing vs 30-day forecast burn) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 269.89 Td (Active AI Sentinel Audits:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 269.89 Td (4 Neural models running \(1,248 daily real-time scans\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 256.89 Td (Flagged Incident Cases:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 256.89 Td (447 system alerts \(148 High/Critical priority cases\)) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 1) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 7 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+6 0 obj
+<< /Length 8311 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (3. CITIZEN BENEFICIARY REGISTRY - DETAILED DOSSIERS \(SECTION 1\)) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (Verified identity records, welfare tier, assigned FPS, and quota logs) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 732.89 Td (This section indexes active citizen beneficiary profiles for semantic search. Each card) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 720.89 Td (includes the Beneficiary Identifier, cardholder name, jurisdiction, assigned Fair Price Shop,) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 708.89 Td (household size, welfare category, risk level, and last recorded disbursement.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 584.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 682.89 Td (BENEFICIARY DOSSIER: BEN-88401 - Aarav Sharma \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 670.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 670.89 Td (Delhi | Assigned FPS: FPS-DL-0021) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 657.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 657.89 Td (PHH \(Household size: 4 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 644.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 644.89 Td (20.0 kg \(12kg Rice + 8kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 631.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 631.89 Td (Verified | Risk: Low) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 618.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 618.89 Td (2026-08-09) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 605.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 605.89 Td (Aarav Sharma is an active Priority Household \(PHH\) cardholder registered under Delhi jurisdiction at Okhla FPS-DL-0021. With 4 family members, Aarav receives 20kg monthly foodgrains. Biometrics verified with zero fraud flags.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 476.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 574.89 Td (BENEFICIARY DOSSIER: BEN-19804 - Rajesh Patel \(AAY\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 562.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 562.89 Td (Gwalior | Assigned FPS: FPS-GW-0104) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 549.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 549.89 Td (AAY \(Household size: 5 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 536.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 536.89 Td (35.0 kg \(20kg Rice + 15kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 523.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 523.89 Td (Pending | Risk: Medium) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 510.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 510.89 Td (2026-08-08) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 497.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 497.89 Td (Rajesh Patel is an Antyodaya Anna Yojana \(AAY\) beneficiary at Lashkar West FPS-GW-0104 in Gwalior. Household of 5 members receiving the standard 35kg quota. Status is Pending due to annual biometric iris renewal.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 368.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 466.89 Td (BENEFICIARY DOSSIER: BEN-77621 - Sunita Devi \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 454.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 454.89 Td (East Delhi | Assigned FPS: BENX1) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 441.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 441.89 Td (PHH \(Household size: 3 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 428.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 428.89 Td (15.0 kg \(10kg Rice + 5kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 415.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 415.89 Td (Flagged | Risk: High) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 402.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 402.89 Td (2026-08-07) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 389.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 389.89 Td (Sunita Devi is registered under PHH scheme with 3 family members at East Delhi center BENX1. The account is flagged with High Risk due to off-hours distribution timestamps occurring at 02:14 AM outside regulated hours.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 260.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 358.89 Td (BENEFICIARY DOSSIER: BEN-44912 - Vikram Singh \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 346.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 346.89 Td (Pune | Assigned FPS: FPS-PN-0045) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 333.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 333.89 Td (PHH \(Household size: 6 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 320.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 320.89 Td (30.0 kg \(18kg Rice + 12kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 307.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 307.89 Td (Verified | Risk: Low) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 294.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 294.89 Td (2026-08-09) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 281.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 281.89 Td (Vikram Singh is a verified PHH cardholder in Hadapsar, Pune \(FPS-PN-0045\). Large household of 6 entitled to 30kg grains monthly. Verified biometric log with consistent collection history.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 152.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 250.89 Td (BENEFICIARY DOSSIER: BEN-65239 - Fatima Sheikh \(AAY\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 238.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 238.89 Td (Lucknow | Assigned FPS: FPS-LU-0098) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 225.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 225.89 Td (AAY \(Household size: 4 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 212.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 212.89 Td (35.0 kg \(25kg Wheat + 10kg Rice\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 199.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 199.89 Td (Verified | Risk: Low) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 186.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 186.89 Td (2026-08-09) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 173.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 173.89 Td (Fatima Sheikh is an Antyodaya Anna Yojana cardholder registered at Lucknow Sector 4 \(FPS-LU-0098\). Entitled to 35kg grains. Fully verified with zero anomalies.) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 2) Tj ET
+
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 10 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+8 0 obj
+<< /Length 7744 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (3. CITIZEN BENEFICIARY REGISTRY - DETAILED DOSSIERS \(SECTION 2\)) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (Additional verified profiles across North, Central, and West zones) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 624.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 722.89 Td (BENEFICIARY DOSSIER: BEN-31084 - Ananya Ghosh \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 710.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 710.89 Td (Bhopal | Assigned FPS: FPS-BP-0012) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 697.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 697.89 Td (PHH \(Household size: 2 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 684.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 684.89 Td (10.0 kg \(6kg Rice + 4kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 671.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 671.89 Td (Pending | Risk: Medium) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 658.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 658.89 Td (2026-08-06) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 645.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 645.89 Td (Ananya Ghosh is a Priority Household beneficiary in Govindpura, Bhopal \(FPS-BP-0012\). 2 family members entitled to 10kg monthly. Status Pending pending dealer physical register reconciliation.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 516.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 614.89 Td (BENEFICIARY DOSSIER: BEN-90234 - Manoj Kumar \(AAY\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 602.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 602.89 Td (Delhi | Assigned FPS: FPS-DL-0044) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 589.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 589.89 Td (AAY \(Household size: 7 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 576.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 576.89 Td (35.0 kg \(20kg Rice + 15kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 563.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 563.89 Td (Flagged | Risk: Critical) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 550.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 550.89 Td (2026-08-09) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 537.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 537.89 Td (CRITICAL ANOMALY: Manoj Kumar's ration card was flagged by Neural Agent 1 for ghost duplicate transaction attempts at two different terminals \(FPS-DL-0044 and FPS-DL-0012\) 24 kilometers apart within 180 seconds.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 408.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 506.89 Td (BENEFICIARY DOSSIER: BEN-51209 - Priya Nair \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 494.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 494.89 Td (Aurangabad | Assigned FPS: FPS-AU-0077) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 481.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 481.89 Td (PHH \(Household size: 5 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 468.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 468.89 Td (25.0 kg \(15kg Rice + 10kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 455.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 455.89 Td (Verified | Risk: Low) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 442.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 442.89 Td (2026-08-08) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 429.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 429.89 Td (Priya Nair is a verified PHH beneficiary in CIDCO Zone 3, Aurangabad \(FPS-AU-0077\). 5 members entitled to 25kg monthly. Full biometric compliance recorded.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 300.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 398.89 Td (BENEFICIARY DOSSIER: BEN-63012 - Ramesh Yadav \(PHH\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 386.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 386.89 Td (Delhi | Assigned FPS: FPS-DL-0012) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 373.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 373.89 Td (PHH \(Household size: 4 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 360.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 360.89 Td (20.0 kg \(12kg Rice + 8kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 347.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 347.89 Td (Verified | Risk: Low) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 334.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 334.89 Td (2026-08-09) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 321.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 321.89 Td (Ramesh Yadav is registered at FPS-DL-0012 in South Delhi. 4 members, receiving 20kg grain quota. Clean transaction audit trail over last 24 months.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 192.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 290.89 Td (BENEFICIARY DOSSIER: BEN-74190 - Geeta Verma \(AAY\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 278.89 Td (Jurisdiction / District:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 278.89 Td (Gwalior | Assigned FPS: FPS-GW-0104) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 265.89 Td (Welfare Scheme Category:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 265.89 Td (AAY \(Household size: 3 members\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 252.89 Td (Monthly Entitlement:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 252.89 Td (35.0 kg \(20kg Rice + 15kg Wheat\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 239.89 Td (Audit Status & Risk Level:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 239.89 Td (Flagged | Risk: High) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 226.89 Td (Last Recorded Transaction:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 226.89 Td (2026-08-07) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 213.89 Td (RAG Ingestion Context:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 213.89 Td (Geeta Verma is registered under AAY in Gwalior. Flagged due to repeated transaction denials caused by fingerprint sensor degradation; inspector verification recommended.) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 3) Tj ET
+
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 13 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+10 0 obj
+<< /Length 8346 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (4. FAIR PRICE SHOP \(FPS\) NETWORK & TERMINAL DIRECTORY) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (Licensed outlets, dealer credentials, cardholder counts, and storage buffers) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 732.89 Td (Each Fair Price Shop \(FPS\) serves as the primary retail point under the Public Distribution) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 720.89 Td (System. The table below outlines key operational centers monitored in real-time.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 610.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 694.89 Td (OUTLET: FPS-DL-0021 - Okhla Industrial Area, South Delhi) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 682.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 682.89 Td (R.K. Gupta) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 669.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 669.89 Td (842 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 656.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 656.89 Td (18,200 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 643.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 643.89 Td (Nominal \(Online\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 630.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 630.89 Td (Center FPS-DL-0021 is managed by dealer R.K. Gupta in Okhla Industrial Area, South Delhi. It serves 842 Active Cards and currently holds 18,200 kg on hand. Telemetry status is Nominal \(Online\).) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 515.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 599.89 Td (OUTLET: FPS-GW-0104 - Lashkar West Zone, Gwalior MP) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 587.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 587.89 Td (S.N. Tomar) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 574.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 574.89 Td (610 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 561.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 561.89 Td (12,400 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 548.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 548.89 Td (Nominal \(Online\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 535.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 535.89 Td (Center FPS-GW-0104 is managed by dealer S.N. Tomar in Lashkar West Zone, Gwalior MP. It serves 610 Active Cards and currently holds 12,400 kg on hand. Telemetry status is Nominal \(Online\).) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 420.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 504.89 Td (OUTLET: BENX1 - Krishna Nagar Buffer, East Delhi) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 492.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 492.89 Td (M.K. Bansal) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 479.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 479.89 Td (1,120 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 466.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 466.89 Td (24,500 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 453.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 453.89 Td (CRITICAL AUDIT REQ) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 440.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 440.89 Td (Center BENX1 is managed by dealer M.K. Bansal in Krishna Nagar Buffer, East Delhi. It serves 1,120 Active Cards and currently holds 24,500 kg on hand. Telemetry status is CRITICAL AUDIT REQ.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 325.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 409.89 Td (OUTLET: FPS-PN-0045 - Hadapsar Logistics Complex, Pune MH) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 397.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 397.89 Td (A.B. Patil) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 384.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 384.89 Td (950 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 371.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 371.89 Td (21,000 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 358.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 358.89 Td (Nominal \(Online\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 345.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 345.89 Td (Center FPS-PN-0045 is managed by dealer A.B. Patil in Hadapsar Logistics Complex, Pune MH. It serves 950 Active Cards and currently holds 21,000 kg on hand. Telemetry status is Nominal \(Online\).) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 230.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 314.89 Td (OUTLET: FPS-LU-0098 - Alambagh Sector 4, Lucknow UP) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 302.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 302.89 Td (D.P. Shukla) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 289.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 289.89 Td (780 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 276.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 276.89 Td (16,800 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 263.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 263.89 Td (Standby / Offline Ping) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 250.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 250.89 Td (Center FPS-LU-0098 is managed by dealer D.P. Shukla in Alambagh Sector 4, Lucknow UP. It serves 780 Active Cards and currently holds 16,800 kg on hand. Telemetry status is Standby / Offline Ping.) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 135.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 219.89 Td (OUTLET: FPS-BP-0012 - Govindpura B-Sector, Bhopal MP) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 207.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 207.89 Td (V.K. Chouhan) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 194.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 194.89 Td (530 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 181.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 181.89 Td (11,500 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 168.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 168.89 Td (Nominal \(Online\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 155.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 155.89 Td (Center FPS-BP-0012 is managed by dealer V.K. Chouhan in Govindpura B-Sector, Bhopal MP. It serves 530 Active Cards and currently holds 11,500 kg on hand. Telemetry status is Nominal \(Online\).) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 4) Tj ET
+
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 16 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+12 0 obj
+<< /Length 1729 >>
+stream
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 682.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 766.89 Td (OUTLET: FPS-AU-0077 - CIDCO Zone 3, Aurangabad MH) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 754.89 Td (Licensee / Authorized Dealer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 754.89 Td (R.T. Jadhav) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 741.89 Td (Registered Cardholder Count:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 741.89 Td (690 Active Cards) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 728.89 Td (Current Physical Stock on Hand:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 728.89 Td (15,200 kg on hand) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 715.89 Td (Terminal Connectivity Status:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 715.89 Td (Nominal \(Online\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 702.89 Td (RAG Retrieval Summary:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 702.89 Td (Center FPS-AU-0077 is managed by dealer R.T. Jadhav in CIDCO Zone 3, Aurangabad MH. It serves 690 Active Cards and currently holds 15,200 kg on hand. Telemetry status is Nominal \(Online\).) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 5) Tj ET
+
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 19 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+14 0 obj
+<< /Length 8004 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (5. COMMODITY BUFFER INVENTORY & FCI GODOWN RESERVES) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (Stock levels, allocation quotas, burn rates, and replenishment challans) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 732.89 Td (Central grain reserves are maintained in Food Corporation of India \(FCI\) buffer godowns and) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 720.89 Td (dispatched to state silos. The table below details stock quotas across all monitored) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 708.89 Td (commodities.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 584.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 682.89 Td (COMMODITY STOCK: Rice \(Grade A Paddy\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 670.89 Td (Total Physical Stock Reserve:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 670.89 Td (42,50,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 657.89 Td (Allocated Monthly Quota:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 657.89 Td (38,00,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 644.89 Td (Consumption Burn Rate:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 644.89 Td (89% Quota Used) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 631.89 Td (Low-Stock Outlets Flagged:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 631.89 Td (12 Low Stock Centers) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 618.89 Td (Primary Apex Supply Origin:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 618.89 Td (FCI Godown #12 \(Central Reserve\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 605.89 Td (RAG Semantic Note:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 605.89 Td (Rice \(Grade A Paddy\) holds 42,50,000 kg in reserve with an allocation of 38,00,000 kg. Current burn rate is 89% Quota Used. Main replenishment hub is FCI Godown #12 \(Central Reserve\).) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 476.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 574.89 Td (COMMODITY STOCK: Wheat \(Standard Milling\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 562.89 Td (Total Physical Stock Reserve:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 562.89 Td (28,50,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 549.89 Td (Allocated Monthly Quota:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 549.89 Td (25,00,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 536.89 Td (Consumption Burn Rate:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 536.89 Td (88% Quota Used) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 523.89 Td (Low-Stock Outlets Flagged:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 523.89 Td (8 Low Stock Centers) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 510.89 Td (Primary Apex Supply Origin:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 510.89 Td (FCI Silo North Corridor \(Delhi\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 497.89 Td (RAG Semantic Note:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 497.89 Td (Wheat \(Standard Milling\) holds 28,50,000 kg in reserve with an allocation of 25,00,000 kg. Current burn rate is 88% Quota Used. Main replenishment hub is FCI Silo North Corridor \(Delhi\).) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 368.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 466.89 Td (COMMODITY STOCK: Sugar \(Refined Crystalline S-30\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 454.89 Td (Total Physical Stock Reserve:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 454.89 Td (6,20,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 441.89 Td (Allocated Monthly Quota:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 441.89 Td (5,00,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 428.89 Td (Consumption Burn Rate:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 428.89 Td (81% Quota Used) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 415.89 Td (Low-Stock Outlets Flagged:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 415.89 Td (4 Low Stock Centers) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 402.89 Td (Primary Apex Supply Origin:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 402.89 Td (Central Buffer Complex \(Bhopal\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 389.89 Td (RAG Semantic Note:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 389.89 Td (Sugar \(Refined Crystalline S-30\) holds 6,20,000 kg in reserve with an allocation of 5,00,000 kg. Current burn rate is 81% Quota Used. Main replenishment hub is Central Buffer Complex \(Bhopal\).) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 260.89 505.28 116.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 358.89 Td (COMMODITY STOCK: Kerosene \(PDS Household Grade\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 346.89 Td (Total Physical Stock Reserve:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 346.89 Td (2,41,167.9 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 333.89 Td (Allocated Monthly Quota:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 333.89 Td (2,00,000 kg) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 320.89 Td (Consumption Burn Rate:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 320.89 Td (83% Quota Used) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 307.89 Td (Low-Stock Outlets Flagged:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 307.89 Td (15 Low Stock Centers) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 294.89 Td (Primary Apex Supply Origin:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 294.89 Td (Strategic Tank Silo #4 \(Pune\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 281.89 Td (RAG Semantic Note:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 281.89 Td (Kerosene \(PDS Household Grade\) holds 2,41,167.9 kg in reserve with an allocation of 2,00,000 kg. Current burn rate is 83% Quota Used. Main replenishment hub is Strategic Tank Silo #4 \(Pune\).) Tj ET
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 240.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 247.89 Td (INFLOW CONSIGNMENT BATCH CHALLANS \(AUDIT TRAIL\)) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 230.89 Td (Recent restock transfers into state silos) Tj ET
+0.960 0.980 0.970 rg 0.768 0.784 0.776 RG 45.00 136.89 505.28 88.00 re b
+BT /F2 9.50 Tf 0.050 0.350 0.220 rg 55.00 206.89 Td (VERIFIED LOGISTICS CHALLAN LEDGER) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 194.89 Td (Batch Challan FCI-CH-3676:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 194.89 Td (+50,000 kg Rice \(Grade A\) to East Delhi Silo | Origin: FCI Godown #12 | Inspector: P.K. Verma) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 181.89 Td (Batch Challan FCI-CH-1377:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 181.89 Td (+50,000 kg Rice to East Delhi Silo | Origin: FCI Godown #12 | Inspector: P.K. Verma) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 168.89 Td (Batch Challan FCI-CH-3268:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 168.89 Td (+1,00,000 kg Wheat to North Corridor | Origin: Central Silo | Inspector: R.S. Bisht) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 155.89 Td (Batch Challan FCI-CH-6819:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 155.89 Td (+50,000 kg Sugar to Bhopal Hub | Origin: Western Godown | Inspector: K.L. Sharma) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 6) Tj ET
+
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 22 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+16 0 obj
+<< /Length 6317 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (6. AI SENTINEL ANOMALY AUDITS & FRAUD INVESTIGATIONS) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (Active enforcement cases identified by multi-agent machine learning models) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 732.89 Td (RationRight employs 4 autonomous AI sentinel agents \(Agent 1: Volumetric Regression, Agent 2:) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 720.89 Td (Timestamp Sentinel, Agent 3: Ghost Duplication Detective, Agent 4: Inventory Depletion) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 708.89 Td (Forecaster\). The following cases are active under judicial/administrative audit:) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 598.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 682.89 Td (INVESTIGATION CASE #11: Off-Hours Distribution Spike at BENX1) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 670.89 Td (Target Facility / Center:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 670.89 Td (BENX1 \(East Delhi Fair Price Shop\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 657.89 Td (AI Confidence Score:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 657.89 Td (94.2% Neural Confidence) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 644.89 Td (Severity Classification:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 644.89 Td (CRITICAL \(Immediate Inspection Assigned\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 631.89 Td (Model Reasoning:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 631.89 Td (AI Agent 1 flagged BENX1 due to an anomalous pattern of back-to-back distributions with timestamps occurring in less than 45 seconds across distinct cardholders, indicating possible automated manual entries.) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 618.89 Td (Enforcement Action:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 618.89 Td (Trigger Agent 2 deterministic verify run and dispatch District Food Inspector to perform live transaction auditing.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 503.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 587.89 Td (INVESTIGATION CASE #10: Success Rate Anomaly at BENX1) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 575.89 Td (Target Facility / Center:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 575.89 Td (BENX1 \(East Delhi Fair Price Shop\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 562.89 Td (AI Confidence Score:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 562.89 Td (89.5% Neural Confidence) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 549.89 Td (Severity Classification:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 549.89 Td (HIGH \(Audit Requested\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 536.89 Td (Model Reasoning:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 536.89 Td (Unusually high transaction success rate of 99.8% during off-hours, significantly diverging from the baseline operations standard of 84.5%.) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 523.89 Td (Enforcement Action:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 523.89 Td (Inspect offline terminal logs and cross-verify with beneficiary physical signatures.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 408.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 492.89 Td (INVESTIGATION CASE #08: Terminal Silence Timeout at FPS-LU-0098) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 480.89 Td (Target Facility / Center:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 480.89 Td (FPS-LU-0098 \(Lucknow Sector 4\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 467.89 Td (AI Confidence Score:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 467.89 Td (98.1% Deterministic Ping Alert) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 454.89 Td (Severity Classification:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 454.89 Td (MEDIUM \(Dealer Inactive\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 441.89 Td (Model Reasoning:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 441.89 Td (No transactions recorded over the last 72 hours, despite normal stock delivery confirmation. Potential system malfunction or dealer outage.) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 428.89 Td (Enforcement Action:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 428.89 Td (Dispatch technical support engineer to inspect ePOS cellular modem and biometric sensor.) Tj ET
+0.990 0.940 0.940 rg 0.792 0.752 0.752 RG 45.00 313.89 505.28 102.00 re b
+BT /F2 9.50 Tf 0.800 0.100 0.100 rg 55.00 397.89 Td (INVESTIGATION CASE #06: Low Inventory Stockout Risk at FPS-WB-0013) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 385.89 Td (Target Facility / Center:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 385.89 Td (FPS-WB-0013 \(West Bengal Distribution Outlet\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 372.89 Td (AI Confidence Score:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 372.89 Td (91.0% Forecast Confidence) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 359.89 Td (Severity Classification:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 359.89 Td (HIGH \(Stock Depletion Imminent\)) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 346.89 Td (Model Reasoning:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 346.89 Td (Stock levels of Wheat are below 10% safety margin. Current burn rate suggests stockout will occur in approximately 1.5 days.) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 333.89 Td (Enforcement Action:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 333.89 Td (Route emergency consignment truck with 10,000 kg Wheat from Central Buffer Silo.) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 7) Tj ET
+
+endstream
+endobj
+17 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Contents 25 0 R /Resources << /Font << /F1 27 0 R /F2 28 0 R /F3 29 0 R >> >> >>
+endobj
+18 0 obj
+<< /Length 5522 >>
+stream
+0.040 0.220 0.150 rg 0.032 0.176 0.120 RG 45.00 756.89 505.28 24.00 re f
+BT /F2 11.00 Tf 1.000 1.000 1.000 rg 55.00 763.89 Td (7. SYNTHETIC QUESTION & ANSWER INDEX FOR RAG GROUNDING) Tj ET
+BT /F1 8.50 Tf 0.400 0.450 0.420 rg 47.00 746.89 Td (High-frequency question-answer chunks for vector indexing and cosine retrieval) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 732.89 Td (This index contains pre-formulated question-answer pairs directly corresponding to expected) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 720.89 Td (user queries. RAG embedding models will index these chunks to deliver precise, fact-grounded) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 708.89 Td (responses.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 654.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 682.89 Td (Q: What is the monthly grain allocation for an Antyodaya Anna Yojana \(AAY\) family?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 670.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 670.89 Td (A: Under the NFSA guidelines implemented in RationRight, an AAY beneficiary household receives a flat entitlement of 35.0 kg of subsidized foodgrains per month, typically distributed as 20 kg Rice and 15 kg Wheat, irrespective of family size.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 611.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 639.89 Td (Q: How is the monthly ration calculated for a Priority Household \(PHH\) beneficiary?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 627.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 627.89 Td (A: PHH beneficiaries receive 5.0 kg of foodgrains per family member per month. For example, beneficiary Aarav Sharma \(BEN-88401\) with 4 family members is entitled to exactly 20.0 kg of grains \(12kg Rice + 8kg Wheat\) each month.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 568.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 596.89 Td (Q: Which Fair Price Shop center has been flagged for fraudulent distribution patterns?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 584.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 584.89 Td (A: Center BENX1 in East Delhi \(managed by M.K. Bansal\) has been flagged for multiple critical anomalies, including back-to-back distributions in under 45 seconds and an off-hours 99.8% transaction success rate.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 525.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 553.89 Td (Q: Who is beneficiary BEN-90234 and why is their account flagged as Critical?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 541.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 541.89 Td (A: BEN-90234 is Manoj Kumar \(AAY cardholder in Delhi with 7 family members\). The account is flagged as Critical because AI Agent 3 detected concurrent transaction attempts from two distinct POS terminals 24 kilometers apart within 3 minutes.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 482.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 510.89 Td (Q: What are the current central reserve stock levels for Rice and Wheat in RationRight?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 498.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 498.89 Td (A: Central reserves currently hold 42,50,000 kg of Rice \(Grade A Paddy, 89% allocated\) and 28,50,000 kg of Wheat \(Standard Milling, 88% allocated\) across buffer godowns.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 439.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 467.89 Td (Q: What is the total foodgrain outflow recorded across all distribution centers today?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 455.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 455.89 Td (A: Today's total system outflow is 43,450.5 kg of foodgrains, distributed across 4,520 verified citizen transactions, representing an 88.2% quota pacing against target allocations.) Tj ET
+0.930 0.960 1.000 rg 0.744 0.768 0.800 RG 45.00 396.89 505.28 46.00 re b
+BT /F2 9.50 Tf 0.100 0.300 0.700 rg 55.00 424.89 Td (Q: What action is triggered when an FPS outlet experiences terminal silence?) Tj ET
+BT /F2 8.50 Tf 0.200 0.250 0.220 rg 57.00 412.89 Td (Direct Grounded Answer:) Tj ET
+BT /F1 8.50 Tf 0.100 0.150 0.120 rg 205.00 412.89 Td (A: As demonstrated in Investigation Case #08 for FPS-LU-0098 in Lucknow \(inactive for 72 hours\), the system alerts the logistics controller and dispatches a field engineer to inspect the ePOS cellular connectivity and hardware status.) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 391.89 Td (END OF RATIONRIGHT RAG KNOWLEDGE CORPUS | Generated for LLM Vector Retrieval & Embedding) Tj ET
+BT /F1 8.50 Tf 0.150 0.200 0.180 rg 45.00 379.89 Td (Ingestion.) Tj ET
+0.100 0.400 0.250 RG 1.20 w 45.00 803.89 m 550.28 803.89 l S
+BT /F2 8.00 Tf 0.080 0.350 0.220 rg 45.00 809.89 Td (RATIONRIGHT | NATIONAL FOOD SECURITY OPERATIONS PLATFORM) Tj ET
+BT /F1 7.50 Tf 0.450 0.550 0.500 rg 310.28 809.89 Td (DOCUMENT CORPUS: NFSA-BENEFICIARY-TELEMETRY-RAG-2026) Tj ET
+0.850 0.880 0.850 RG 0.80 w 45.00 57.00 m 550.28 57.00 l S
+BT /F1 7.50 Tf 0.500 0.550 0.520 rg 45.00 45.00 Td (OFFICIAL KNOWLEDGE CORPUS FOR RAG INGESTION & VECTOR RETRIEVAL) Tj ET
+BT /F2 8.00 Tf 0.200 0.250 0.220 rg 510.28 45.00 Td (Page 8) Tj ET
+
+endstream
+endobj
+19 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+20 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+21 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 22
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000168 00000 n 
+0000000323 00000 n 
+0000006680 00000 n 
+0000006835 00000 n 
+0000015198 00000 n 
+0000015354 00000 n 
+0000023150 00000 n 
+0000023306 00000 n 
+0000031705 00000 n 
+0000031862 00000 n 
+0000033644 00000 n 
+0000033801 00000 n 
+0000041858 00000 n 
+0000042015 00000 n 
+0000048385 00000 n 
+0000048542 00000 n 
+0000054117 00000 n 
+0000054188 00000 n 
+0000054264 00000 n 
+trailer
+<< /Size 22 /Root 1 0 R >>
+startxref
+54333
+%%EOF

@@ -13,7 +13,12 @@ import {
   Trash2,
   FileText,
   MapPin,
-  Store
+  Store,
+  User,
+  Hash,
+  RefreshCw,
+  ChevronDown,
+  Check
 } from 'lucide-react';
 import { StatusBadge } from '../components/StatusBadge';
 import { mockBeneficiaries } from '../data/mockData';
@@ -399,168 +404,277 @@ export const Beneficiaries: React.FC = () => {
       </div>
 
       {/* =====================================================================
-          ADD BENEFICIARY MODAL DIALOG
+          ADD BENEFICIARY MODAL DIALOG (REDESIGNED)
           ===================================================================== */}
       {isAddModalOpen && createPortal(
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-md animate-in fade-in duration-200" onClick={() => setIsAddModalOpen(false)}>
+        <div 
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/50 backdrop-blur-md animate-in fade-in duration-200" 
+          onClick={() => setIsAddModalOpen(false)}
+        >
           <div 
-            className="bg-white border border-white/80 rounded-[28px] shadow-2xl w-full max-w-lg overflow-hidden flex flex-col animate-in zoom-in-95 duration-200"
+            className="bg-white border border-slate-200/80 rounded-[28px] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.3)] w-full max-w-xl overflow-hidden flex flex-col animate-in zoom-in-95 duration-200 max-h-[92vh]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4.5 border-b border-slate-100 bg-[#e7f0eb]/50">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-[#14654a]/15 text-[#14654a] flex items-center justify-center shrink-0">
-                  <UserPlus size={20} />
+            <div className="relative px-6 pt-5 pb-4 border-b border-slate-100 bg-gradient-to-r from-emerald-50/70 via-teal-50/30 to-slate-50/50">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-center gap-3.5">
+                  <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-[#14654a] to-[#0a3829] text-white flex items-center justify-center shadow-lg shadow-[#14654a]/25 shrink-0 ring-4 ring-emerald-500/10">
+                    <UserPlus size={20} className="stroke-[2.2]" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-extrabold text-[#10261c] text-lg leading-tight font-display tracking-tight">
+                        Register New Beneficiary
+                      </h3>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold tracking-wider uppercase bg-[#14654a]/10 text-[#14654a] border border-[#14654a]/20">
+                        NFSA Enrolment
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#5d7468] mt-0.5">
+                      Create citizen beneficiary record in the official Public Distribution System (PDS)
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <h3 className="font-extrabold text-[#10261c] text-base leading-tight font-display">
-                    Register New Beneficiary
-                  </h3>
-                  <p className="text-xs text-[#5d7468] mt-0.5">
-                    Add beneficiary citizen record to the PDS distribution registry
-                  </p>
-                </div>
+                <button 
+                  type="button"
+                  onClick={() => setIsAddModalOpen(false)} 
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-white/80 border border-transparent hover:border-slate-200 transition-all shadow-none hover:shadow-sm"
+                  aria-label="Close dialog"
+                >
+                  <X size={18} />
+                </button>
               </div>
-              <button 
-                onClick={() => setIsAddModalOpen(false)} 
-                className="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
-              >
-                <X size={18} />
-              </button>
             </div>
 
             {/* Modal Form */}
-            <form onSubmit={handleAddSubmit} className="p-6 space-y-4 text-xs md:text-sm">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                {/* Full Name */}
-                <div className="sm:col-span-2 space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Beneficiary Full Name *
+            <form onSubmit={handleAddSubmit} className="p-6 overflow-y-auto space-y-4 text-xs md:text-sm custom-scrollbar">
+              {/* Full Name */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700">
+                    Beneficiary Full Name <span className="text-rose-500">*</span>
                   </label>
+                  <span className="text-[10.5px] font-medium text-slate-400">As per official Aadhaar / NFSA document</span>
+                </div>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                    <User size={16} />
+                  </div>
                   <input
                     type="text"
                     required
                     placeholder="e.g. Meera Devi"
                     value={formData.name}
                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] focus:ring-1 focus:ring-[#14654a] text-[#10261c]"
+                    className="w-full pl-10 pr-3.5 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-sm font-semibold text-slate-800 placeholder:text-slate-400 placeholder:font-normal focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all shadow-sm"
                   />
-                </div>
-
-                {/* Beneficiary ID */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Beneficiary ID
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.id}
-                    onChange={(e) => setFormData({ ...formData, id: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-mono font-bold text-slate-700 bg-slate-50/70"
-                  />
-                </div>
-
-                {/* District */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    District
-                  </label>
-                  <select
-                    value={formData.district}
-                    onChange={(e) => setFormData({ ...formData, district: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c] bg-white"
-                  >
-                    <option value="Delhi">Delhi</option>
-                    <option value="East Delhi">East Delhi</option>
-                    <option value="Lucknow">Lucknow</option>
-                    <option value="Gwalior">Gwalior</option>
-                    <option value="Aurangabad">Aurangabad</option>
-                  </select>
-                </div>
-
-                {/* Assigned FPS Center */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Assigned FPS Center
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. FPS-DL-0042"
-                    value={formData.fps}
-                    onChange={(e) => setFormData({ ...formData, fps: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c]"
-                  />
-                </div>
-
-                {/* Family Members */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Family Members
-                  </label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="15"
-                    value={formData.familyMembers}
-                    onChange={(e) => setFormData({ ...formData, familyMembers: Number(e.target.value) })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c]"
-                  />
-                </div>
-
-                {/* Scheme Type */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Scheme Type
-                  </label>
-                  <select
-                    value={formData.schemeType}
-                    onChange={(e) => setFormData({ ...formData, schemeType: e.target.value })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c] bg-white"
-                  >
-                    <option value="PHH">PHH (Priority Household)</option>
-                    <option value="AAY">AAY (Antyodaya Anna Yojana)</option>
-                    <option value="NPHH">NPHH (Non-Priority)</option>
-                  </select>
-                </div>
-
-                {/* Risk Level */}
-                <div className="space-y-1">
-                  <label className="text-[11px] font-bold text-[#7a8b84] uppercase tracking-wide">
-                    Initial Risk Level
-                  </label>
-                  <select
-                    value={formData.risk}
-                    onChange={(e) => setFormData({ ...formData, risk: e.target.value as any })}
-                    className="w-full px-3.5 py-2 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:border-[#14654a] text-[#10261c] bg-white"
-                  >
-                    <option value="Low">Low Risk</option>
-                    <option value="Medium">Medium Risk</option>
-                    <option value="High">High Risk</option>
-                    <option value="Critical">Critical Risk</option>
-                  </select>
                 </div>
               </div>
 
-              {/* Action Buttons */}
-              <div className="flex items-center justify-end gap-2.5 pt-4 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setIsAddModalOpen(false)}
-                  className="px-4 py-2 rounded-full border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-50 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-full text-white text-xs font-bold shadow-md transition-all duration-200 hover:scale-[1.02] active:scale-[0.98]"
-                  style={{
-                    background: 'linear-gradient(135deg, #062d22, #14654a 52%, #2fa56f)',
-                    boxShadow: '0 8px 18px -4px rgba(20, 101, 74, 0.45)'
-                  }}
-                >
-                  Register Beneficiary
-                </button>
+              {/* 2-Column Row: ID & District */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                {/* Beneficiary ID */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-700">Beneficiary ID</label>
+                    <button
+                      type="button"
+                      onClick={() => setFormData(prev => ({ ...prev, id: `BEN-${Math.floor(10000 + Math.random() * 90000)}` }))}
+                      className="inline-flex items-center gap-1 text-[10.5px] font-semibold text-[#14654a] hover:text-[#0d4b36] hover:underline"
+                      title="Generate new ID"
+                    >
+                      <RefreshCw size={10} className="hover:rotate-180 transition-transform duration-300" />
+                      <span>Regenerate</span>
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                      <Hash size={15} />
+                    </div>
+                    <input
+                      type="text"
+                      value={formData.id}
+                      onChange={(e) => setFormData({ ...formData, id: e.target.value })}
+                      className="w-full pl-9 pr-3.5 py-2.5 bg-slate-100/70 border border-slate-200/90 rounded-xl text-xs font-mono font-bold text-slate-700 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all"
+                    />
+                  </div>
+                </div>
+
+                {/* District */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700">District Jurisdiction</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                      <MapPin size={15} />
+                    </div>
+                    <select
+                      value={formData.district}
+                      onChange={(e) => setFormData({ ...formData, district: e.target.value })}
+                      className="w-full pl-9 pr-8 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all appearance-none cursor-pointer shadow-sm"
+                    >
+                      <option value="Delhi">Delhi Central</option>
+                      <option value="East Delhi">East Delhi</option>
+                      <option value="Lucknow">Lucknow</option>
+                      <option value="Gwalior">Gwalior</option>
+                      <option value="Aurangabad">Aurangabad</option>
+                    </select>
+                    <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none text-slate-400">
+                      <ChevronDown size={14} />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 2-Column Row: Assigned FPS & Household Members */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                {/* Assigned FPS Center */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-700">Assigned Fair Price Shop</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                      <Store size={15} />
+                    </div>
+                    <input
+                      type="text"
+                      placeholder="e.g. FPS-DL-0021"
+                      value={formData.fps}
+                      onChange={(e) => setFormData({ ...formData, fps: e.target.value })}
+                      className="w-full pl-9 pr-3.5 py-2.5 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200/90 rounded-xl text-xs font-semibold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-[#14654a] focus:ring-2 focus:ring-[#14654a]/15 transition-all shadow-sm"
+                    />
+                  </div>
+                </div>
+
+                {/* Family Members Counter */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-700">Family Members</label>
+                    <span className="text-[10.5px] font-medium text-slate-400">Household units</span>
+                  </div>
+                  <div className="flex items-center rounded-xl border border-slate-200/90 bg-slate-50/80 overflow-hidden shadow-sm focus-within:ring-2 focus-within:ring-[#14654a]/15 focus-within:border-[#14654a] focus-within:bg-white transition-all">
+                    <button
+                      type="button"
+                      onClick={() => setFormData(prev => ({ ...prev, familyMembers: Math.max(1, prev.familyMembers - 1) }))}
+                      className="w-9 h-9 flex items-center justify-center text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 active:bg-slate-200 transition-colors select-none font-bold text-base"
+                      aria-label="Decrease members"
+                    >
+                      −
+                    </button>
+                    <div className="flex-1 flex items-center justify-center gap-1.5 font-bold text-slate-800 text-xs">
+                      <Users size={14} className="text-slate-400" />
+                      <span>{formData.familyMembers}</span>
+                      <span className="text-[11px] font-normal text-slate-400">{formData.familyMembers === 1 ? 'person' : 'persons'}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setFormData(prev => ({ ...prev, familyMembers: Math.min(15, prev.familyMembers + 1) }))}
+                      className="w-9 h-9 flex items-center justify-center text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 active:bg-slate-200 transition-colors select-none font-bold text-base"
+                      aria-label="Increase members"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Scheme Category Segmented Cards */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700">Ration Scheme Category</label>
+                  <span className="text-[10.5px] font-medium text-slate-400">Monthly NFSA Entitlement</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: 'PHH', label: 'PHH', title: 'Priority Household', quota: '5 kg / member' },
+                    { id: 'AAY', label: 'AAY', title: 'Antyodaya Anna', quota: '35 kg flat' },
+                    { id: 'NPHH', label: 'NPHH', title: 'Non-Priority', quota: 'Subsidized' }
+                  ].map(scheme => {
+                    const isSelected = formData.schemeType === scheme.id;
+                    return (
+                      <button
+                        key={scheme.id}
+                        type="button"
+                        onClick={() => setFormData({ ...formData, schemeType: scheme.id })}
+                        className={`p-2.5 rounded-xl border text-left transition-all relative ${
+                          isSelected 
+                            ? 'bg-emerald-50/70 border-[#14654a] shadow-sm shadow-emerald-900/5 ring-1 ring-[#14654a]' 
+                            : 'bg-white hover:bg-slate-50/80 border-slate-200/80'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className={`text-xs font-extrabold ${isSelected ? 'text-[#14654a]' : 'text-slate-800'}`}>
+                            {scheme.label}
+                          </span>
+                          {isSelected && <Check size={12} className="text-[#14654a] stroke-[3]" />}
+                        </div>
+                        <p className="text-[10px] font-medium text-slate-500 truncate leading-tight">{scheme.title}</p>
+                        <span className={`inline-block mt-1.5 text-[9.5px] font-semibold px-1.5 py-0.5 rounded ${
+                          isSelected ? 'bg-[#14654a]/15 text-[#14654a]' : 'bg-slate-100 text-slate-600'
+                        }`}>
+                          {scheme.quota}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Initial Risk Level Selector */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-700">Initial Audit & Risk Level</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    { level: 'Low', label: 'Low', dot: 'bg-emerald-500' },
+                    { level: 'Medium', label: 'Medium', dot: 'bg-amber-500' },
+                    { level: 'High', label: 'High', dot: 'bg-orange-500' },
+                    { level: 'Critical', label: 'Critical', dot: 'bg-rose-500' }
+                  ].map(item => {
+                    const isSelected = formData.risk === item.level;
+                    return (
+                      <button
+                        key={item.level}
+                        type="button"
+                        onClick={() => setFormData({ ...formData, risk: item.level as any })}
+                        className={`py-2 px-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all ${
+                          isSelected
+                            ? 'border-slate-800 bg-slate-900 text-white shadow-sm ring-1 ring-slate-800'
+                            : 'border-slate-200/80 bg-white hover:bg-slate-50 text-slate-700'
+                        }`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${item.dot} ${isSelected ? 'ring-2 ring-white/50' : ''}`} />
+                        <span>{item.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Action Buttons & Ledger Notice */}
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 border-t border-slate-100">
+                <div className="flex items-center gap-1.5 text-slate-500 text-[11px]">
+                  <ShieldCheck size={14} className="text-[#14654a] shrink-0" />
+                  <span>Synced with secure state PDS ledger</span>
+                </div>
+                <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setIsAddModalOpen(false)}
+                    className="flex-1 sm:flex-initial px-4 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50 hover:text-slate-800 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="flex-1 sm:flex-initial px-5 py-2.5 rounded-xl text-white text-xs font-bold shadow-md transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] flex items-center justify-center gap-2"
+                    style={{
+                      background: 'linear-gradient(135deg, #062d22, #14654a 52%, #2fa56f)',
+                      boxShadow: '0 8px 18px -4px rgba(20, 101, 74, 0.45)'
+                    }}
+                  >
+                    <UserPlus size={14} />
+                    <span>Register Beneficiary</span>
+                  </button>
+                </div>
               </div>
             </form>
           </div>

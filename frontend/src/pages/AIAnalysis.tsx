@@ -10,7 +10,6 @@ import {
   Search, 
   FileDown, 
   X, 
-  ArrowRight, 
   Eye, 
   ShieldCheck, 
   Activity, 
@@ -598,18 +597,6 @@ export const AIAnalysis: React.FC = () => {
                     >
                       <Eye size={13} />
                       <span>Inspect Dossier</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => handleResolveCase(item.id, 'Dispatched Field Inspector')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-bold text-white shadow-xs transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
-                      style={{
-                        background: 'linear-gradient(135deg, #062d22 0%, #14654a 52%, #2fa56f 100%)'
-                      }}
-                    >
-                      <span>Take Action</span>
-                      <ArrowRight size={12} />
                     </button>
                   </div>
                 </div>

@@ -1,0 +1,21 @@
+beneficiary_id,category,collection_status,demo_record,family_size,head_name,identity_status,last_collection_date,monthly_entitlement_kg,pwd_id,ration_card_id,review_reason
+BEN001,PHH,collected,True,2,Demo Beneficiary 01,verified,2026-10-02,10,PWD001,DEMO-RC-10001,
+BEN002,PHH,collected,True,3,Demo Beneficiary 02,verified,2026-10-03,15,PWD001,DEMO-RC-10002,
+BEN003,PHH,collected,True,4,Demo Beneficiary 03,verified,2026-10-04,20,PWD001,DEMO-RC-10003,
+BEN004,AAY,collected,True,5,Demo Beneficiary 04,verified,2026-10-05,35,PWD001,DEMO-RC-10004,
+BEN005,PHH,collected,True,6,Demo Beneficiary 05,verified,2026-10-06,30,PWD002,DEMO-RC-10005,
+BEN006,PHH,collected,True,2,Demo Beneficiary 06,verified,2026-10-07,10,PWD002,DEMO-RC-10006,
+BEN007,PHH,collected,True,3,Demo Beneficiary 07,possible_duplicate,2026-10-08,15,PWD002,DEMO-RC-10007,Same demo household fingerprint as BEN014
+BEN008,AAY,collected,True,4,Demo Beneficiary 08,verified,2026-10-09,5,PWD002,DEMO-RC-10008,
+BEN009,PHH,collected,True,5,Demo Beneficiary 09,verified,2026-10-10,25,PWD003,DEMO-RC-10009,
+BEN010,PHH,collected,True,6,Demo Beneficiary 10,verified,2026-10-11,30,PWD003,DEMO-RC-10010,
+BEN011,PHH,collected,True,2,Demo Beneficiary 11,verified,2026-10-12,10,PWD003,DEMO-RC-10011,
+BEN012,AAY,collected,True,3,Demo Beneficiary 12,verified,2026-10-13,5,PWD003,DEMO-RC-10012,
+BEN013,PHH,collected,True,4,Demo Beneficiary 13,verified,2026-10-14,20,PWD004,DEMO-RC-10013,
+BEN014,PHH,collected,True,5,Demo Beneficiary 14,possible_duplicate,2026-10-15,25,PWD004,DEMO-RC-10014,Same demo household fingerprint as BEN007
+BEN015,PHH,collected,True,6,Demo Beneficiary 15,verified,2026-10-16,30,PWD004,DEMO-RC-10015,
+BEN016,AAY,collected,True,2,Demo Beneficiary 16,verified,2026-10-17,5,PWD004,DEMO-RC-10016,
+BEN017,PHH,collected,True,3,Demo Beneficiary 17,verified,2026-10-18,15,PWD005,DEMO-RC-10017,
+BEN018,PHH,collected,True,4,Demo Beneficiary 18,verified,2026-10-19,20,PWD005,DEMO-RC-10018,
+BEN019,PHH,multiple_claims,True,5,Demo Beneficiary 19,review_required,2026-10-20,25,PWD005,DEMO-RC-10019,Two collection events recorded in one entitlement period
+BEN020,AAY,collected,True,6,Demo Beneficiary 20,verified,2026-10-21,35,PWD005,DEMO-RC-10020,
